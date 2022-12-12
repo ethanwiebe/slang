@@ -1,0 +1,25 @@
+#include <iostream>
+
+#include "slang.h"
+#include <fstream>
+
+using namespace slang;
+
+int main(int argc,char** argv){
+	if (argc<=1)
+		return 0;
+		
+	std::string fileName = std::string(argv[1]);
+	
+	std::ifstream f(fileName,std::ios::ate);
+	auto size = f.tellg();
+	f.seekg(0);
+	std::string code(size,'\0');
+	f.read(&code[0],size);
+	
+	Env e = {};
+	
+	Parse(code);
+	
+	return 0;
+}

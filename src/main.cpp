@@ -17,9 +17,13 @@ int main(int argc,char** argv){
 	std::string code(size,'\0');
 	f.read(&code[0],size);
 	
-	Env e = {};
-	
-	Parse(code);
+	SlangParser parser{code};
+	SlangInterpreter interp = {};
+	SlangObj* program = parser.Parse();
+	if (program)
+		interp.Run(program);
+	else
+		return 1;
 	
 	return 0;
 }

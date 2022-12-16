@@ -28,6 +28,7 @@ namespace slang {
 	
 	struct SlangObj {
 		SlangType type;
+		
 		union {
 			struct {
 				SlangObj* left;
@@ -42,20 +43,14 @@ namespace slang {
 		};
 	};
 	
-	struct SlangLambda;
-
 	struct Env {
 		std::map<SymbolName,SlangObj*> symbolMap;
 		std::vector<Env*> children;
 		Env* parent = nullptr;
 		
-		inline Env* MakeChild(){
-			Env* child = new Env;
-			*child = {{},{},this};
-			children.push_back(child);
-			return children.back();
-		}
+		inline Env* MakeChild();
 		
+		inline void Clear();
 		void DefSymbol(SymbolName,SlangObj*);
 		// symbol might not exist
 		SlangObj* GetSymbol(SymbolName) const;
@@ -75,17 +70,111 @@ namespace slang {
 	
 	SlangObj* EvalExpr(const SlangObj* expr,Env& env);
 	
-	SlangObj* AllocateObj();
-	void FreeObj(SlangObj*);
-	
-	SlangObj MakeInt(int64_t);
-	SlangObj MakeSymbol(SymbolName);
-	SlangObj* MakeList(std::vector<SlangObj>&);
-		
 	typedef std::string::const_iterator StringIt;
 	
-	void ResetParseState();
-	void Parse(const std::string&);
+	struct ParseErrorData {
+		uint32_t line,col;
+		std::string message;
+	};
+	
+	enum class SlangTokenType : uint8_t {
+		Symbol = 0,
+		Int,
+		Real,
+		LeftBracket,
+		RightBracket,
+		Quote,
+		Comment,
+		True,
+		False,
+		EndOfFile,
+		Error
+	};
+	
+	struct SlangToken {
+		SlangTokenType type;
+		std::string_view view;
+		uint32_t line,col;
+	};
+	
+	struct SlangTokenizer {
+		std::string tokenStr;
+		StringIt pos,end;
+		uint32_t line,col;
+		
+		SlangTokenizer(const std::string& code) : 
+			tokenStr(code),
+			pos(tokenStr.begin()),
+			end(tokenStr.end()),
+			line(),col(){}
+		
+		SlangToken NextToken();
+	};
+	
+	struct SlangParser {
+		SlangTokenizer tokenizer;
+		SlangToken token;
+		
+		SymbolNameDict nameDict;
+		SymbolName currentName;
+		std::vector<ParseErrorData> errors;
+		
+		SlangParser(const std::string& code) : 
+			tokenizer(code),token(),nameDict(),currentName(),errors(){
+			token.type = SlangTokenType::Comment;
+		}
+		
+		std::string GetSymbolString(SymbolName name);
+		SymbolName RegisterSymbol(const std::string& name);
+		
+		void PushError(const std::string& msg);
+		
+		inline void NextToken();
+		SlangObj* ParseExpr();
+		SlangObj* ParseObj();
+		SlangObj* ParseExprOrObj();
+		SlangObj* Parse();
+	};
+	
+	typedef std::vector<SlangObj*> SlangArgVec;
+	typedef std::vector<SlangObj*> GarbageVec;
+	
+	struct SlangInterpreter {
+		SlangObj* program;
+		Env env;
+		std::vector<SlangLambda> globalLambdas;
+		GarbageVec garbage;
+		
+		inline LambdaKey RegisterLambda(const SlangLambda& lam){
+			globalLambdas.push_back(lam);
+			return globalLambdas.size()-1;
+		}
+		
+		inline SlangLambda* GetLambda(LambdaKey key){
+			return &globalLambdas.at(key);
+		}
+		
+		inline SlangObj* SlangFuncDefine(const SlangArgVec& args,Env* env);
+		inline SlangObj* SlangFuncLambda(const SlangArgVec& args,Env* env);
+		inline SlangObj* SlangFuncSet(const SlangArgVec& args,Env* env);
+		inline SlangObj* SlangFuncQuote(const SlangArgVec& args);
+		inline SlangObj* SlangFuncAdd(const SlangArgVec& args,Env* env);
+		inline SlangObj* SlangFuncSub(const SlangArgVec& args,Env* env);
+		inline SlangObj* SlangFuncMul(const SlangArgVec& args,Env* env);
+		inline SlangObj* SlangFuncPair(const SlangArgVec& args,Env* env);
+		inline SlangObj* SlangFuncLeft(const SlangArgVec& args,Env* env);
+		inline SlangObj* SlangFuncRight(const SlangArgVec& args,Env* env);
+		//inline SlangObj* SlangFuncSetLeft(const SlangArgVec& args,Env* env);
+		//inline SlangObj* SlangFuncSetRight(const SlangArgVec& args,Env* env);
+		
+		SlangObj* EvalExpr(const SlangObj* expr,Env* env);
+		
+		void Reset();
+		void Run(SlangObj* prog);
+	};
+	
+	extern SlangParser* gDebugParser;
+	extern SlangInterpreter* gDebugInterpreter;
 	
 	std::ostream& operator<<(std::ostream&,SlangObj);
 }

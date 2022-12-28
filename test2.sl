@@ -1,9 +1,9 @@
 (def glob 3)
 
 (def counter
-	(lambda (x)
+	(& (x)
 		(do
-			(lambda () 
+			(& () 
 				(set! x (+ x 1))
 			)
 		)
@@ -18,6 +18,5 @@
 (c1)
 (c2)
 (c1)
-
-''(+ 2 3)
-''abc
+(print (c1))
+(print (c2))

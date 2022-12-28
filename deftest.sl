@@ -2,7 +2,7 @@
 
 
 (def foo 
-	(lambda () 
+	(& () 
 		(do
 			(def x 4)
 			x
@@ -11,7 +11,7 @@
 )
 
 (def bar 
-	(lambda ()
+	(& ()
 		(do
 			(set! x 4)
 			x
@@ -19,7 +19,7 @@
 	)
 )
 
-(foo)
-x
-(bar)
-x
+(print (foo))
+(print x)
+(print (bar))
+(print x)

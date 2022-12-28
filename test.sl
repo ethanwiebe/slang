@@ -3,7 +3,7 @@
 (+ abc 1)
 12
 (def func 
-	(lambda (y) (do 
+	(& (y) (do 
 					(def x 1)
 					(+ x y))))
 
@@ -11,29 +11,29 @@
 
 
 
-(def eq (lambda (x y)
+(def eq (& (x y)
 				(if (- x y) false true)))
 
-(def fact-sub (lambda (z curr)
+(def fact-sub (& (z curr)
 					(if (eq z 1) curr (fact-sub (- z 1) (* curr z)))))
 
-(def fact (lambda (x) (fact-sub x 1)))
+(def fact (& (x) (fact-sub x 1)))
 
 (+ 1 2)
 
 (def nest 
-	(lambda (x) 
-		(lambda (y)
+	(& (x) 
+		(& (y)
 			(* x y)
 		)
 	)
 )
 
 (def counter
-	(lambda (x)
+	(& (x)
 		(do
 			(def countVal x)
-			(lambda () 
+			(& () 
 				(set! countVal (+ countVal 1))
 			)
 		)
@@ -46,7 +46,12 @@
 (def c1 (counter 3))
 (def c2 (counter 8))
 
-(def test (lambda (x) (if (eq x 0) 0 (test (- x 1)))))
+(def test (& (x) (if (eq x 0) 0 (test (- x 1)))))
+
+(def a (/ 9 2))
 
 (c1)
 (c1)
+(print (c1))
+(print (c1))
+(fact fact)

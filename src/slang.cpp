@@ -3,14 +3,19 @@
 #include <assert.h>
 #include <iostream>
 #include <cstring>
+#include <sstream>
 
 #include <set>
 
 namespace slang {
 
+MemArena gMemArena = {};
+
 size_t gAllocCount = 0;
 size_t gAllocTotal = 0;
 size_t gMaxAlloc = 0;
+size_t gHeapAllocTotal = 0;
+size_t gMaxStackHeight = 0;
 std::set<SlangObj*> stillAround = {};
 
 size_t gEvalCounter = 0;
@@ -19,26 +24,40 @@ size_t gEvalRecurCounter = 0;
 SlangParser* gDebugParser;
 SlangInterpreter* gDebugInterpreter;
 
-inline SlangObj* AllocateObj(){
-	SlangObj* p = (SlangObj*)malloc(sizeof(SlangObj));
+void PrintErrors(const std::vector<ErrorData>& errors){
+	for (auto it=errors.rbegin();it!=errors.rend();++it){
+		auto error = *it;
+		std::cout << "@" << error.loc.line+1 << ',' << error.loc.col+1 <<
+			":\n" << error.message << '\n';
+	}
+}
+
+inline SlangObj* SlangInterpreter::AllocateObj(){
+	SlangObj* p = (SlangObj*)arena->smallPointer;
+	arena->smallPointer += sizeof(SlangObj);
+	if (arena->smallPointer>=arena->smallSetEnd)
+		arena->smallPointer = &arena->smallSet[0];
+	//SlangObj* p = (SlangObj*)malloc(sizeof(SlangObj));
 	++gAllocCount;
 	++gAllocTotal;
 	gMaxAlloc = (gAllocCount>gMaxAlloc) ? gAllocCount : gMaxAlloc;
 	//stillAround.insert(p);
+	p->flags = 0;
 	return p;
 }
 
-inline void FreeObj(SlangObj* p){
+inline void SlangInterpreter::FreeObj(SlangObj* p){
 	/*if (!stillAround.contains(p)){
 		std::cout << "double free!\n";
 	} else {
 		stillAround.erase(p);
 	}*/
-	free(p);
+	//free(p);
+	p->flags |= FLAG_FREE;
 	--gAllocCount;
 }
 
-void FreeExpr(SlangObj* p){
+void SlangInterpreter::FreeExpr(SlangObj* p){
 	if (p->type==SlangType::List){
 		FreeExpr(p->left);
 		FreeExpr(p->right);
@@ -46,7 +65,7 @@ void FreeExpr(SlangObj* p){
 	FreeObj(p);
 }
 
-void FreeEnv(Env* e){
+void SlangInterpreter::FreeEnv(Env* e){
 	for (auto* child : e->children){
 		FreeEnv(child);
 		delete child;
@@ -57,7 +76,7 @@ void FreeEnv(Env* e){
 	}
 }
 
-SlangObj* Copy(const SlangObj* expr){
+SlangObj* SlangInterpreter::Copy(const SlangObj* expr){
 	SlangObj* n = AllocateObj();
 	memcpy(n,expr,sizeof(SlangObj));
 	if (expr->type==SlangType::List){
@@ -88,15 +107,19 @@ enum SlangGlobalSymbol {
 	SLANG_PAIR,
 	SLANG_LEFT,
 	SLANG_RIGHT,
+	SLANG_SET_LEFT,
+	SLANG_SET_RIGHT,
 	SLANG_ADD,
 	SLANG_SUB,
 	SLANG_MUL,
+	SLANG_DIV,
+	SLANG_PRINT,
 	GLOBAL_SYMBOL_COUNT
 };
 
 SymbolNameDict gDefaultNameDict = {
 	{"def",SLANG_DEFINE},
-	{"lambda",SLANG_LAMBDA},
+	{"&",SLANG_LAMBDA},
 	{"set!",SLANG_SET},
 	{"if",SLANG_IF},
 	{"do",SLANG_DO},
@@ -104,14 +127,16 @@ SymbolNameDict gDefaultNameDict = {
 	{"pair",SLANG_PAIR},
 	{"L",SLANG_LEFT},
 	{"R",SLANG_RIGHT},
+	{"setL!",SLANG_SET_LEFT},
+	{"setR!",SLANG_SET_RIGHT},
 	{"+",SLANG_ADD},
 	{"-",SLANG_SUB},
-	{"*",SLANG_MUL}
+	{"*",SLANG_MUL},
+	{"/",SLANG_DIV},
+	{"print",SLANG_PRINT}
 };
 
 void Env::DefSymbol(SymbolName name,SlangObj* obj){
-	if (symbolMap.contains(name))
-		FreeExpr(symbolMap.at(name));
 	symbolMap.insert_or_assign(name,obj);
 }
 
@@ -121,47 +146,47 @@ SlangObj* Env::GetSymbol(SymbolName name) const {
 		
 	return symbolMap.at(name);
 }
-inline Env* Env::MakeChild(){
+inline Env* SlangInterpreter::MakeEnvChild(Env* parent){
 	Env* child = new Env;
-	*child = {{},{},this};
-	if (parent){
-		for (const auto& [name,sym] : symbolMap){
+	*child = {{},{},parent};
+	if (parent->parent){
+		for (const auto& [name,sym] : parent->symbolMap){
 			child->DefSymbol(name,Copy(sym));
 		}
 	}
-	children.push_back(child);
+	parent->children.push_back(child);
 	return child;
 }
-
+/*
 inline void Env::Clear(){
 	for (const auto& [name,sym] : symbolMap){
 		FreeExpr(sym);
 	}
 	symbolMap.clear();
-}
+}*/
 
-inline SlangObj* MakeInt(int64_t i){
+inline SlangObj* SlangInterpreter::MakeInt(int64_t i){
 	SlangObj* obj = AllocateObj();
 	obj->type = SlangType::Int;
 	obj->integer = i;
 	return obj;
 }
 
-inline SlangObj* MakeBool(bool b){
+inline SlangObj* SlangInterpreter::MakeBool(bool b){
 	SlangObj* obj = AllocateObj();
 	obj->type = SlangType::Bool;
 	obj->boolean = b;
 	return obj;
 }
 
-inline SlangObj* MakeSymbol(SymbolName symbol){
+inline SlangObj* SlangInterpreter::MakeSymbol(SymbolName symbol){
 	SlangObj* obj = AllocateObj();
 	obj->type = SlangType::Symbol;
 	obj->symbol = symbol;
 	return obj;
 }
 
-inline SlangObj* MakeList(const std::vector<SlangObj*>& objs){
+inline SlangObj* SlangInterpreter::MakeList(const std::vector<SlangObj*>& objs){
 	SlangObj* listHead = AllocateObj();
 	listHead->type = SlangType::List;
 	SlangObj* list = listHead;
@@ -186,11 +211,11 @@ inline bool GetRecursiveSymbol(Env* e,SymbolName name,SlangObj** val){
 	return false;
 }
 
-inline bool SetRecursiveSymbol(Env* e,SymbolName name,SlangObj* val){
+inline bool SetRecursiveSymbol(SlangInterpreter* alloc,Env* e,SymbolName name,SlangObj* val){
 	while (e){
 		SlangObj* res = e->GetSymbol(name);
 		if (res){
-			e->DefSymbol(name,Copy(val));
+			e->DefSymbol(name,alloc->Copy(val));
 			return true;
 		}
 		e = e->parent;
@@ -198,30 +223,56 @@ inline bool SetRecursiveSymbol(Env* e,SymbolName name,SlangObj* val){
 	return false;
 }
 
-inline SlangObj* SlangInterpreter::SlangFuncDefine(const SlangArgVec& args,Env* env){
-	assert(args.size()==2);
-	assert(args[0]->type==SlangType::Symbol);
-	// can't exist
-	//assert(env->GetSymbol(args[0]->symbol)==nullptr);
-	
-	SlangObj* res = EvalExpr(args[1],env);
-	// not nullptr
-	//assert(res);
-	
-	env->DefSymbol(args[0]->symbol,res);
-	return Copy(res);
+inline SlangObj* NextArg(const SlangObj* expr){
+	return expr->right;
 }
 
-inline SlangObj* SlangInterpreter::SlangFuncLambda(const SlangArgVec& args,Env* env){
-	assert(args.size()==2);
-	assert(args[0]->type==SlangType::List||args[0]->type==SlangType::Null);
+inline bool SlangInterpreter::SlangFuncDefine(SlangObj* argIt,SlangObj* res,Env* env){
+	// can't exist
+	//assert(env->GetSymbol(args[0]->symbol)==nullptr);
+	if (argIt->left->type!=SlangType::Symbol){
+		TypeError(argIt->left,argIt->left->type,SlangType::Symbol);
+		return false;
+	}
+		
+	SymbolName sym = argIt->left->symbol;
+	argIt = NextArg(argIt);
+	if (!EvalExpr(argIt->left,res,env))
+		return false;
+	
+	SlangObj* h = AllocateObj();
+	*h = *res;
+	env->DefSymbol(sym,h);
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncLambda(SlangObj* argIt,SlangObj* res,Env* env){
+	if (argIt->left->type!=SlangType::List&&argIt->left->type!=SlangType::Null){
+		std::stringstream msg = {};
+		msg << "LambdaError:\n    Expected parameter list, not '" << *argIt->left << "'";
+		PushError(argIt->left,msg.str());
+		return false;
+	}
+		
 	std::vector<SymbolName> params = {};
 	std::set<SymbolName> seen = {};
-	SlangObj* paramIt = args[0];
+	SlangObj* paramIt = argIt->left;
 	while (paramIt->type!=SlangType::Null){
-		assert(paramIt->type==SlangType::List);
-		assert(paramIt->left->type==SlangType::Symbol);
-		assert(!seen.contains(paramIt->left->symbol));
+		if (paramIt->type!=SlangType::List){
+			TypeError(paramIt,paramIt->type,SlangType::List);
+			return false;
+		}
+		if (paramIt->left->type!=SlangType::Symbol){
+			TypeError(paramIt->left,paramIt->left->type,SlangType::Symbol);
+			return false;
+		}
+		if (seen.contains(paramIt->left->symbol)){
+			std::stringstream msg = {};
+			msg << "LambdaError:\n    Lambda parameter '" << 
+				*paramIt->left << "' was reused!";
+			PushError(paramIt->left,msg.str());
+			return false;
+		}
 		
 		params.push_back(paramIt->left->symbol);
 		seen.insert(paramIt->left->symbol);
@@ -229,110 +280,265 @@ inline SlangObj* SlangInterpreter::SlangFuncLambda(const SlangArgVec& args,Env* 
 		paramIt = paramIt->right;
 	}
 
-	Env* child = env->MakeChild();
-	SlangLambda lam = {params,args[1],child};
+	Env* child = MakeEnvChild(env);
+	argIt = NextArg(argIt);
+	SlangLambda lam = {params,argIt->left,child};
 	LambdaKey key = RegisterLambda(lam);
-	SlangObj* ret = AllocateObj();
-	ret->type = SlangType::Lambda;
-	ret->lambda = key;
-	return ret;
+	res->type = SlangType::Lambda;
+	res->lambda = key;
+	return true;
 }
 
-inline SlangObj* SlangInterpreter::SlangFuncSet(const SlangArgVec& args,Env* env){
-	assert(args.size()==2);
-	assert(args[0]->type==SlangType::Symbol);
-	SlangObj* s = EvalExpr(args[1],env);
-	assert(s);
-	if (!SetRecursiveSymbol(env,args[0]->symbol,s)){
-		assert(false);
+inline bool SlangInterpreter::SlangFuncSet(SlangObj* argIt,SlangObj* res,Env* env){
+	if (argIt->left->type!=SlangType::Symbol){
+		TypeError(argIt->left,argIt->left->type,SlangType::Symbol);
+		return false;
 	}
-	SlangObj* copy = Copy(s);
-	FreeExpr(s);
-	return copy;
-}
-
-inline SlangObj* SlangInterpreter::SlangFuncQuote(const SlangArgVec& args){
-	assert(args.size()==1);
-	return Copy(args.front());
-}
-
-inline SlangObj* SlangInterpreter::SlangFuncPair(const SlangArgVec& args,Env* env){
-	assert(args.size()==2);
-	SlangObj* obj = AllocateObj();
+	SymbolName sym = argIt->left->symbol;
+	argIt = NextArg(argIt);
 	
-	obj->type = SlangType::List;
-	obj->left = EvalExpr(args.front(),env);
-	obj->right = EvalExpr(args.back(),env);
-	return obj;
-}
-
-inline SlangObj* SlangInterpreter::SlangFuncLeft(const SlangArgVec& args,Env* env){
-	assert(args.size()==1);
-	SlangObj* m = EvalExpr(args.front(),env);
-	assert(m->type==SlangType::List);
-	SlangObj* copy = Copy(m->left);
-	FreeExpr(m);
-	return copy;
-}
-
-inline SlangObj* SlangInterpreter::SlangFuncRight(const SlangArgVec& args,Env* env){
-	assert(args.size()==1);
-	SlangObj* m = EvalExpr(args.front(),env);
-	assert(m->type==SlangType::List);
-	SlangObj* copy = Copy(m->right);
-	FreeExpr(m);
-	return copy;
-}
-
-/*inline SlangObj* SlangInterpreter::SlangFuncSetLeft(const SlangArgVec& args,Env* env){
-	assert(args.size()==2);
-	SlangObj* toSet = EvalExpr(args[0],env);
-	assert(toSet->type==SlangType::List);
+	if (!EvalExpr(argIt->left,res,env))
+		return false;
+		
+	if (!SetRecursiveSymbol(this,env,sym,res)){
+		std::stringstream msg = {};
+		msg << "SetError:\n    Cannot set undefined symbol '" << *argIt->left << "'";
+		PushError(argIt->left,msg.str());
+		return false;
+	}
 	
-	SlangObj* s = EvalExpr(args[1],env);
-	
-	SlangObj* copy = Copy(s);
-	FreeExpr(s);
-	return copy;
-}*/
+	return true;
+}
 
-inline SlangObj* SlangInterpreter::SlangFuncAdd(const SlangArgVec& args,Env* env){
+inline bool SlangInterpreter::SlangFuncQuote(SlangObj* argIt,SlangObj* res){
+	//if (argIt->type==SlangType::Null)
+	//	return false;
+	
+	*res = *argIt->left;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncPair(SlangObj* argIt,SlangObj* res,Env* env){
+	res->type = SlangType::List;
+	res->left = AllocateObj();
+	res->right = AllocateObj();
+	
+	if (!WrappedEvalExpr(argIt->left,res->left,env))
+		return false;
+		
+	argIt = NextArg(argIt);
+	
+	if (!WrappedEvalExpr(argIt->left,res->right,env))
+		return false;
+	
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncLeft(SlangObj* argIt,SlangObj* res,Env* env){
+	if (!WrappedEvalExpr(argIt->left,res,env))
+		return false;
+		
+	if (res->type!=SlangType::List){
+		TypeError(res,res->type,SlangType::List);
+		return false;
+	}
+	
+	*res = *res->left;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncRight(SlangObj* argIt,SlangObj* res,Env* env){
+	if (!WrappedEvalExpr(argIt->left,res,env))
+		return false;
+	
+	if (res->type!=SlangType::List){
+		TypeError(res,res->type,SlangType::List);
+		return false;
+	}
+		
+	*res = *res->right;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncSetLeft(SlangObj* argIt,SlangObj* res,Env* env){
+	// TODO: make res a SlangObj**
+	SlangObj* toSet = StackAlloc();
+	if (!WrappedEvalExpr(argIt->left,toSet,env))
+		return false;
+		
+	if (toSet->type!=SlangType::List){
+		TypeError(toSet,toSet->type,SlangType::List);
+		return false;
+	}
+	
+	argIt = NextArg(argIt);
+	
+	SlangObj* val = StackAlloc();
+	if (!WrappedEvalExpr(argIt->left,val,env))
+		return false;
+	
+	*toSet->left = *val;
+	*res = *val;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncSetRight(SlangObj* argIt,SlangObj* res,Env* env){
+	SlangObj* toSet = StackAlloc();
+	if (!WrappedEvalExpr(argIt->left,toSet,env))
+		return false;
+	
+	if (toSet->type!=SlangType::List){
+		TypeError(toSet,toSet->type,SlangType::List);
+		return false;
+	}
+	
+	argIt = NextArg(argIt);
+	
+	SlangObj* val = StackAlloc();
+	if (!WrappedEvalExpr(argIt->left,val,env))
+		return false;
+	
+	*toSet->right = *val;
+	*res = *val;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncAdd(SlangObj* argIt,SlangObj* res,Env* env){
 	int64_t sum = 0;
-	for (const auto& arg : args){
-		SlangObj* e = EvalExpr(arg,env);
-		assert(e->type==SlangType::Int);
-		sum += e->integer;
-		FreeObj(e);
+	while (argIt->type!=SlangType::Null){
+		if (!EvalExpr(argIt->left,res,env))
+			return false;
+			
+		if (res->type!=SlangType::Int){
+			TypeError(res,res->type,SlangType::Int);
+			return false;
+		}
+			
+		sum += res->integer;
+		argIt = NextArg(argIt);
 	}
-	return MakeInt(sum);
+	res->type = SlangType::Int;
+	res->integer = sum;
+	return true;
 }
 
-inline SlangObj* SlangInterpreter::SlangFuncSub(const SlangArgVec& args,Env* env){
-	SlangObj* start = EvalExpr(args.front(),env);
-	assert(start->type==SlangType::Int);
-	int64_t diff = start->integer;
-	FreeObj(start);
-	for (size_t i=1;i<args.size();++i){
-		SlangObj* e = EvalExpr(args[i],env);
-		assert(e->type==SlangType::Int);
-		diff -= e->integer;
-		FreeObj(e);
+inline bool SlangInterpreter::SlangFuncSub(SlangObj* argIt,SlangObj* res,Env* env){
+	if (!EvalExpr(argIt->left,res,env))
+		return false;
+	if (res->type!=SlangType::Int){
+		TypeError(res,res->type,SlangType::Int);
+		return false;
 	}
-	return MakeInt(diff);
+	
+	argIt = NextArg(argIt);
+	int64_t diff = res->integer;
+	while (argIt->type!=SlangType::Null){
+		if (!EvalExpr(argIt->left,res,env))
+			return false;
+		
+		if (res->type!=SlangType::Int){
+			TypeError(res,res->type,SlangType::Int);
+			return false;
+		}
+			
+		diff -= res->integer;
+		argIt = NextArg(argIt);
+	}
+	res->type = SlangType::Int;
+	res->integer = diff;
+	return true;
 }
 
-inline SlangObj* SlangInterpreter::SlangFuncMul(const SlangArgVec& args,Env* env){
+inline bool SlangInterpreter::SlangFuncMul(SlangObj* argIt,SlangObj* res,Env* env){
 	int64_t prod = 1;
-	for (const auto& arg : args){
-		SlangObj* e = EvalExpr(arg,env);
-		assert(e->type==SlangType::Int);
-		prod *= e->integer;
-		FreeObj(e);
+	while (argIt->type!=SlangType::Null){
+		if (!EvalExpr(argIt->left,res,env))
+			return false;
+			
+		if (res->type!=SlangType::Int){
+			TypeError(res,res->type,SlangType::Int);
+			return false;
+		}
+			
+		prod *= res->integer;
+		argIt = NextArg(argIt);
 	}
-	return MakeInt(prod);
+	res->type = SlangType::Int;
+	res->integer = prod;
+	return true;
 }
 
-SlangObj* SlangInterpreter::EvalExpr(const SlangObj* expr,Env* env){
+inline bool SlangInterpreter::SlangFuncDiv(SlangObj* argIt,SlangObj* res,Env* env){
+	if (!EvalExpr(argIt->left,res,env))
+		return false;
+	if (res->type!=SlangType::Int){
+		TypeError(res,res->type,SlangType::Int);
+		return false;
+	}
+	
+	argIt = NextArg(argIt);
+	int64_t quo = res->integer;
+	while (argIt->type!=SlangType::Null){
+		if (!EvalExpr(argIt->left,res,env))
+			return false;
+		
+		if (res->type!=SlangType::Int){
+			TypeError(res,res->type,SlangType::Int);
+			return false;
+		}
+			
+		quo /= res->integer;
+		argIt = NextArg(argIt);
+	}
+	res->type = SlangType::Int;
+	res->integer = quo;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncPrint(SlangObj* argIt,SlangObj* res,Env* env){
+	if (!EvalExpr(argIt->left,res,env))
+		return false;
+	
+	std::cout << *res << '\n';
+	return true;
+}
+
+bool SlangInterpreter::Validate(SlangObj* expr){
+	switch (expr->type){
+		case SlangType::Int:
+		case SlangType::Real:
+		case SlangType::Null:
+		case SlangType::String:
+		case SlangType::Bool:
+		case SlangType::Lambda:
+		case SlangType::Symbol:
+			return true;
+		case SlangType::List: {
+			
+			
+			return true;
+		}
+	}
+	return false;
+}
+
+inline bool SlangInterpreter::WrappedEvalExpr(SlangObj* expr,SlangObj* res,Env* env){
+	StackAllocFrame();
+	bool b = EvalExpr(expr,res,env);
+	StackFreeFrame();
+	return b;
+}
+
+inline size_t GetArgCount(const SlangObj* arg){
+	size_t c = 0;
+	while (arg->type!=SlangType::Null){
+		arg = NextArg(arg);
+		++c;
+	}
+	return c;
+}
+
+bool SlangInterpreter::EvalExpr(SlangObj* expr,SlangObj* res,Env* env){
 	++gEvalRecurCounter;
 	while (true){
 		++gEvalCounter;
@@ -343,138 +549,367 @@ SlangObj* SlangInterpreter::EvalExpr(const SlangObj* expr,Env* env){
 			case SlangType::String:
 			case SlangType::Bool:
 			case SlangType::Lambda: {
-				return Copy(expr);
+				*res = *expr;
+				return true;
 			}
 			case SlangType::Symbol: {
 				Env* parent = env;
-				SlangObj* ref = nullptr;
-				if (GetRecursiveSymbol(parent,expr->symbol,&ref)){
-					return Copy(ref);
+				SlangObj* found;
+				if (GetRecursiveSymbol(parent,expr->symbol,&found)){
+					*res = *found;
+					return true;
 				}
 				
-				return Copy(expr);
+				*res = *expr;
+				return true;
 			}
 			
 			// function
 			case SlangType::List: {
-				SlangObj* head = EvalExpr(expr->left,env);
-				const SlangObj* argIt = expr->right;
-				
-				std::vector<SlangObj*> args{};
-				args.reserve(4);
-				while (argIt->type!=SlangType::Null){
-					SlangObj* a = argIt->left;
-					args.push_back(a);
-					argIt = argIt->right;
+				size_t resetPoint = frameIndex;
+				SlangObj head = {};
+				if (!EvalExpr(expr->left,&head,env)){
+					EvalError(expr);
+					return false;
 				}
+				frameIndex = resetPoint;
 				
-				if (head->type==SlangType::Lambda){
-					SlangLambda* lam = GetLambda(head->lambda);
-					assert(args.size()==lam->params.size());
+				SlangObj* argIt = NextArg(expr);
+				size_t argCount = GetArgCount(argIt);
+				
+				if (head.type==SlangType::Lambda){
+					SlangLambda* lam = GetLambda(head.lambda);
+					
+					if (lam->params.size()!=argCount){
+						ArityError(expr,argCount,lam->params.size());
+						return false;
+					}
+					
+					size_t tempBase = frameIndex;
+					for (size_t i=0;i<argCount;++i){
+						if (!WrappedEvalExpr(argIt->left,StackAlloc(),env)){
+							EvalError(expr);
+							return false;
+						}
+						argIt = NextArg(argIt);
+					}
+					if (argIt->type!=SlangType::Null){
+						EvalError(expr);
+						return false;
+					}
 					
 					Env* funcEnv = lam->env;
-					for (size_t i=0;i<args.size();++i){
-						args[i] = EvalExpr(args[i],env);
+					if (funcEnv!=env){
+						for (size_t i=0;i<argCount;++i){
+							funcEnv->DefSymbol(lam->params[i],&stack[tempBase++]);
+						}
+						assert(tempBase==frameIndex);
+					} else { // tail call stack eliasion
+						for (size_t i=0;i<argCount;++i){
+							auto* sym = funcEnv->GetSymbol(lam->params[i]);
+							*sym = stack[tempBase++];
+						}
+						assert(tempBase==frameIndex);
+						frameIndex = resetPoint;
 					}
 					
-					//funcEnv->Clear();
-					for (size_t i=0;i<lam->params.size();++i){
-						funcEnv->DefSymbol(lam->params[i],Copy(args[i]));
-					}
-					
-					for (auto* arg : args){
-						FreeExpr(arg);
-					}
-					
-					FreeExpr(head);
 					expr = lam->body;
 					env = funcEnv;
 					continue;
-				} else if (head->type==SlangType::Symbol){
-					auto symbol = head->symbol;
-					FreeObj(head);
+				} else if (head.type==SlangType::Symbol){
+					auto symbol = head.symbol;
 					// handle predefined symbols
+					bool success = false;
 					switch (symbol){
 						case SLANG_DEFINE:
-							return SlangFuncDefine(args,env);
-						case SLANG_LAMBDA:
-							return SlangFuncLambda(args,env);
-						case SLANG_SET:
-							return SlangFuncSet(args,env);
-						case SLANG_DO: {
-							SlangObj* res = nullptr;
-							for (size_t i=0;i<args.size()-1;++i){
-								if (res) FreeExpr(res);
-								res = EvalExpr(args[i],env);
-								assert(res);
+							if (argCount!=2){
+								ArityError(expr,argCount,2);
+								return false;
 							}
-							if (res) FreeExpr(res);
+							success = SlangFuncDefine(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
+						case SLANG_LAMBDA:
+							if (argCount!=2){
+								ArityError(expr,argCount,2);
+								return false;
+							}
+							success = SlangFuncLambda(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
+						case SLANG_SET:
+							if (argCount!=2){
+								ArityError(expr,argCount,2);
+								return false;
+							}
+							success = SlangFuncSet(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
+						case SLANG_DO: {
+							if (argCount==0){
+								ArityError(expr,argCount,1);
+								return false;
+							}
+							// while next arg is not null
+							while (argIt->right->type!=SlangType::Null){
+								if (!WrappedEvalExpr(argIt->left,res,env)){
+									EvalError(argIt->left);
+									return false;
+								}
+								argIt = NextArg(argIt);
+							}
 							
-							expr = args.back();
+							// elide last call
+							expr = argIt->left;
 							continue;
 						}
 						case SLANG_IF: {
-							assert(args.size()==3);
+							if (argCount!=3){
+								ArityError(expr,argCount,3);
+								return false;
+							}
 							bool test;
 							
-							auto* first = EvalExpr(args.front(),env);
-							if (first->type==SlangType::Int){
-								test = (bool)first->integer;
-							} else if (first->type==SlangType::Bool){
-								test = first->boolean;
-							} else {
-								assert(false);
-								test = false;
+							if (!WrappedEvalExpr(argIt->left,res,env)){
+								EvalError(expr);
+								return false;
 							}
-							FreeExpr(first);
+								
+							if (res->type==SlangType::Int){
+								test = (bool)res->integer;
+							} else if (res->type==SlangType::Bool){
+								test = res->boolean;
+							} else {
+								TypeError(argIt->left,argIt->type,SlangType::Bool);
+								EvalError(expr);
+								return false;
+							}
 							
+							argIt = NextArg(argIt);
 							if (test){
-								expr = args[1];
+								expr = argIt->left;
 								continue;
 							}
-							expr = args[2];
+							argIt = NextArg(argIt);
+							expr = argIt->left;
 							continue;
 						}
 						case SLANG_QUOTE:
-							return SlangFuncQuote(args);
+							if (argCount!=1){
+								ArityError(expr,argCount,1);
+								return false;
+							}
+							success = SlangFuncQuote(argIt,res);
+							if (!success)
+								EvalError(expr);
+							return success;
 						case SLANG_PAIR:
-							return SlangFuncPair(args,env);
+							if (argCount!=2){
+								ArityError(expr,argCount,2);
+								return false;
+							}
+							success = SlangFuncPair(argIt,res,env);
+							return success;
 						case SLANG_LEFT:
-							return SlangFuncLeft(args,env);
+							if (argCount!=1){
+								ArityError(expr,argCount,1);
+								return false;
+							}
+							success = SlangFuncLeft(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
 						case SLANG_RIGHT:
-							return SlangFuncRight(args,env);
+							if (argCount!=1){
+								ArityError(expr,argCount,1);
+								return false;
+							}
+							success = SlangFuncRight(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
 						case SLANG_ADD:
-							return SlangFuncAdd(args,env);
+							success = SlangFuncAdd(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
 						case SLANG_SUB:
-							return SlangFuncSub(args,env);
+							if (argCount<2){
+								ArityError(expr,argCount,2);
+								return false;
+							}
+							success = SlangFuncSub(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
 						case SLANG_MUL:
-							return SlangFuncMul(args,env);
+							success = SlangFuncMul(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
+						case SLANG_DIV:
+							if (argCount<2){
+								ArityError(expr,argCount,2);
+								return false;
+							}
+							success = SlangFuncDiv(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
+						case SLANG_SET_LEFT:
+							if (argCount!=2){
+								ArityError(expr,argCount,2);
+								return false;
+							}
+							success = SlangFuncSetLeft(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
+						case SLANG_SET_RIGHT:
+							if (argCount!=2){
+								ArityError(expr,argCount,2);
+								return false;
+							}
+							success = SlangFuncSetRight(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
+						case SLANG_PRINT:
+							if (argCount!=1){
+								ArityError(expr,argCount,1);
+								return false;
+							}
+							success = SlangFuncPrint(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
 						default:
 							//std::cout << *head << '\n';
-							assert(false);
-							break;
+							ProcError(&head);
+							return false;
 					}
 				} else {
-					std::cout << "No match: " << *head << '\n';
-					assert(false);
+					std::cout << "No match: " << head << '\n';
+					return false;
 				}
 			}
 		}
 	}
 }
 
+inline SlangObj* SlangInterpreter::StackAlloc(){
+	if (frameIndex==stack.size()-1)
+		return nullptr;
+		//stack.emplace_back();
+	
+	gMaxStackHeight = (gMaxStackHeight<frameIndex) ? frameIndex : gMaxStackHeight;
+	return &stack[frameIndex++];
+}
+
+inline void SlangInterpreter::StackAllocFrame(){
+	frameStack.emplace_back(baseIndex);
+	baseIndex = frameIndex;
+}
+
+inline void SlangInterpreter::StackFreeFrame(){
+	assert(!frameStack.empty());
+	frameIndex = baseIndex;
+	baseIndex = frameStack.back();
+	frameStack.pop_back();
+}
+
+void SlangInterpreter::PushError(const SlangObj* expr,const std::string& msg){
+	LocationData loc = parser.GetExprLocation(expr);
+	errors.emplace_back(loc,msg);
+}
+
+void SlangInterpreter::EvalError(const SlangObj* expr){
+	//if (expr==program) return;
+	std::stringstream msg = {};
+	msg << "EvalError:\n    Error while evaluating '" << *expr << "'";
+	PushError(expr,msg.str());
+}
+
+inline const char* TypeToString(SlangType type){
+	switch (type){
+		case SlangType::Int:
+			return "Int";
+		case SlangType::Real:
+			return "Real";
+		case SlangType::String:
+			return "String";
+		case SlangType::List:
+			return "Pair";
+		case SlangType::Bool:
+			return "Bool";
+		case SlangType::Symbol:
+			return "Symbol";
+		case SlangType::Null:
+			return "Null";
+		case SlangType::Lambda:
+			return "Lambda";
+	}
+	return nullptr;
+}
+
+void SlangInterpreter::TypeError(const SlangObj* expr,SlangType found,SlangType expect){
+	std::stringstream msg = {};
+	msg << "TypeError:\n    Expected type " << 
+		TypeToString(expect) << " instead of type " << 
+		TypeToString(found) << " in argument '" << *expr << "'";
+		
+	PushError(expr,msg.str());
+}
+
+void SlangInterpreter::ProcError(const SlangObj* proc){
+	std::stringstream msg = {};
+	msg << "ProcError:\n    Procedure '" << *proc << "' is not defined!";
+	
+	PushError(proc,msg.str());
+}
+
+void SlangInterpreter::ArityError(const SlangObj* head,size_t found,size_t expect){
+	std::stringstream msg = {};
+	msg << "ArityError:\n    Procedure '" << *head << 
+		"' takes " << expect << " arguments, was given " <<
+		found;
+		
+	PushError(head,msg.str());
+}
+
 void SlangInterpreter::Run(SlangObj* prog){
+	arena = new MemArena();
 	gDebugInterpreter = this;
+	stack = {};
+	frameStack = {};
+	frameStack.reserve(32);
+	stack.resize(5461);
+	frameIndex = 0;
+	baseIndex = 0;
+	errors = {};
 	
 	program = prog;
+	
 	env = {};
-	SlangObj* res = EvalExpr(prog,&env);
+	SlangObj res;
+	WrappedEvalExpr(prog,&res,&env);
 	
-	std::cout << *res << '\n';
-	FreeExpr(prog);
-	FreeExpr(res);
 	
-	FreeEnv(&env);
+	if (!errors.empty()){
+		PrintErrors(errors);
+		std::cout << '\n';
+		//for (const auto& e : errors){
+		//	std::cout << e.msg << '\n';
+		//}
+	}
+	//std::cout << res << '\n';
+	//FreeExpr(prog);
+	//FreeExpr(res);
+	
+	//FreeEnv(&env);
 	
 	//std::cout << "still alive:\n";
 	//for (auto* alive : stillAround){
@@ -483,10 +918,13 @@ void SlangInterpreter::Run(SlangObj* prog){
 	
 	std::cout << "Alloc balance: " << gAllocCount << '\n';
 	std::cout << "Alloc total: " << gAllocTotal << " (" << gAllocTotal*sizeof(SlangObj)/1024 << " KB)\n";
+	std::cout << "Heap alloc total: " << gHeapAllocTotal << " (" << gHeapAllocTotal*sizeof(SlangObj)/1024 << " KB)\n";
 	std::cout << "Max allocated: " << gMaxAlloc << " (" << gMaxAlloc*sizeof(SlangObj)/1024 << " KB)\n";
 	std::cout << "Eval count: " << gEvalCounter << '\n';
 	std::cout << "Non-eliminated eval count: " << gEvalRecurCounter << '\n';
-	
+	std::cout << "Frame height at end: " << frameStack.size() << '\n';
+	std::cout << "Max stack height: " << gMaxStackHeight << '\n';
+	delete arena;
 }
 
 inline SlangToken SlangTokenizer::NextToken(){
@@ -573,7 +1011,8 @@ std::string SlangParser::GetSymbolString(SymbolName symbol){
 
 
 void SlangParser::PushError(const std::string& msg){
-	errors.emplace_back(token.line,token.col,msg);
+	LocationData l = {token.line,token.col,0};
+	errors.emplace_back(l,msg);
 }
 
 inline void SlangParser::NextToken(){
@@ -593,17 +1032,40 @@ inline void SlangParser::NextToken(){
 	}
 }
 
+inline SlangObj* HeapAllocObj(){
+	++gHeapAllocTotal;
+	return new SlangObj;
+}
+
 inline SlangObj* QuoteExpr(SlangObj* expr){
-	return MakeList({MakeSymbol(SLANG_QUOTE),expr});
+	SlangObj* q = HeapAllocObj();
+	q->type = SlangType::Symbol;
+	q->symbol = SLANG_QUOTE;
+
+	SlangObj* list = HeapAllocObj();
+	list->type = SlangType::List;
+	list->left = q;
+	list->right = HeapAllocObj();
+	list->right->type = SlangType::List;
+	list->right->left = expr;
+	list->right->right = HeapAllocObj();
+	list->right->right->type = SlangType::Null;
+
+	return list;
 }
 
 inline SlangObj* SlangParser::ParseObj(){
+	LocationData loc = {token.line,token.col,0};
 	switch (token.type){
 		case SlangTokenType::Int: {
 			char* d;
 			int64_t i = strtoll(token.view.begin(),&d,10);
 			NextToken();
-			return MakeInt(i);
+			SlangObj* intObj = HeapAllocObj();
+			intObj->type = SlangType::Int;
+			intObj->integer = i;
+			codeMap[intObj] = loc;
+			return intObj;
 		}
 		case SlangTokenType::Symbol: {
 			SymbolName s;
@@ -613,21 +1075,39 @@ inline SlangObj* SlangParser::ParseObj(){
 			else
 				s = nameDict.at(copy);
 			NextToken();
-			return MakeSymbol(s);
+			SlangObj* sym = HeapAllocObj();
+			sym->type = SlangType::Symbol;
+			sym->symbol = s;
+			codeMap[sym] = loc;
+			return sym;
 		}
 		case SlangTokenType::True: {
 			NextToken();
-			return MakeBool(true);
+			SlangObj* boolObj = HeapAllocObj();
+			boolObj->type = SlangType::Bool;
+			boolObj->boolean = true;
+			codeMap[boolObj] = loc;
+			return boolObj;
 		}
 		case SlangTokenType::False: {
 			NextToken();
-			return MakeBool(false);
+			SlangObj* boolObj = HeapAllocObj();
+			boolObj->type = SlangType::Bool;
+			boolObj->boolean = false;
+			codeMap[boolObj] = loc;
+			return boolObj;
 		}
-		case SlangTokenType::Quote:
+		case SlangTokenType::Quote: {
 			NextToken();
-			return QuoteExpr(ParseExprOrObj());
-		case SlangTokenType::LeftBracket:
-			return ParseExpr();
+			SlangObj* res = QuoteExpr(ParseExprOrObj());
+			codeMap[res] = loc;
+			return res;
+		}
+		case SlangTokenType::LeftBracket: {
+			SlangObj* res = ParseExpr();
+			codeMap[res] = loc;
+			return res;
+		}
 		case SlangTokenType::Error:
 			PushError("Token error: "+std::string(token.view));
 			return nullptr;
@@ -645,11 +1125,10 @@ inline SlangObj* SlangParser::ParseObj(){
 }
 
 SlangObj* SlangParser::ParseExpr(){
-	SlangObj* objHead = AllocateObj();
+	SlangObj* objHead = HeapAllocObj();
 	objHead->type = SlangType::Null;
 	
 	SlangObj* obj = objHead;
-	assert(token.type==SlangTokenType::LeftBracket);
 	char leftBracket = token.view[0];
 	NextToken();
 	
@@ -659,7 +1138,7 @@ SlangObj* SlangParser::ParseExpr(){
 		
 		obj->type = SlangType::List;
 		
-		obj->right = AllocateObj();
+		obj->right = HeapAllocObj();
 		obj = obj->right;
 		obj->type = SlangType::Null;
 	}
@@ -687,37 +1166,59 @@ SlangObj* SlangParser::ParseExpr(){
 	}
 	
 	NextToken();
-	
 	return objHead;
 }
 
 inline SlangObj* SlangParser::ParseExprOrObj(){
 	if (token.type==SlangTokenType::LeftBracket){
-		return ParseExpr();
+		LocationData loc = {token.line,token.col,0};
+		SlangObj* res = ParseExpr();
+		codeMap[res] = loc;
+		return res;
 	}
-	return ParseObj();
-}
-
-void PrintErrors(const SlangParser& parser){
-	for (const auto& error : parser.errors){
-		std::cout << "@" << error.line << ',' << error.col <<
-			": " << error.message << '\n';
-	}
+	SlangObj* res = ParseObj();
+	return res;
 }
 
 // wraps program exprs in a (do ...) block
 inline SlangObj* WrapProgram(const std::vector<SlangObj*>& exprs){
-	SlangObj* outer = AllocateObj();
+	SlangObj* doSym = HeapAllocObj();
+	doSym->type = SlangType::Symbol;
+	doSym->symbol = SLANG_DO;
+
+	SlangObj* outer = HeapAllocObj();
 	outer->type = SlangType::List;
-	outer->left = MakeSymbol(SLANG_DO);
-	outer->right = MakeList(exprs);
+	outer->left = doSym;
+	
+	
+	SlangObj* next = HeapAllocObj();
+	next->type = SlangType::Null;
+	outer->right = next;
+	for (auto* expr : exprs){
+		next->left = expr;
+		next->type = SlangType::List;
+		next->right = HeapAllocObj();
+		next = next->right;
+		next->type = SlangType::Null;
+	}
+	
+	// add one last null element for error reporting
+	SlangObj* last = HeapAllocObj();
+	last->type = SlangType::Null;
+	next->type = SlangType::List;
+	next->left = last;
+	next->right = HeapAllocObj();
+	next->right->type = SlangType::Null;
+	
 	return outer;
 }
 
-SlangObj* SlangParser::Parse(){
+SlangObj* SlangParser::Parse(const std::string& code){
 	gDebugParser = this;
-	nameDict = gDefaultNameDict;
-	currentName = GLOBAL_SYMBOL_COUNT;
+	tokenizer.SetText(code);
+	token.type = SlangTokenType::Comment;
+	//nameDict = gDefaultNameDict;
+	//currentName = GLOBAL_SYMBOL_COUNT;
 	NextToken();
 	
 	std::vector<SlangObj*> exprs = {};
@@ -734,10 +1235,28 @@ SlangObj* SlangParser::Parse(){
 	}
 	
 	if (!errors.empty()){
-		PrintErrors(*this);
+		PrintErrors(errors);
 		return nullptr;
 	}
 	return WrapProgram(exprs);
+}
+
+inline LocationData SlangParser::GetExprLocation(const SlangObj* expr){
+	if (!codeMap.contains(expr))
+		return {-1U,-1U,-1U};
+	
+	return codeMap.at(expr);
+}
+
+SlangParser::SlangParser() :
+		tokenizer(),token(),
+		nameDict(gDefaultNameDict),
+		currentName(GLOBAL_SYMBOL_COUNT),errors(){
+	token.type = SlangTokenType::Comment;
+}
+
+SlangObj* SlangInterpreter::Parse(const std::string& code){
+	return parser.Parse(code);
 }
 
 std::ostream& operator<<(std::ostream& os,SlangObj obj){
@@ -749,7 +1268,7 @@ std::ostream& operator<<(std::ostream& os,SlangObj obj){
 			os << obj.real;
 			break;
 		case SlangType::Lambda: {
-			os << "(lambda (";
+			os << "(& (";
 			SlangLambda* l = gDebugInterpreter->GetLambda(obj.lambda);
 			for (size_t i=0;i<l->params.size();++i){
 				if (i!=0)
@@ -768,9 +1287,9 @@ std::ostream& operator<<(std::ostream& os,SlangObj obj){
 			break;
 		case SlangType::Bool:
 			if (obj.boolean){
-				os << "#t";
+				os << "true";
 			} else {
-				os << "#f";
+				os << "false";
 			}
 			break;
 		case SlangType::List: {

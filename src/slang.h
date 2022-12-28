@@ -7,15 +7,26 @@
 #include <vector>
 #include <ostream>
 
+#define SMALL_SET_SIZE 32768
+#define MEDIUM_SET_SIZE 131072
+
 namespace slang {
 	typedef uint64_t SymbolName;
 	typedef uint64_t LambdaKey;
-	
 	typedef std::unordered_map<std::string,SymbolName> SymbolNameDict;
-	extern SymbolNameDict gSymbolDict;
-	extern SymbolName gCurrentSymbolName;
 	
-	enum class SlangType : uint8_t {
+	struct MemArena {
+		uint8_t smallSet[SMALL_SET_SIZE];
+		uint8_t mediumSet[MEDIUM_SET_SIZE];
+		
+		uint8_t* smallPointer = &smallSet[0];
+		uint8_t* mediumPointer = &mediumSet[0];
+		
+		uint8_t* smallSetEnd = &smallSet[0]+sizeof(smallSet);
+		uint8_t* mediumSetEnd = &mediumSet[0]+sizeof(mediumSet);
+	};
+		
+	enum class SlangType : uint16_t {
 		Null,
 		List,
 		Symbol,
@@ -26,9 +37,13 @@ namespace slang {
 		String
 	};
 	
+	enum SlangFlag : uint8_t {
+		FLAG_FREE = 1
+	};
+	
 	struct SlangObj {
 		SlangType type;
-		
+		uint8_t flags;
 		union {
 			struct {
 				SlangObj* left;
@@ -48,8 +63,6 @@ namespace slang {
 		std::vector<Env*> children;
 		Env* parent = nullptr;
 		
-		inline Env* MakeChild();
-		
 		inline void Clear();
 		void DefSymbol(SymbolName,SlangObj*);
 		// symbol might not exist
@@ -62,18 +75,15 @@ namespace slang {
 		Env* env;
 	};
 	
-	extern std::vector<SlangLambda> gLambdaDict;
-	
-	SymbolName RegisterSymbol(const std::string& name);
-	LambdaKey RegisterLambda(const SlangLambda&);
-	std::string GetSymbolString(SymbolName symbol);
-	
-	SlangObj* EvalExpr(const SlangObj* expr,Env& env);
-	
 	typedef std::string::const_iterator StringIt;
 	
-	struct ParseErrorData {
+	struct LocationData {
 		uint32_t line,col;
+		uint32_t fileIndex;
+	};
+	
+	struct ErrorData {
+		LocationData loc;
 		std::string message;
 	};
 	
@@ -102,12 +112,13 @@ namespace slang {
 		StringIt pos,end;
 		uint32_t line,col;
 		
-		SlangTokenizer(const std::string& code) : 
-			tokenStr(code),
-			pos(tokenStr.begin()),
-			end(tokenStr.end()),
-			line(),col(){}
-		
+		inline void SetText(const std::string& code){
+			tokenStr = code;
+			pos = tokenStr.begin();
+			end = tokenStr.end();
+			line = 0;
+			col = 0;
+		}
 		SlangToken NextToken();
 	};
 	
@@ -117,12 +128,13 @@ namespace slang {
 		
 		SymbolNameDict nameDict;
 		SymbolName currentName;
-		std::vector<ParseErrorData> errors;
+		std::vector<ErrorData> errors;
 		
-		SlangParser(const std::string& code) : 
-			tokenizer(code),token(),nameDict(),currentName(),errors(){
-			token.type = SlangTokenType::Comment;
-		}
+		std::unordered_map<const SlangObj*,LocationData> codeMap;
+		
+		SlangParser();
+		
+		inline LocationData GetExprLocation(const SlangObj*);
 		
 		std::string GetSymbolString(SymbolName name);
 		SymbolName RegisterSymbol(const std::string& name);
@@ -133,17 +145,20 @@ namespace slang {
 		SlangObj* ParseExpr();
 		SlangObj* ParseObj();
 		SlangObj* ParseExprOrObj();
-		SlangObj* Parse();
+		SlangObj* Parse(const std::string& code);
 	};
 	
-	typedef std::vector<SlangObj*> SlangArgVec;
-	typedef std::vector<SlangObj*> GarbageVec;
-	
 	struct SlangInterpreter {
-		SlangObj* program;
+		SlangParser parser;
 		Env env;
+		SlangObj* program;
 		std::vector<SlangLambda> globalLambdas;
-		GarbageVec garbage;
+		MemArena* arena;
+		std::vector<SlangObj> stack;
+		size_t baseIndex,frameIndex;
+		std::vector<size_t> frameStack;
+		
+		std::vector<ErrorData> errors;
 		
 		inline LambdaKey RegisterLambda(const SlangLambda& lam){
 			globalLambdas.push_back(lam);
@@ -154,23 +169,51 @@ namespace slang {
 			return &globalLambdas.at(key);
 		}
 		
-		inline SlangObj* SlangFuncDefine(const SlangArgVec& args,Env* env);
-		inline SlangObj* SlangFuncLambda(const SlangArgVec& args,Env* env);
-		inline SlangObj* SlangFuncSet(const SlangArgVec& args,Env* env);
-		inline SlangObj* SlangFuncQuote(const SlangArgVec& args);
-		inline SlangObj* SlangFuncAdd(const SlangArgVec& args,Env* env);
-		inline SlangObj* SlangFuncSub(const SlangArgVec& args,Env* env);
-		inline SlangObj* SlangFuncMul(const SlangArgVec& args,Env* env);
-		inline SlangObj* SlangFuncPair(const SlangArgVec& args,Env* env);
-		inline SlangObj* SlangFuncLeft(const SlangArgVec& args,Env* env);
-		inline SlangObj* SlangFuncRight(const SlangArgVec& args,Env* env);
-		//inline SlangObj* SlangFuncSetLeft(const SlangArgVec& args,Env* env);
-		//inline SlangObj* SlangFuncSetRight(const SlangArgVec& args,Env* env);
+		inline bool SlangFuncDefine(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncLambda(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncSet(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncQuote(SlangObj* args,SlangObj* res);
+		inline bool SlangFuncAdd(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncSub(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncMul(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncDiv(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncPair(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncLeft(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncRight(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncSetLeft(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncSetRight(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncPrint(SlangObj* args,SlangObj* res,Env* env);
 		
-		SlangObj* EvalExpr(const SlangObj* expr,Env* env);
+		inline bool WrappedEvalExpr(SlangObj* expr,SlangObj* res,Env* env);
+		bool EvalExpr(SlangObj* expr,SlangObj* res,Env* env);
 		
-		void Reset();
+		inline SlangObj* StackAlloc();
+		inline void StackAllocFrame();
+		inline void StackFreeFrame();
+		
+		//void Reset();
+		void PushError(const SlangObj*,const std::string&);
+		void EvalError(const SlangObj*);
+		void ProcError(const SlangObj*);
+		void TypeError(const SlangObj*,SlangType found,SlangType expected);
+		void ArityError(const SlangObj* head,size_t found,size_t expected);
+		
+		SlangObj* Parse(const std::string& code);
 		void Run(SlangObj* prog);
+		
+		bool Validate(SlangObj* prog);
+		
+		SlangObj* AllocateObj();
+		inline void FreeObj(SlangObj*);
+		inline void FreeExpr(SlangObj*);
+		inline void FreeEnv(Env*);
+		inline SlangObj* Copy(const SlangObj*);
+		inline Env* MakeEnvChild(Env*);
+		
+		inline SlangObj* MakeInt(int64_t);
+		inline SlangObj* MakeBool(bool);
+		inline SlangObj* MakeSymbol(SymbolName);
+		inline SlangObj* MakeList(const std::vector<SlangObj*>&);
 	};
 	
 	extern SlangParser* gDebugParser;

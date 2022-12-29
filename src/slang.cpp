@@ -4,6 +4,7 @@
 #include <iostream>
 #include <cstring>
 #include <sstream>
+#include <math.h>
 
 #include <set>
 
@@ -94,7 +95,7 @@ inline bool IsIdentifierChar(char c){
 		   c=='!'||c=='@'||c=='&'||
 		   c=='*'||c=='+'||c=='/'||
 		   c=='$'||c=='%'||c=='^'||
-		   c=='~';
+		   c=='~'||c=='=';
 }
 
 enum SlangGlobalSymbol {
@@ -113,7 +114,10 @@ enum SlangGlobalSymbol {
 	SLANG_SUB,
 	SLANG_MUL,
 	SLANG_DIV,
+	SLANG_MOD,
 	SLANG_PRINT,
+	SLANG_ASSERT,
+	SLANG_EQ,
 	GLOBAL_SYMBOL_COUNT
 };
 
@@ -133,7 +137,10 @@ SymbolNameDict gDefaultNameDict = {
 	{"-",SLANG_SUB},
 	{"*",SLANG_MUL},
 	{"/",SLANG_DIV},
-	{"print",SLANG_PRINT}
+	{"%",SLANG_MOD},
+	{"print",SLANG_PRINT},
+	{"assert",SLANG_ASSERT},
+	{"=",SLANG_EQ}
 };
 
 void Env::DefSymbol(SymbolName name,SlangObj* obj){
@@ -403,49 +410,130 @@ inline bool SlangInterpreter::SlangFuncSetRight(SlangObj* argIt,SlangObj* res,En
 	return true;
 }
 
+inline bool AddReals(SlangInterpreter* interp,SlangObj* argIt,SlangObj* res,Env* env,double curr){
+	while (argIt->type!=SlangType::Null){
+		if (!interp->EvalExpr(argIt->left,res,env))
+			return false;
+		
+		if (res->type==SlangType::Real){
+			curr += res->real;
+		} else if (res->type==SlangType::Int){
+			curr += res->integer;
+		} else {
+			interp->TypeError(res,res->type,SlangType::Real);
+			return false;
+		}
+		
+		argIt = NextArg(argIt);
+	}
+	
+	res->type = SlangType::Real;
+	res->real = curr;
+	
+	return true;
+}
+
 inline bool SlangInterpreter::SlangFuncAdd(SlangObj* argIt,SlangObj* res,Env* env){
 	int64_t sum = 0;
 	while (argIt->type!=SlangType::Null){
 		if (!EvalExpr(argIt->left,res,env))
 			return false;
-			
-		if (res->type!=SlangType::Int){
+		
+		if (res->type==SlangType::Int){
+			sum += res->integer;
+		} else if (res->type==SlangType::Real){
+			return AddReals(this,NextArg(argIt),res,env,res->real+sum);
+		} else {
 			TypeError(res,res->type,SlangType::Int);
 			return false;
 		}
 			
-		sum += res->integer;
 		argIt = NextArg(argIt);
 	}
+	
 	res->type = SlangType::Int;
 	res->integer = sum;
+	return true;
+}
+
+inline bool SubReals(SlangInterpreter* interp,SlangObj* argIt,SlangObj* res,Env* env,double curr){
+	while (argIt->type!=SlangType::Null){
+		if (!interp->EvalExpr(argIt->left,res,env))
+			return false;
+		
+		if (res->type==SlangType::Real){
+			curr -= res->real;
+		} else if (res->type==SlangType::Int){
+			curr -= res->integer;
+		} else {
+			interp->TypeError(res,res->type,SlangType::Real);
+			return false;
+		}
+		
+		argIt = NextArg(argIt);
+	}
+	
+	res->type = SlangType::Real;
+	res->real = curr;
+	
 	return true;
 }
 
 inline bool SlangInterpreter::SlangFuncSub(SlangObj* argIt,SlangObj* res,Env* env){
 	if (!EvalExpr(argIt->left,res,env))
 		return false;
-	if (res->type!=SlangType::Int){
+		
+	int64_t diff;
+	if (res->type==SlangType::Int){
+		diff = res->integer;
+	} else if (res->type==SlangType::Real){
+		return SubReals(this,NextArg(argIt),res,env,res->real);
+	} else {
 		TypeError(res,res->type,SlangType::Int);
 		return false;
 	}
 	
 	argIt = NextArg(argIt);
-	int64_t diff = res->integer;
 	while (argIt->type!=SlangType::Null){
 		if (!EvalExpr(argIt->left,res,env))
 			return false;
 		
-		if (res->type!=SlangType::Int){
+		if (res->type==SlangType::Int){
+			diff -= res->integer;
+		} else if (res->type==SlangType::Real){
+			return SubReals(this,NextArg(argIt),res,env,diff - res->real);
+		} else {
 			TypeError(res,res->type,SlangType::Int);
 			return false;
 		}
 			
-		diff -= res->integer;
 		argIt = NextArg(argIt);
 	}
 	res->type = SlangType::Int;
 	res->integer = diff;
+	return true;
+}
+
+inline bool MulReals(SlangInterpreter* interp,SlangObj* argIt,SlangObj* res,Env* env,double curr){
+	while (argIt->type!=SlangType::Null){
+		if (!interp->EvalExpr(argIt->left,res,env))
+			return false;
+		
+		if (res->type==SlangType::Real){
+			curr *= res->real;
+		} else if (res->type==SlangType::Int){
+			curr *= res->integer;
+		} else {
+			interp->TypeError(res,res->type,SlangType::Real);
+			return false;
+		}
+		
+		argIt = NextArg(argIt);
+	}
+	
+	res->type = SlangType::Real;
+	res->real = curr;
+	
 	return true;
 }
 
@@ -455,12 +543,15 @@ inline bool SlangInterpreter::SlangFuncMul(SlangObj* argIt,SlangObj* res,Env* en
 		if (!EvalExpr(argIt->left,res,env))
 			return false;
 			
-		if (res->type!=SlangType::Int){
+		if (res->type==SlangType::Int){
+			prod *= res->integer;
+		} else if (res->type==SlangType::Real){
+			return MulReals(this,NextArg(argIt),res,env,prod*res->real);
+		} else {
 			TypeError(res,res->type,SlangType::Int);
 			return false;
 		}
-			
-		prod *= res->integer;
+		
 		argIt = NextArg(argIt);
 	}
 	res->type = SlangType::Int;
@@ -468,31 +559,123 @@ inline bool SlangInterpreter::SlangFuncMul(SlangObj* argIt,SlangObj* res,Env* en
 	return true;
 }
 
+inline int64_t floordiv(int64_t a,int64_t b){
+	int64_t d = a/b;
+	int64_t r = a%b;
+	return r ? (d-((a<0)^(b<0))) : d;
+}
+
+inline int64_t floormod(int64_t a,int64_t b){
+	return a-floordiv(a,b)*b;
+}
+
+inline bool DivReals(SlangInterpreter* interp,SlangObj* argIt,SlangObj* res,Env* env,double curr){
+	while (argIt->type!=SlangType::Null){
+		if (!interp->EvalExpr(argIt->left,res,env))
+			return false;
+		
+		if (res->type==SlangType::Real){
+			curr /= res->real;
+		} else if (res->type==SlangType::Int){
+			curr /= res->integer;
+		} else {
+			interp->TypeError(res,res->type,SlangType::Real);
+			return false;
+		}
+		
+		argIt = NextArg(argIt);
+	}
+	
+	res->type = SlangType::Real;
+	res->real = curr;
+	
+	return true;
+}
+
 inline bool SlangInterpreter::SlangFuncDiv(SlangObj* argIt,SlangObj* res,Env* env){
 	if (!EvalExpr(argIt->left,res,env))
 		return false;
-	if (res->type!=SlangType::Int){
+		
+	int64_t quo;
+	if (res->type==SlangType::Int){
+		quo = res->integer;
+	} else if (res->type==SlangType::Real){
+		return DivReals(this,NextArg(argIt),res,env,res->real);
+	} else {
 		TypeError(res,res->type,SlangType::Int);
 		return false;
 	}
 	
 	argIt = NextArg(argIt);
-	int64_t quo = res->integer;
 	while (argIt->type!=SlangType::Null){
 		if (!EvalExpr(argIt->left,res,env))
 			return false;
 		
-		if (res->type!=SlangType::Int){
+		if (res->type==SlangType::Int){
+			quo = floordiv(quo,res->integer);
+		} else if (res->type==SlangType::Real){
+			return DivReals(this,NextArg(argIt),res,env,quo/res->real);
+		} else {
 			TypeError(res,res->type,SlangType::Int);
 			return false;
 		}
 			
-		quo /= res->integer;
 		argIt = NextArg(argIt);
 	}
 	res->type = SlangType::Int;
 	res->integer = quo;
 	return true;
+}
+
+inline bool ModReal(SlangInterpreter* interp,SlangObj* argIt,SlangObj* res,Env* env,double curr){
+	if (!interp->EvalExpr(argIt->left,res,env))
+		return false;
+		
+	if (res->type==SlangType::Int){
+		double r = fmod(curr,(double)res->integer);
+		res->type = SlangType::Real;
+		res->real = r;
+		return true;
+	} else if (res->type==SlangType::Real){
+        res->real = fmod(curr,res->real);
+        return true;
+	} 
+	
+	interp->TypeError(res,res->type,SlangType::Real);
+	return false;
+}
+
+inline bool SlangInterpreter::SlangFuncMod(SlangObj* argIt,SlangObj* res,Env* env){
+	if (!EvalExpr(argIt->left,res,env))
+		return false;
+	
+	int64_t mod;
+	if (res->type==SlangType::Int){
+		mod = res->integer;
+	} else if (res->type==SlangType::Real){
+		return ModReal(this,NextArg(argIt),res,env,res->real);
+	} else {
+		TypeError(res,res->type,SlangType::Int);
+		return false;
+	}
+	
+	argIt = NextArg(argIt);
+	if (!EvalExpr(argIt->left,res,env))
+		return false;
+	
+	if (res->type==SlangType::Int){
+		mod = floormod(mod,res->integer);
+		res->integer = mod;
+		return true;
+	} else if (res->type==SlangType::Real){
+		double r = fmod((double)mod,res->real);
+		res->type = SlangType::Real;
+		res->real = r;
+		return true;
+	}
+	
+	TypeError(res,res->type,SlangType::Int);
+	return false;
 }
 
 inline bool SlangInterpreter::SlangFuncPrint(SlangObj* argIt,SlangObj* res,Env* env){
@@ -501,6 +684,126 @@ inline bool SlangInterpreter::SlangFuncPrint(SlangObj* argIt,SlangObj* res,Env* 
 	
 	std::cout << *res << '\n';
 	return true;
+}
+
+inline bool ConvertToBool(const SlangObj* obj,bool& res){
+	switch (obj->type){
+		case SlangType::Bool:
+			res = obj->boolean;
+			return true;
+		case SlangType::Int:
+			res = (bool)obj->integer;
+			return true;
+		case SlangType::Real:
+			res = (bool)obj->real;
+			return true;
+		case SlangType::List:
+			res = true;
+			return true;
+		case SlangType::Null:
+			res = false;
+			return true;
+		default:
+			return false;
+	}
+}
+
+inline bool SlangInterpreter::SlangFuncAssert(SlangObj* argIt,SlangObj* res,Env* env){
+	if (!EvalExpr(argIt->left,res,env))
+		return false;
+	
+	bool test;
+	if (!ConvertToBool(res,test)){
+		TypeError(res,res->type,SlangType::Bool);
+		return false;
+	}
+	
+	if (!test){
+		AssertError(argIt->left);
+		return false;
+	}
+	
+	res->type = SlangType::Bool;
+	res->boolean = true;
+	return true;
+}
+
+bool ListEquality(const SlangObj* a,const SlangObj* b);
+
+bool EqualObjs(const SlangObj* a,const SlangObj* b){
+	if (a->type==b->type){
+		if (a->type==SlangType::Null) return true;
+		if (a->type==SlangType::List){
+			return ListEquality(a,b);
+		}
+	}
+	
+	return *a == *b;
+}
+
+bool ListEquality(const SlangObj* a,const SlangObj* b){
+	if (!EqualObjs(a->left,b->left)) return false;
+	if (!EqualObjs(a->right,b->right)) return false;
+	
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncEq(SlangObj* argIt,SlangObj* res,Env* env){
+	if (!EvalExpr(argIt->left,res,env))
+		return false;
+	
+	SlangObj temp = *res;
+	
+	argIt = NextArg(argIt);
+	
+	if (!EvalExpr(argIt->left,res,env))
+		return false;
+	
+	if (res->type==temp.type){
+		res->type = SlangType::Bool;
+		switch (temp.type){
+			case SlangType::Int:
+				res->boolean = res->integer==temp.integer;
+				return true;
+			case SlangType::Real:
+				res->boolean = res->real==temp.real;
+				return true;
+			case SlangType::Bool:
+				res->boolean = res->boolean==temp.boolean;
+				return true;
+			case SlangType::Null:
+				res->boolean = true;
+				return true;
+			case SlangType::List:
+				res->boolean = ListEquality(res,&temp);
+				return true;
+			default:
+				return false;
+		}
+	} else {
+		// if both are list-likes but not the same type they
+		// cannot be equal
+		if (IsListType(res->type)&&IsListType(temp.type)){
+			res->type = SlangType::Bool;
+			res->boolean = false;
+			return true;
+		}
+		
+		if (res->type==SlangType::Real&&temp.type==SlangType::Int){
+			res->type = SlangType::Bool;
+			res->boolean = ((double)temp.integer)==res->real;
+			return true;
+		}
+		
+		if (temp.type==SlangType::Real&&res->type==SlangType::Int){
+			res->type = SlangType::Bool;
+			res->boolean = temp.real==((double)res->integer);
+			return true;
+		}
+		
+		TypeError(res,res->type,temp.type);
+		return false;
+	}
 }
 
 bool SlangInterpreter::Validate(SlangObj* expr){
@@ -677,8 +980,13 @@ bool SlangInterpreter::EvalExpr(SlangObj* expr,SlangObj* res,Env* env){
 								EvalError(expr);
 								return false;
 							}
-								
-							if (res->type==SlangType::Int){
+							
+							if (!ConvertToBool(res,test)){
+								TypeError(argIt->left,argIt->type,SlangType::Bool);
+								EvalError(expr);
+								return false;
+							}
+							/*if (res->type==SlangType::Int){
 								test = (bool)res->integer;
 							} else if (res->type==SlangType::Bool){
 								test = res->boolean;
@@ -686,7 +994,7 @@ bool SlangInterpreter::EvalExpr(SlangObj* expr,SlangObj* res,Env* env){
 								TypeError(argIt->left,argIt->type,SlangType::Bool);
 								EvalError(expr);
 								return false;
-							}
+							}*/
 							
 							argIt = NextArg(argIt);
 							if (test){
@@ -759,6 +1067,15 @@ bool SlangInterpreter::EvalExpr(SlangObj* expr,SlangObj* res,Env* env){
 							if (!success)
 								EvalError(expr);
 							return success;
+						case SLANG_MOD:
+							if (argCount!=2){
+								ArityError(expr,argCount,2);
+								return false;
+							}
+							success = SlangFuncMod(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
 						case SLANG_SET_LEFT:
 							if (argCount!=2){
 								ArityError(expr,argCount,2);
@@ -786,13 +1103,28 @@ bool SlangInterpreter::EvalExpr(SlangObj* expr,SlangObj* res,Env* env){
 							if (!success)
 								EvalError(expr);
 							return success;
+						case SLANG_ASSERT:
+							if (argCount!=1){
+								ArityError(expr,argCount,1);
+								return false;
+							}
+							success = SlangFuncAssert(argIt,res,env);
+							return success;
+						case SLANG_EQ:
+							if (argCount!=2){
+								ArityError(expr,argCount,2);
+								return false;
+							}
+							success = SlangFuncEq(argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
 						default:
-							//std::cout << *head << '\n';
 							ProcError(&head);
 							return false;
 					}
 				} else {
-					std::cout << "No match: " << head << '\n';
+					ProcError(&head);
 					return false;
 				}
 			}
@@ -861,6 +1193,13 @@ void SlangInterpreter::TypeError(const SlangObj* expr,SlangType found,SlangType 
 		TypeToString(expect) << " instead of type " << 
 		TypeToString(found) << " in argument '" << *expr << "'";
 		
+	PushError(expr,msg.str());
+}
+
+void SlangInterpreter::AssertError(const SlangObj* expr){
+	std::stringstream msg = {};
+	msg << "AssertError:\n    Assertion failed: '" << *expr << "'";
+	
 	PushError(expr,msg.str());
 }
 
@@ -944,7 +1283,8 @@ inline SlangToken SlangTokenizer::NextToken(){
 	StringIt begin = pos;
 	char c = *begin;
 	char nextC = ' ';
-	if (pos+1!=end) nextC = *(pos+1);
+	if (pos+1!=end)
+		nextC = *(pos+1);
 	SlangToken token = {};
 	token.line = line;
 	token.col = col;
@@ -961,10 +1301,18 @@ inline SlangToken SlangTokenizer::NextToken(){
 	} else if (c==';'){
 		token.type = SlangTokenType::Comment;
 		while (pos!=end&&*pos!='\n') ++pos;
-	} else if ((c=='-'&&nextC>='0'&&nextC<='9')||(c>='0'&&c<='9')){
-		token.type = SlangTokenType::Int;
+	} else if ((c=='-'&&((nextC>='0'&&nextC<='9')||nextC=='.'))||(c>='0'&&c<='9')||c=='.'){
+		token.type = (c=='.') ? SlangTokenType::Real : SlangTokenType::Int;
+		++pos;
 		while (pos!=end&&*pos>='0'&&*pos<='9'){
 			++pos;
+		}
+		if (pos!=end&&*pos=='.'&&token.type!=SlangTokenType::Real){
+			token.type = SlangTokenType::Real;
+			++pos;
+			while (pos!=end&&*pos>='0'&&*pos<='9'){
+				++pos;
+			}
 		}
 		// if unexpected char shows up at end (like '123q')
 		if (pos!=end&&
@@ -1066,6 +1414,15 @@ inline SlangObj* SlangParser::ParseObj(){
 			intObj->integer = i;
 			codeMap[intObj] = loc;
 			return intObj;
+		}
+		case SlangTokenType::Real: {
+			double r = std::stod(token.view.begin(),nullptr);
+			NextToken();
+			SlangObj* realObj = HeapAllocObj();
+			realObj->type = SlangType::Real;
+			realObj->real = r;
+			codeMap[realObj] = loc;
+			return realObj;
 		}
 		case SlangTokenType::Symbol: {
 			SymbolName s;

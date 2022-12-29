@@ -41,6 +41,14 @@ namespace slang {
 		FLAG_FREE = 1
 	};
 	
+	inline bool IsNumericType(SlangType t){
+		return t==SlangType::Int || t==SlangType::Real;
+	}
+	
+	inline bool IsListType(SlangType t){
+		return t==SlangType::List || t==SlangType::Null;
+	}
+
 	struct SlangObj {
 		SlangType type;
 		uint8_t flags;
@@ -56,6 +64,24 @@ namespace slang {
 			double real;
 			uint8_t character;
 		};
+		
+		inline bool operator==(const SlangObj& other) const {
+			if (type==other.type){
+				if (!IsListType(type)){
+					// union moment
+					return integer==other.integer;
+				}
+			} else {
+				if (type==SlangType::Int&&other.type==SlangType::Real){
+					return ((double)integer)==other.real;
+				}
+				
+				if (type==SlangType::Real&&other.type==SlangType::Int){
+					return real==((double)other.integer);
+				}
+			}
+			return false;
+		}
 	};
 	
 	struct Env {
@@ -177,12 +203,16 @@ namespace slang {
 		inline bool SlangFuncSub(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncMul(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncDiv(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncMod(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncPair(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncLeft(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncRight(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncSetLeft(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncSetRight(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncPrint(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncAssert(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncEq(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncIs(SlangObj* args,SlangObj* res,Env* env);
 		
 		inline bool WrappedEvalExpr(SlangObj* expr,SlangObj* res,Env* env);
 		bool EvalExpr(SlangObj* expr,SlangObj* res,Env* env);
@@ -196,6 +226,7 @@ namespace slang {
 		void EvalError(const SlangObj*);
 		void ProcError(const SlangObj*);
 		void TypeError(const SlangObj*,SlangType found,SlangType expected);
+		void AssertError(const SlangObj*);
 		void ArityError(const SlangObj* head,size_t found,size_t expected);
 		
 		SlangObj* Parse(const std::string& code);

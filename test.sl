@@ -54,4 +54,9 @@
 (c1)
 (print (c1))
 (print (c1))
-(fact fact)
+
+(print (= ''(1 (1 1.0)) ''(1 (1 1))))
+(print (/ 2 -2))
+(print (% 1 -10))
+(assert (= '() ()))
+(print ())

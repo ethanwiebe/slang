@@ -7,25 +7,14 @@
 #include <vector>
 #include <ostream>
 
-#define SMALL_SET_SIZE 32768
-#define MEDIUM_SET_SIZE 131072
+#define SMALL_SET_SIZE (1365*24)
+#define MEDIUM_SET_SIZE (5461*24)
 
 namespace slang {
 	typedef uint64_t SymbolName;
 	typedef uint64_t LambdaKey;
 	typedef std::unordered_map<std::string,SymbolName> SymbolNameDict;
 	
-	struct MemArena {
-		uint8_t smallSet[SMALL_SET_SIZE];
-		uint8_t mediumSet[MEDIUM_SET_SIZE];
-		
-		uint8_t* smallPointer = &smallSet[0];
-		uint8_t* mediumPointer = &mediumSet[0];
-		
-		uint8_t* smallSetEnd = &smallSet[0]+sizeof(smallSet);
-		uint8_t* mediumSetEnd = &mediumSet[0]+sizeof(mediumSet);
-	};
-		
 	enum class SlangType : uint16_t {
 		Null,
 		List,
@@ -38,7 +27,8 @@ namespace slang {
 	};
 	
 	enum SlangFlag : uint8_t {
-		FLAG_FREE = 1
+		FLAG_FREE = 1,
+		FLAG_MARKED = 2
 	};
 	
 	inline bool IsNumericType(SlangType t){
@@ -84,6 +74,21 @@ namespace slang {
 		}
 	};
 	
+	struct MemArena {
+		uint8_t smallSet[SMALL_SET_SIZE];
+		uint8_t mediumSet[MEDIUM_SET_SIZE];
+		
+		uint8_t* smallPointer = &smallSet[0];
+		uint8_t* mediumPointer = &mediumSet[0];
+		
+		uint8_t* smallSetEnd = &smallSet[0]+sizeof(smallSet);
+		uint8_t* mediumSetEnd = &mediumSet[0]+sizeof(mediumSet);
+		
+		inline bool InSmallSet(const SlangObj* obj) const {
+			return (void*)obj>=(void*)&smallSet[0] && (void*)obj<(void*)smallSetEnd;
+		}
+	};
+		
 	struct Env {
 		std::map<SymbolName,SlangObj*> symbolMap;
 		std::vector<Env*> children;
@@ -99,6 +104,7 @@ namespace slang {
 		std::vector<SymbolName> params;
 		SlangObj* body;
 		Env* env;
+		bool variadic;
 	};
 	
 	typedef std::string::const_iterator StringIt;
@@ -120,6 +126,8 @@ namespace slang {
 		LeftBracket,
 		RightBracket,
 		Quote,
+		Not,
+		Negation,
 		Comment,
 		True,
 		False,
@@ -156,6 +164,10 @@ namespace slang {
 		SymbolName currentName;
 		std::vector<ErrorData> errors;
 		
+		std::vector<SlangObj> codeBuffer;
+		size_t codeCount;
+		size_t codeIndex;
+		
 		std::unordered_map<const SlangObj*,LocationData> codeMap;
 		
 		SlangParser();
@@ -171,6 +183,9 @@ namespace slang {
 		SlangObj* ParseExpr();
 		SlangObj* ParseObj();
 		SlangObj* ParseExprOrObj();
+		//inline SlangObj* WrapProgram(const std::vector<SlangObj*>&);
+		SlangObj* LoadIntoBuffer(SlangObj* prog);
+		
 		SlangObj* Parse(const std::string& code);
 	};
 	
@@ -199,11 +214,17 @@ namespace slang {
 		inline bool SlangFuncLambda(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncSet(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncQuote(SlangObj* args,SlangObj* res);
+		inline bool SlangFuncNot(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncNegate(SlangObj* args,SlangObj* res,Env* env);
+		
+		inline bool SlangFuncInc(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncDec(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncAdd(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncSub(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncMul(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncDiv(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncMod(SlangObj* args,SlangObj* res,Env* env);
+		
 		inline bool SlangFuncPair(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncLeft(SlangObj* args,SlangObj* res,Env* env);
 		inline bool SlangFuncRight(SlangObj* args,SlangObj* res,Env* env);
@@ -235,6 +256,7 @@ namespace slang {
 		bool Validate(SlangObj* prog);
 		
 		SlangObj* AllocateObj();
+		inline void MarkObjs(Env*);
 		inline void FreeObj(SlangObj*);
 		inline void FreeExpr(SlangObj*);
 		inline void FreeEnv(Env*);

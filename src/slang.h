@@ -5,18 +5,19 @@
 #include <unordered_map>
 #include <map>
 #include <vector>
+#include <list>
 #include <ostream>
+#include <assert.h>
 
-#define SMALL_SET_SIZE (1365*24)
-#define MEDIUM_SET_SIZE (5461*24)
+#define SMALL_SET_SIZE 1365
+#define LARGE_SET_SIZE 10922
 
 namespace slang {
 	typedef uint64_t SymbolName;
-	typedef uint64_t LambdaKey;
 	typedef std::unordered_map<std::string,SymbolName> SymbolNameDict;
 	
 	enum class SlangType : uint16_t {
-		Null,
+		NullType,
 		List,
 		Symbol,
 		Lambda,
@@ -27,18 +28,13 @@ namespace slang {
 	};
 	
 	enum SlangFlag : uint8_t {
-		FLAG_FREE = 1,
-		FLAG_MARKED = 2
+		FLAG_SURVIVE_MASK = 0b11,
+		FLAG_FORWARDED = 4,
+		FLAG_TENURED = 8
 	};
 	
-	inline bool IsNumericType(SlangType t){
-		return t==SlangType::Int || t==SlangType::Real;
-	}
+	struct Env;
 	
-	inline bool IsListType(SlangType t){
-		return t==SlangType::List || t==SlangType::Null;
-	}
-
 	struct SlangObj {
 		SlangType type;
 		uint8_t flags;
@@ -47,64 +43,104 @@ namespace slang {
 				SlangObj* left;
 				SlangObj* right;
 			};
+			struct {
+				SlangObj* expr;
+				Env* env;
+			};
 			SymbolName symbol;
-			LambdaKey lambda;
 			int64_t integer;
 			bool boolean;
 			double real;
 			uint8_t character;
+			SlangObj* forwarded;
 		};
+	};
+	
+	static_assert(sizeof(SlangObj)==24);
+	
+	inline SlangType GetType(const SlangObj* expr){
+		if (!expr) return SlangType::NullType;
+		return expr->type;
+	}
+	
+	inline SlangObj* NextArg(const SlangObj* expr){
+		return expr->right;
+	}
+	
+	inline bool IsNumeric(const SlangObj* o){
+		return GetType(o)==SlangType::Int || GetType(o)==SlangType::Real;
+	}
+	
+	inline bool IsList(const SlangObj* o){
+		return o==nullptr||o->type==SlangType::List;
+	}
+	
+	struct MemArena {
+		SlangObj leftSet[SMALL_SET_SIZE*sizeof(SlangObj)];
+		SlangObj rightSet[SMALL_SET_SIZE*sizeof(SlangObj)];
 		
-		inline bool operator==(const SlangObj& other) const {
-			if (type==other.type){
-				if (!IsListType(type)){
-					// union moment
-					return integer==other.integer;
-				}
-			} else {
-				if (type==SlangType::Int&&other.type==SlangType::Real){
-					return ((double)integer)==other.real;
-				}
-				
-				if (type==SlangType::Real&&other.type==SlangType::Int){
-					return real==((double)other.integer);
-				}
+		SlangObj* currSet = &leftSet[0];
+		SlangObj* otherSet = &rightSet[0];
+		
+		SlangObj* currPointer = &leftSet[0];
+		
+		std::list<SlangObj*> tenureSets = {};
+		SlangObj* currTenureSet = nullptr;
+		SlangObj* currTenurePointer = nullptr;
+		
+		inline SlangObj* TenureObj(){
+			if (!currTenureSet){
+				currTenureSet = (SlangObj*)malloc(LARGE_SET_SIZE*sizeof(SlangObj));
+				tenureSets.push_back(currTenureSet);
+				currTenurePointer = currTenureSet;
+			}
+			
+			SlangObj* ptr = currTenurePointer++;
+			if (currTenurePointer-currTenureSet > LARGE_SET_SIZE){
+				currTenureSet = nullptr;
+			}
+			return ptr;
+		}
+		
+		inline void ClearTenuredSets(){
+			for (auto* ptr : tenureSets){
+				free(ptr);
+			}
+			tenureSets.clear();
+		}
+		
+		inline bool SameTenureSet(const SlangObj* s1,const SlangObj* s2) const {
+			if (s1==s2) return true;
+			if (std::abs(s1-s2)>LARGE_SET_SIZE) return false;
+			for (auto it=tenureSets.rbegin();it!=tenureSets.rend();++it){
+				if (s1<*it || s1>=(*it+LARGE_SET_SIZE)) continue;
+				if (s2<*it || s2>=(*it+LARGE_SET_SIZE)) return false;
+				return true;
 			}
 			return false;
 		}
-	};
-	
-	struct MemArena {
-		uint8_t smallSet[SMALL_SET_SIZE];
-		uint8_t mediumSet[MEDIUM_SET_SIZE];
 		
-		uint8_t* smallPointer = &smallSet[0];
-		uint8_t* mediumPointer = &mediumSet[0];
-		
-		uint8_t* smallSetEnd = &smallSet[0]+sizeof(smallSet);
-		uint8_t* mediumSetEnd = &mediumSet[0]+sizeof(mediumSet);
-		
-		inline bool InSmallSet(const SlangObj* obj) const {
-			return (void*)obj>=(void*)&smallSet[0] && (void*)obj<(void*)smallSetEnd;
+		inline bool InCurrSet(const SlangObj* obj) const {
+			return obj>=&currSet[0] && 
+					obj<(&currSet[0]+SMALL_SET_SIZE);
 		}
 	};
 		
 	struct Env {
+		std::vector<SymbolName> params;
 		std::map<SymbolName,SlangObj*> symbolMap;
-		std::vector<Env*> children;
 		Env* parent = nullptr;
+		bool variadic;
+		bool marked;
+		
+		inline bool IsGlobal() const {
+			return parent==nullptr;
+		}
 		
 		inline void Clear();
-		void DefSymbol(SymbolName,SlangObj*);
+		bool DefSymbol(SymbolName,SlangObj*);
 		// symbol might not exist
-		SlangObj* GetSymbol(SymbolName) const;
-	};
-	
-	struct SlangLambda {
-		std::vector<SymbolName> params;
-		SlangObj* body;
-		Env* env;
-		bool variadic;
+		SlangObj** GetSymbol(SymbolName);
 	};
 	
 	typedef std::string::const_iterator StringIt;
@@ -180,11 +216,10 @@ namespace slang {
 		void PushError(const std::string& msg);
 		
 		inline void NextToken();
-		SlangObj* ParseExpr();
-		SlangObj* ParseObj();
-		SlangObj* ParseExprOrObj();
-		//inline SlangObj* WrapProgram(const std::vector<SlangObj*>&);
+		bool ParseExpr(SlangObj**);
+		bool ParseObj(SlangObj**);
 		SlangObj* LoadIntoBuffer(SlangObj* prog);
+		void TestSeqMacro(SlangObj* list,size_t argCount);
 		
 		SlangObj* Parse(const std::string& code);
 	};
@@ -192,81 +227,95 @@ namespace slang {
 	struct SlangInterpreter {
 		SlangParser parser;
 		Env env;
+		Env* currEnv;
 		SlangObj* program;
-		std::vector<SlangLambda> globalLambdas;
 		MemArena* arena;
-		std::vector<SlangObj> stack;
+		bool gcParity;
 		size_t baseIndex,frameIndex;
+		
+		SymbolName genIndex;
+		
+		std::vector<SlangObj*> funcArgStack;
 		std::vector<size_t> frameStack;
 		
 		std::vector<ErrorData> errors;
 		
-		inline LambdaKey RegisterLambda(const SlangLambda& lam){
-			globalLambdas.push_back(lam);
-			return globalLambdas.size()-1;
-		}
+		inline bool AddReals(SlangObj* args,SlangObj** res,Env* env,double curr);
+		inline bool MulReals(SlangObj* args,SlangObj** res,Env* env,double curr);
+		bool GetLetParams(
+			std::vector<SymbolName>& params,
+			std::vector<SlangObj*>& exprs,
+			SlangObj* paramIt
+		);
 		
-		inline SlangLambda* GetLambda(LambdaKey key){
-			return &globalLambdas.at(key);
-		}
+		inline bool SlangFuncDefine(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncLambda(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncSet(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncQuote(SlangObj* args,SlangObj** res);
+		inline bool SlangFuncNot(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncNegate(SlangObj* args,SlangObj** res,Env* env);
 		
-		inline bool SlangFuncDefine(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncLambda(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncSet(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncQuote(SlangObj* args,SlangObj* res);
-		inline bool SlangFuncNot(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncNegate(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncInc(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncDec(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncAdd(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncSub(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncMul(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncDiv(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncMod(SlangObj* args,SlangObj** res,Env* env);
 		
-		inline bool SlangFuncInc(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncDec(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncAdd(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncSub(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncMul(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncDiv(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncMod(SlangObj* args,SlangObj* res,Env* env);
+		inline bool SlangFuncPair(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncLeft(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncRight(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncSetLeft(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncSetRight(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncPrint(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncAssert(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncEq(SlangObj* args,SlangObj** res,Env* env);
+		inline bool SlangFuncIs(SlangObj* args,SlangObj** res,Env* env);
 		
-		inline bool SlangFuncPair(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncLeft(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncRight(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncSetLeft(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncSetRight(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncPrint(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncAssert(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncEq(SlangObj* args,SlangObj* res,Env* env);
-		inline bool SlangFuncIs(SlangObj* args,SlangObj* res,Env* env);
+		inline bool WrappedEvalExpr(SlangObj* expr,SlangObj** res,Env* env);
+		bool EvalExpr(SlangObj* expr,SlangObj** res,Env* env);
 		
-		inline bool WrappedEvalExpr(SlangObj* expr,SlangObj* res,Env* env);
-		bool EvalExpr(SlangObj* expr,SlangObj* res,Env* env);
-		
-		inline SlangObj* StackAlloc();
+		inline void StackAddArg(SlangObj*);
 		inline void StackAllocFrame();
 		inline void StackFreeFrame();
 		
 		//void Reset();
 		void PushError(const SlangObj*,const std::string&);
 		void EvalError(const SlangObj*);
+		void UndefinedError(const SlangObj*);
+		void RedefinedError(const SlangObj*,SymbolName);
 		void ProcError(const SlangObj*);
-		void TypeError(const SlangObj*,SlangType found,SlangType expected);
+		void TypeError(const SlangObj*,SlangType found,SlangType expected,size_t index=-1ULL);
 		void AssertError(const SlangObj*);
 		void ArityError(const SlangObj* head,size_t found,size_t expected);
+		void ZeroDivisionError(const SlangObj*);
 		
 		SlangObj* Parse(const std::string& code);
 		void Run(SlangObj* prog);
 		
-		bool Validate(SlangObj* prog);
+		inline SlangObj* AllocateObj();
+		inline SlangObj* Evacuate(SlangObj** write,SlangObj* obj);
+		inline SlangObj* TenureEntireObj(SlangObj** write,SlangObj* obj);
+		inline void EvacuateEnv(SlangObj** write,Env* env);
+		inline void ScavengeObj(SlangObj** write,SlangObj* read);
+		inline void ScavengeTenure(SlangObj** write,SlangObj* start,SlangObj* end);
+		inline void Scavenge(SlangObj** write,SlangObj* read);
+		inline void DeleteEnv(Env* env);
+		inline void EnvCleanup();
+		inline void SmallGC();
 		
-		SlangObj* AllocateObj();
-		inline void MarkObjs(Env*);
-		inline void FreeObj(SlangObj*);
-		inline void FreeExpr(SlangObj*);
-		inline void FreeEnv(Env*);
-		inline SlangObj* Copy(const SlangObj*);
-		inline Env* MakeEnvChild(Env*);
+		inline SlangObj* Copy(SlangObj*);
+		
+		inline SymbolName GenSym();
+		inline Env* CreateEnv();
 		
 		inline SlangObj* MakeInt(int64_t);
+		inline SlangObj* MakeReal(double);
 		inline SlangObj* MakeBool(bool);
+		inline SlangObj* MakeLambda(SlangObj* expr,Env* env,const std::vector<SymbolName>& args,bool variadic);
 		inline SlangObj* MakeSymbol(SymbolName);
-		inline SlangObj* MakeList(const std::vector<SlangObj*>&);
+		inline SlangObj* MakeList(const std::vector<SlangObj*>&,size_t start=0,size_t end=-1ULL);
 	};
 	
 	extern SlangParser* gDebugParser;

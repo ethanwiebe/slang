@@ -38,4 +38,6 @@
 (assert (= (list-len (makebig)) 100000))
 (make-int-list 1000)
 (assert (= (list-sum biglist) 4999950003))
+(set! biglist ())
+(gc-collect)
 (print 'passed)

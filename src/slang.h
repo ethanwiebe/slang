@@ -9,7 +9,7 @@
 #include <ostream>
 #include <assert.h>
 
-#define SMALL_SET_SIZE 1365
+#define SMALL_SET_SIZE 1364
 #define LARGE_SET_SIZE 10922
 
 namespace slang {
@@ -57,6 +57,13 @@ namespace slang {
 	};
 	
 	static_assert(sizeof(SlangObj)==24);
+	struct SlangInterpreter;
+	typedef bool(*SlangFunc)(SlangInterpreter* s,SlangObj* args,SlangObj** res,Env* env);
+	
+	struct ExternalFunc {
+		const char* name;
+		SlangFunc func;
+	};
 	
 	inline SlangType GetType(const SlangObj* expr){
 		if (!expr) return SlangType::NullType;
@@ -76,17 +83,31 @@ namespace slang {
 	}
 	
 	struct MemArena {
-		SlangObj leftSet[SMALL_SET_SIZE*sizeof(SlangObj)];
-		SlangObj rightSet[SMALL_SET_SIZE*sizeof(SlangObj)];
+		size_t memSize = 0;
+		SlangObj* memSet = nullptr;
 		
-		SlangObj* currSet = &leftSet[0];
-		SlangObj* otherSet = &rightSet[0];
+		SlangObj* currSet = nullptr;
+		SlangObj* otherSet = nullptr;
 		
-		SlangObj* currPointer = &leftSet[0];
+		SlangObj* currPointer = nullptr;
 		
 		std::list<SlangObj*> tenureSets = {};
 		SlangObj* currTenureSet = nullptr;
 		SlangObj* currTenurePointer = nullptr;
+		
+		inline void SetSpace(SlangObj* ptr,size_t size){
+			memSet = ptr;
+			currSet = ptr;
+			currPointer = ptr;
+			otherSet = ptr+size/2;
+			memSize = size;
+		}
+		
+		inline void SwapSets(){
+			currPointer = otherSet;
+			otherSet = currSet;
+			currSet = currPointer;
+		}
 		
 		inline SlangObj* TenureObj(){
 			if (!currTenureSet){
@@ -122,7 +143,7 @@ namespace slang {
 		
 		inline bool InCurrSet(const SlangObj* obj) const {
 			return obj>=&currSet[0] && 
-					obj<(&currSet[0]+SMALL_SET_SIZE);
+					obj<(&currSet[0]+memSize/2);
 		}
 	};
 		
@@ -236,9 +257,11 @@ namespace slang {
 		SymbolName genIndex;
 		
 		std::vector<SlangObj*> funcArgStack;
-		std::vector<size_t> frameStack;
-		
 		std::vector<ErrorData> errors;
+		std::map<SymbolName,SlangFunc> extFuncs;
+		
+		SlangInterpreter();
+		void AddExternalFunction(const ExternalFunc&);
 		
 		inline bool AddReals(SlangObj* args,SlangObj** res,Env* env,double curr);
 		inline bool MulReals(SlangObj* args,SlangObj** res,Env* env,double curr);
@@ -277,8 +300,6 @@ namespace slang {
 		bool EvalExpr(SlangObj* expr,SlangObj** res,Env* env);
 		
 		inline void StackAddArg(SlangObj*);
-		inline void StackAllocFrame();
-		inline void StackFreeFrame();
 		
 		//void Reset();
 		void PushError(const SlangObj*,const std::string&);
@@ -297,6 +318,7 @@ namespace slang {
 		inline SlangObj* AllocateObj();
 		inline SlangObj* Evacuate(SlangObj** write,SlangObj* obj);
 		inline SlangObj* TenureEntireObj(SlangObj** write,SlangObj* obj);
+		inline void ReallocSet(size_t newSize);
 		inline void EvacuateEnv(SlangObj** write,Env* env);
 		inline void ScavengeObj(SlangObj** write,SlangObj* read);
 		inline void ScavengeTenure(SlangObj** write,SlangObj* start,SlangObj* end);

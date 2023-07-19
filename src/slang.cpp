@@ -14,10 +14,11 @@ namespace slang {
 size_t gAllocCount = 0;
 size_t gAllocTotal = 0;
 size_t gTenureCount = 0;
-size_t gMaxAlloc = 0;
 size_t gHeapAllocTotal = 0;
 size_t gMaxStackHeight = 0;
 size_t gSmallGCs = 0;
+size_t gReallocCount = 0;
+size_t gMaxArenaSize = 0;
 size_t gCurrDepth = 0;
 size_t gMaxDepth = 0;
 size_t gEnvCount = 0;
@@ -40,24 +41,27 @@ void PrintErrors(const std::vector<ErrorData>& errors){
 }
 
 inline SlangObj* SlangInterpreter::AllocateObj(){
-	if (arena->currPointer>=arena->currSet+SMALL_SET_SIZE){
-		// gc curr set now
-		SmallGC();
+	if (arena->currPointer<arena->currSet+arena->memSize/2){
+		++gAllocCount;
+		++gAllocTotal;
+		SlangObj* p = arena->currPointer++;
+		p->type = (SlangType)65;
+		p->flags = 0;
+		return p;
 	}
-	SlangObj* p;
-	if (arena->currPointer>=arena->currSet+SMALL_SET_SIZE){
-		// could not free up space
-		std::cout << "early tenure\n";
-		p = arena->TenureObj();
-		++gTenureCount;
-	} else {
-		p = arena->currPointer;
-		++arena->currPointer;
+	
+	// gc curr set now
+	SmallGC();
+	if (arena->currPointer>=arena->currSet+arena->memSize/2){
+		std::cout << "out of mem\n";
+		assert(false);
+		exit(1);
 	}
+	
+	SlangObj* p = arena->currPointer++;
 	
 	++gAllocCount;
 	++gAllocTotal;
-	gMaxAlloc = (gAllocCount>gMaxAlloc) ? gAllocCount : gMaxAlloc;
 	p->type = (SlangType)65;
 	p->flags = 0;
 	return p;
@@ -85,7 +89,6 @@ inline SlangObj* SlangInterpreter::TenureEntireObj(SlangObj** write,SlangObj* ob
 		}
 		toPtr->expr = TenureEntireObj(write,toPtr->expr);
 	}
-	//ScavengeObj(write,toPtr);
 	
 	return toPtr;
 }
@@ -94,14 +97,14 @@ inline SlangObj* SlangInterpreter::Evacuate(SlangObj** write,SlangObj* obj){
 	if (!obj) return nullptr;
 	if (!arena->InCurrSet(obj)) return obj;
 	
-	uint8_t flags = obj->flags;
-	uint8_t surviveCount = flags&FLAG_SURVIVE_MASK;
+	//uint8_t flags = obj->flags;
+	//uint8_t surviveCount = flags&FLAG_SURVIVE_MASK;
 	SlangObj* toPtr;
 	
-	if (surviveCount>=2){
+	/*if (surviveCount>=2){
 		toPtr = TenureEntireObj(write,obj);
-	} else {
-		obj->flags = (flags&~FLAG_SURVIVE_MASK) | ((surviveCount+1)&FLAG_SURVIVE_MASK);
+	} else {*/
+		//obj->flags = (flags&~FLAG_SURVIVE_MASK) | ((surviveCount+1)&FLAG_SURVIVE_MASK);
 		toPtr = *write;
 		*write += 1;
 		memcpy(toPtr,obj,sizeof(SlangObj));
@@ -109,7 +112,7 @@ inline SlangObj* SlangInterpreter::Evacuate(SlangObj** write,SlangObj* obj){
 		obj->flags |= FLAG_FORWARDED;
 		obj->forwarded = toPtr;
 		obj->type = (SlangType)36;
-	}
+	//}
 	
 	return obj->forwarded;
 }
@@ -169,7 +172,7 @@ inline void SlangInterpreter::DeleteEnv(Env* env){
 }
 
 inline void SlangInterpreter::EnvCleanup(){
-	SlangObj* end = arena->currSet+SMALL_SET_SIZE;
+	SlangObj* end = arena->currSet+arena->memSize/2;
 	for (
 			SlangObj* start = arena->currSet;
 			start < end;
@@ -183,9 +186,69 @@ inline void SlangInterpreter::EnvCleanup(){
 	}
 }
 
+inline void SlangInterpreter::ReallocSet(size_t newSize){
+	SlangObj* newPtr = (SlangObj*)malloc(newSize*sizeof(SlangObj));
+	// copy over data
+	size_t currPointerLen = arena->currPointer-arena->currSet;
+	memcpy(newPtr,arena->currSet,currPointerLen*sizeof(SlangObj));
+	SlangObj* newStart = newPtr;
+	SlangObj* newCurrPointer = newPtr+currPointerLen;
+	for (
+			SlangObj* start=arena->currSet;
+			start!=arena->currPointer;
+			++start,++newStart
+		){
+		*newStart = *start;
+		start->flags |= FLAG_FORWARDED;
+		start->forwarded = newStart;
+		start->type = (SlangType)52;
+	}
+	
+	for (SlangObj* start=newPtr;start!=newCurrPointer;++start){
+		if (start->type==SlangType::List){
+			if (start->left && start->left->flags & FLAG_FORWARDED){
+				start->left = start->left->forwarded;
+			}
+			if (start->right && start->right->flags & FLAG_FORWARDED){
+				start->right = start->right->forwarded;
+			}
+		} else if (start->type==SlangType::Lambda){
+			if (start->expr && start->expr-> flags & FLAG_FORWARDED){
+				start->expr = start->expr->forwarded;
+			}
+			for (Env* e = start->env;e!=nullptr;e=e->parent){
+				for (auto& [key,val] : e->symbolMap){
+					if (val && val->flags & FLAG_FORWARDED){
+						val = val->forwarded;
+					}
+				}
+			}
+		}
+	}
+	
+	for (auto& [key,val] : env.symbolMap){
+		if (val && val->flags & FLAG_FORWARDED){
+			val = val->forwarded;
+		}
+	}
+	
+	for (size_t i=0;i<frameIndex;++i){
+		if (funcArgStack[i] && funcArgStack[i]->flags & FLAG_FORWARDED){
+			funcArgStack[i] = funcArgStack[i]->forwarded;
+		}
+	}
+	
+	free(arena->memSet);
+	arena->SetSpace(newPtr,newSize);
+	arena->currPointer = newCurrPointer;
+	gMaxArenaSize = (newSize*sizeof(SlangObj) > gMaxArenaSize) ?
+						newSize*sizeof(SlangObj) : gMaxArenaSize;
+	++gReallocCount;
+}
+
 inline void SlangInterpreter::SmallGC(){
 	gcParity = !gcParity;
-	SlangObj* tenureStart = arena->currTenurePointer;
+	//SlangObj* tenureStart = arena->currTenurePointer;
 	SlangObj* write = arena->otherSet;
 	SlangObj* read = write;
 	for (size_t i=0;i<frameIndex;++i){
@@ -196,12 +259,12 @@ inline void SlangInterpreter::SmallGC(){
 		}
 	}
 	
-	EvacuateEnv(&write,&env);
+	//EvacuateEnv(&write,&env);
 	if (currEnv)
 		EvacuateEnv(&write,currEnv);
 	
 	Scavenge(&write,read);
-	if (!tenureStart) tenureStart = arena->currTenureSet;
+	/*if (!tenureStart) tenureStart = arena->currTenureSet;
 	if (!arena->SameTenureSet(tenureStart,arena->currTenurePointer)){
 		auto it = arena->tenureSets.rbegin();
 		++it;
@@ -210,12 +273,19 @@ inline void SlangInterpreter::SmallGC(){
 		ScavengeTenure(&write,arena->currTenureSet,arena->currTenurePointer);
 	} else {
 		ScavengeTenure(&write,tenureStart,arena->currTenurePointer);
-	}
+	}*/
 	
 	EnvCleanup();
-	
-	std::swap(arena->currSet,arena->otherSet);
+	arena->SwapSets();
 	arena->currPointer = write;
+	size_t spaceLeft = arena->currSet+arena->memSize/2-write;
+	// less than 1/4 of the set left
+	if (spaceLeft<arena->memSize/8){
+		ReallocSet(arena->memSize*3/2);
+	} else if (arena->memSize>SMALL_SET_SIZE*4&&spaceLeft>arena->memSize*7/16){
+		// set more than 7/8 empty
+		ReallocSet(arena->memSize/2);
+	}
 	++gSmallGCs;
 }
 
@@ -296,7 +366,7 @@ SymbolNameDict gDefaultNameDict = {
 	{"print",SLANG_PRINT},
 	{"assert",SLANG_ASSERT},
 	{"=",SLANG_EQ},
-	{"is",SLANG_IS}
+	{"is",SLANG_IS},
 };
 
 bool Env::DefSymbol(SymbolName name,SlangObj* obj){
@@ -387,6 +457,27 @@ inline SlangObj* SlangInterpreter::MakeList(const std::vector<SlangObj*>& objs,s
 	--frameIndex;
 	
 	return listHead;
+}
+
+bool GCManualCollect(SlangInterpreter* s,SlangObj* args,SlangObj** res,Env*){
+	if (args!=nullptr) return false;
+	s->SmallGC();
+	*res = nullptr;
+	return true;
+}
+
+bool GCMemSize(SlangInterpreter* s,SlangObj* args,SlangObj** res,Env*){
+	if (args!=nullptr) return false;
+	size_t size = (s->arena->currPointer-s->arena->currSet)*sizeof(SlangObj);
+	*res = s->MakeInt(size);
+	return true;
+}
+
+bool GCMemCapacity(SlangInterpreter* s,SlangObj* args,SlangObj** res,Env*){
+	if (args!=nullptr) return false;
+	size_t size = s->arena->memSize/2*sizeof(SlangObj);
+	*res = s->MakeInt(size);
+	return true;
 }
 
 inline bool IsPredefinedSymbol(SymbolName name){
@@ -591,8 +682,6 @@ inline bool SlangInterpreter::SlangFuncNegate(SlangObj* argIt,SlangObj** res,Env
 }
 
 inline bool SlangInterpreter::SlangFuncPair(SlangObj* argIt,SlangObj** res,Env* env){
-	StackAllocFrame();
-	
 	SlangObj* pairObj = AllocateObj();
 	// for GC
 	StackAddArg(pairObj);
@@ -616,7 +705,7 @@ inline bool SlangInterpreter::SlangFuncPair(SlangObj* argIt,SlangObj** res,Env* 
 	funcArgStack[frameIndex-1]->right = right;
 	
 	*res = funcArgStack[frameIndex-1];
-	StackFreeFrame();
+	--frameIndex;
 	return true;
 }
 
@@ -1141,18 +1230,6 @@ inline void SlangInterpreter::StackAddArg(SlangObj* arg){
 	funcArgStack[frameIndex++] = arg;
 }
 
-inline void SlangInterpreter::StackAllocFrame(){
-	frameStack.emplace_back(baseIndex);
-	baseIndex = frameIndex;
-}
-
-inline void SlangInterpreter::StackFreeFrame(){
-	assert(!frameStack.empty());
-	frameIndex = baseIndex;
-	baseIndex = frameStack.back();
-	frameStack.pop_back();
-}
-
 inline bool SlangInterpreter::WrappedEvalExpr(SlangObj* expr,SlangObj** res,Env* env){
 	++gCurrDepth;
 	if (gCurrDepth>gMaxDepth) gMaxDepth = gCurrDepth;
@@ -1249,6 +1326,11 @@ bool SlangInterpreter::EvalExpr(SlangObj* expr,SlangObj** res,Env* env){
 				}
 				
 				if (IsPredefinedSymbol(expr->symbol)){
+					*res = expr;
+					return true;
+				}
+				
+				if (extFuncs.contains(expr->symbol)){
 					*res = expr;
 					return true;
 				}
@@ -1548,8 +1630,14 @@ bool SlangInterpreter::EvalExpr(SlangObj* expr,SlangObj** res,Env* env){
 								EvalError(expr);
 							return success;
 						default:
-							ProcError(head);
-							return false;
+							if (!extFuncs.contains(symbol)){
+								ProcError(head);
+								return false;
+							}
+							success = extFuncs.at(symbol)(this,argIt,res,env);
+							if (!success)
+								EvalError(expr);
+							return success;
 					}
 				} else {
 					TypeError(head,GetType(head),SlangType::Lambda);
@@ -1657,14 +1745,13 @@ void SlangInterpreter::ZeroDivisionError(const SlangObj* head){
 
 void SlangInterpreter::Run(SlangObj* prog){
 	arena = new MemArena();
-	memset(arena->leftSet,0,sizeof(arena->leftSet));
-	memset(arena->rightSet,0,sizeof(arena->rightSet));
+	size_t memSize = SMALL_SET_SIZE*2;
+	SlangObj* memAlloc = (SlangObj*)malloc(memSize*sizeof(SlangObj));
+	arena->SetSpace(memAlloc,memSize);
+	memset(arena->memSet,0,memSize*sizeof(SlangObj));
 	gDebugInterpreter = this;
 	
-	frameStack = {};
-	frameStack.reserve(16);
-	
-	funcArgStack.resize(256);
+	funcArgStack.resize(32);
 	frameIndex = 0;
 	baseIndex = 0;
 	errors = {};
@@ -1696,12 +1783,13 @@ void SlangInterpreter::Run(SlangObj* prog){
 	std::cout << "Tenure count: " << gTenureCount << " (" << gTenureCount*sizeof(SlangObj)/1024 << " KB)\n";
 	std::cout << "Tenure set count: " << tenureCount << '\n';
 	std::cout << "Heap alloc total: " << gHeapAllocTotal << " (" << gHeapAllocTotal*sizeof(SlangObj)/1024 << " KB)\n";
-	std::cout << "Max allocated: " << gMaxAlloc << " (" << gMaxAlloc*sizeof(SlangObj)/1024 << " KB)\n";
 	std::cout << "Eval count: " << gEvalCounter << '\n';
 	std::cout << "Non-eliminated eval count: " << gEvalRecurCounter << '\n';
-	std::cout << "Frame height at end: " << frameStack.size() << '\n';
 	std::cout << "Max stack height: " << gMaxStackHeight << '\n';
 	std::cout << "Small GCs: " << gSmallGCs << '\n';
+	std::cout << "Realloc count: " << gReallocCount << '\n';
+	std::cout << "Max arena size: " << gMaxArenaSize/1024 << " KB\n";
+	std::cout << "Curr arena size: " << arena->memSize*sizeof(SlangObj)/1024 << " KB\n";
 	std::cout << "Curr depth: " << gCurrDepth << '\n';
 	std::cout << "Max depth: " << gMaxDepth << '\n';
 	std::cout << "Env count: " << gEnvCount << '\n';
@@ -1712,6 +1800,8 @@ void SlangInterpreter::Run(SlangObj* prog){
 		std::cout << "Run time: " << gRunTime << "s\n";
 	else
 		std::cout << "Run Time: " << gRunTime*1000 << "ms\n";
+	if (arena->memSet)
+		free(arena->memSet);
 	delete arena;
 }
 
@@ -2166,6 +2256,18 @@ SlangParser::SlangParser() :
 		nameDict(gDefaultNameDict),
 		currentName(GLOBAL_SYMBOL_COUNT),errors(){
 	token.type = SlangTokenType::Comment;
+}
+
+inline void SlangInterpreter::AddExternalFunction(const ExternalFunc& ext){
+	SymbolName sym = parser.RegisterSymbol(ext.name);
+	extFuncs[sym] = ext.func;
+}
+
+SlangInterpreter::SlangInterpreter(){
+	extFuncs = {};
+	AddExternalFunction({"gc-collect",&GCManualCollect});
+	AddExternalFunction({"gc-mem-size",GCMemSize});
+	AddExternalFunction({"gc-mem-cap",&GCMemCapacity});
 }
 
 SlangObj* SlangInterpreter::Parse(const std::string& code){

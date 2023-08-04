@@ -21,7 +21,7 @@ int main(int argc,char** argv){
 	f.read(&code[0],size);
 	
 	SlangInterpreter interp = {};
-	SlangObj* program = interp.Parse(code);
+	SlangHeader* program = interp.Parse(code);
 	if (program)
 		interp.Run(program);
 	else

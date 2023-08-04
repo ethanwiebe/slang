@@ -31,6 +31,8 @@
 	(* (interm1 a b) (interm2 a b))
 ))
 
+(print (combo 2 4))
+(print (= 48 48))
 (assert (= (combo 2 4) 48))
 (print (combo (+ 2 4) (+ 4 6)))
 (print (combo (combo 2 4) 1))
@@ -45,9 +47,12 @@
 	)
 ))
 
+(print combo)
+(print (fact 50))
+(print fact-linear)
+(print 'hello)
 (print (fact-linear 8))
 ;(print 'start)
-(print (fact 50))
 ;(print 'end)
 
 
@@ -63,9 +68,11 @@
 
 (def counter
 	(& (x)
-		(print x)
-		(& () 
-			(set! x (+ x 1))
+		(let ((count x))
+			(print count)
+			(& () 
+				(set! count (+ count 1))
+			)
 		)
 	)
 )
@@ -88,6 +95,8 @@
 (print (c1))
 (print (c1))
 (print (c2))
+(assert (= (c1) 8))
+(assert (= (c2) 10))
 
 (print (= ''(1 (1 1.0)) ''(1 (1 1))))
 (print (/ 2 -2))
@@ -101,8 +110,8 @@
 
 (def print-list (& (l)
 	(print (L l))
-	(if (is (R l) ()) 
-		1 
+	(if (null? (R l)) 
+		0
 		(print-list (R l))
 	)
 ))
@@ -110,6 +119,7 @@
 (print-list '(1 2 3 hello))
 
 (def vary (& args
+	(print args)
 	(print-list args)
 ))
 
@@ -129,7 +139,7 @@
 
 (print lettest)
 
-;(def letcount
+(def letcount
 	(let
 		((count 0))
 		(& ()
@@ -137,22 +147,51 @@
 			count
 		)
 	)
-;)
-
-;(print (letcount))
-;(print (letcount))
-;(print (letcount))
-
-(def make-let-counter
-	(& ()
-		(let ((count 0))
-			(& (count)
-				(set! count (++ count))
-				count
-			)
-		)
-	)
 )
 
-(make-let-counter)
-(print 3)
+(print (letcount))
+(print (letcount))
+(print (letcount))
+(print (letcount))
+(print (num? 3.2))
+(print "tes\n\0\et")
+
+(def v (vec 1 2 'hello 5))
+(print (list 1 2 'hello 4))
+(print v)
+(print (vec-get v 3))
+(print '-5)
+(def aa -.3)
+(print -aa)
+(print .3)
+(print (vec-set! v -1 'bye))
+(def l (list 1 2 3))
+(def va (vec-alloc 8 0))
+(print va)
+(vec-set! va 3 4)
+(print va)
+(print v)
+(def var (gc-mem-size))
+(print var)
+(def var2 var)
+(set! var2 10)
+(print var)
+(print var2)
+
+(def limited-use (& (func max)
+	(let ((count max))
+		(& args (if !count 
+			(assert false)
+			(do
+				(set! count (-- count))
+				(apply func args)
+			)
+		))
+		
+	)
+))
+
+(def limit-add (limited-use + 3))
+(print (limit-add 2 3))
+(print (limit-add 2 3))
+(print (limit-add 2 3))

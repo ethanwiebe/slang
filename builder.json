@@ -42,7 +42,8 @@
 			"compileFlags":[
 				"%compileFlags",
 				"-DNDEBUG",
-				"-O3"
+				"-O3",
+				"-march=native"
 			],
 			"linkFlags":[
 				"%linkFlags",

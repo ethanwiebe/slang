@@ -232,26 +232,29 @@ inline SlangStorage* SlangInterpreter::AllocateStorage(size_t size,uint16_t elem
 	storage->header.elemSize = elemSize;
 	storage->size = size;
 	storage->capacity = byteCount/elemSize;
+	StackAddArg((SlangHeader*)storage);
 	
 	if (elemSize==sizeof(SlangHeader*)){
 		SlangType fillType = GetType(fill);
-		SlangHeader** start = storage->objs;
-		SlangHeader** end = start+size;
 		
 		if (fillType==SlangType::List||fillType==SlangType::Vector||
 			fillType==SlangType::Lambda||fillType==SlangType::String){
+			
+			SlangHeader** start = storage->objs;
+			SlangHeader** end = start+size;
 			while (start!=end){
 				*start = fill;
 				++start;
 			}
 		} else {
-			while (start!=end){
-				*start = Copy(fill);
-				++start;
+			size_t i=0;
+			while (i<size){
+				storage = (SlangStorage*)funcArgStack[frameIndex-1];
+				storage->objs[i++] = Copy(fill);
 			}
 		}
 	}
-	return storage;
+	return (SlangStorage*)funcArgStack[--frameIndex];
 }
 
 inline SlangVec* SlangInterpreter::AllocateVec(size_t size,SlangHeader* fill){
@@ -264,7 +267,10 @@ inline SlangVec* SlangInterpreter::AllocateVec(size_t size,SlangHeader* fill){
 		return obj;
 	}
 	
-	obj->storage = AllocateStorage(size,sizeof(SlangHeader*),fill);
+	StackAddArg((SlangHeader*)obj);
+	SlangStorage* s = AllocateStorage(size,sizeof(SlangHeader*),fill);
+	obj = (SlangVec*)funcArgStack[--frameIndex];
+	obj->storage = s;
 	return obj;
 }
 
@@ -277,7 +283,10 @@ inline SlangStr* SlangInterpreter::AllocateStr(size_t size){
 		obj->storage = nullptr;
 		return obj;
 	}
-	obj->storage = AllocateStorage(qsize,sizeof(uint8_t),nullptr);
+	StackAddArg((SlangHeader*)obj);
+	SlangStorage* s = AllocateStorage(qsize,sizeof(uint8_t),nullptr);
+	obj = (SlangStr*)funcArgStack[--frameIndex];
+	obj->storage = s;
 	return obj;
 }
 
@@ -541,6 +550,12 @@ inline void SlangInterpreter::SmallGC(size_t allocAttempt){
 		EvacuateOrForward(&write,(SlangHeader**)&envStack[i]);
 	}
 	
+	assert(exprIndex==argIndex);
+	for (size_t i=1;i<=exprIndex;++i){
+		EvacuateOrForward(&write,&exprStack[i]);
+		EvacuateOrForward(&write,(SlangHeader**)&argStack[i]);
+	}
+	
 	Scavenge(&write,read);
 	/*if (!tenureStart) tenureStart = arena->currTenureSet;
 	if (!arena->SameTenureSet(tenureStart,arena->currTenurePointer)){
@@ -601,6 +616,8 @@ enum SlangGlobalSymbol {
 	SLANG_IF,
 	SLANG_DO,
 	SLANG_APPLY,
+	SLANG_PARSE,
+	SLANG_EVAL,
 	SLANG_QUOTE,
 	SLANG_NOT,
 	SLANG_NEG,
@@ -646,6 +663,8 @@ SymbolNameDict gDefaultNameDict = {
 	{"if",SLANG_IF},
 	{"do",SLANG_DO},
 	{"apply",SLANG_APPLY},
+	{"parse",SLANG_PARSE},
+	{"eval",SLANG_EVAL},
 	{"quote",SLANG_QUOTE},
 	{"not",SLANG_NOT},
 	{"neg",SLANG_NEG},
@@ -658,8 +677,8 @@ SymbolNameDict gDefaultNameDict = {
 	{"pair",SLANG_PAIR},
 	{"L",SLANG_LEFT},
 	{"R",SLANG_RIGHT},
-	{"setL!",SLANG_SET_LEFT},
-	{"setR!",SLANG_SET_RIGHT},
+	{"set-L!",SLANG_SET_LEFT},
+	{"set-R!",SLANG_SET_RIGHT},
 	{"++",SLANG_INC},
 	{"--",SLANG_DEC},
 	{"+",SLANG_ADD},
@@ -840,22 +859,22 @@ inline SlangList* SlangInterpreter::MakeList(const std::vector<SlangHeader*>& ob
 	return listHead;
 }
 
-bool GCManualCollect(SlangInterpreter* s,SlangList* args,SlangHeader** res){
-	if (args!=nullptr) return false;
+bool GCManualCollect(SlangInterpreter* s,SlangHeader** res){
+	if (s->GetCurrArg()!=nullptr) return false;
 	s->SmallGC(0);
 	*res = nullptr;
 	return true;
 }
 
-bool GCMemSize(SlangInterpreter* s,SlangList* args,SlangHeader** res){
-	if (args!=nullptr) return false;
+bool GCMemSize(SlangInterpreter* s,SlangHeader** res){
+	if (s->GetCurrArg()!=nullptr) return false;
 	size_t size = s->arena->currPointer - s->arena->currSet;
 	*res = (SlangHeader*)s->MakeInt(size);
 	return true;
 }
 
-bool GCMemCapacity(SlangInterpreter* s,SlangList* args,SlangHeader** res){
-	if (args!=nullptr) return false;
+bool GCMemCapacity(SlangInterpreter* s,SlangHeader** res){
+	if (s->GetCurrArg()!=nullptr) return false;
 	size_t size = s->arena->memSize/2;
 	*res = (SlangHeader*)s->MakeInt(size);
 	return true;
@@ -902,14 +921,15 @@ inline bool SlangInterpreter::SetRecursiveSymbol(SlangEnv* e,SymbolName name,Sla
 	return false;
 }
 
-#define NEXT_ARG(x) { \
-	if (!NextArg(x)){ \
-		EvalError((SlangHeader*)x); \
+#define NEXT_ARG() { \
+	if (!NextArg()){ \
+		EvalError((SlangHeader*)GetCurrArg()); \
 		return false; \
 	}} \
 
-inline bool SlangInterpreter::SlangFuncDefine(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncDefine(SlangHeader** res){
 	// can't exist
+	SlangList* argIt = GetCurrArg();
 	if (GetType(argIt->left)!=SlangType::Symbol){
 		TypeError(argIt->left,GetType(argIt->left),SlangType::Symbol);
 		return false;
@@ -922,10 +942,10 @@ inline bool SlangInterpreter::SlangFuncDefine(SlangList* argIt,SlangHeader** res
 		return false;
 	}
 	
-	NEXT_ARG(&argIt);
+	NEXT_ARG();
 	
 	SlangHeader* valObj = nullptr;
-	if (!WrappedEvalExpr(argIt->left,&valObj))
+	if (!WrappedEvalExpr(GetCurrArg()->left,&valObj))
 		return false;
 	
 	DefEnvSymbol(sym,valObj);
@@ -933,7 +953,8 @@ inline bool SlangInterpreter::SlangFuncDefine(SlangList* argIt,SlangHeader** res
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncLambda(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncLambda(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	if (!IsList(argIt->left)&&GetType(argIt->left)!=SlangType::Symbol){
 		std::stringstream msg = {};
 		msg << "LambdaError:\n    Expected parameter list, not '" << *argIt->left << "'";
@@ -969,26 +990,29 @@ inline bool SlangInterpreter::SlangFuncLambda(SlangList* argIt,SlangHeader** res
 			params.push_back(symObj->symbol);
 			seen.insert(symObj->symbol);
 			
-			NEXT_ARG(&paramIt);
+			paramIt = (SlangList*)paramIt->right;
 		}
 	} else { // variadic
 		params.push_back(((SlangObj*)argIt->left)->symbol);
 	}
-	NEXT_ARG(&argIt);
+	NEXT_ARG();
+	argIt = GetCurrArg();
 
 	SlangLambda* lambdaObj = MakeLambda(argIt->left,params,variadic);
 	*res = (SlangHeader*)lambdaObj;
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncSet(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncSet(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	if (GetType(argIt->left)!=SlangType::Symbol){
 		TypeError(argIt->left,GetType(argIt->left),SlangType::Symbol);
 		return false;
 	}
 	
 	SymbolName sym = ((SlangObj*)argIt->left)->symbol;
-	NEXT_ARG(&argIt);
+	NEXT_ARG();
+	argIt = GetCurrArg();
 	
 	SlangHeader* valObj = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&valObj))
@@ -996,8 +1020,8 @@ inline bool SlangInterpreter::SlangFuncSet(SlangList* argIt,SlangHeader** res){
 		
 	if (!SetRecursiveSymbol(GetCurrEnv(),sym,valObj)){
 		std::stringstream msg = {};
-		msg << "SetError:\n    Cannot set undefined symbol '" << *argIt->left << "'";
-		PushError(argIt->left,msg.str());
+		msg << "SetError:\n    Cannot set undefined symbol '" << *GetCurrArg()->left << "'";
+		PushError(GetCurrArg()->left,msg.str());
 		return false;
 	}
 	
@@ -1005,12 +1029,8 @@ inline bool SlangInterpreter::SlangFuncSet(SlangList* argIt,SlangHeader** res){
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncQuote(SlangList* argIt,SlangHeader** res){
-	//if (argIt->left){
-		*res = Copy(argIt->left);
-	//} else {
-	//	*res = nullptr;
-	//}
+inline bool SlangInterpreter::SlangFuncQuote(SlangHeader** res){
+	*res = Copy(GetCurrArg()->left);
 	return true;
 }
 
@@ -1067,7 +1087,8 @@ inline bool ConvertToBool(const SlangHeader* obj,bool& res){
 	return false;
 }
 
-inline bool SlangInterpreter::SlangFuncNot(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncNot(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* boolObj = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&boolObj))
 		return false;
@@ -1082,7 +1103,8 @@ inline bool SlangInterpreter::SlangFuncNot(SlangList* argIt,SlangHeader** res){
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncNegate(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncNegate(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* numObj = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&numObj))
 		return false;
@@ -1107,7 +1129,8 @@ inline bool SlangInterpreter::SlangFuncNegate(SlangList* argIt,SlangHeader** res
 	}
 }
 
-inline bool SlangInterpreter::SlangFuncList(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncList(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	if (!argIt){
 		*res = nullptr;
 		return true;
@@ -1120,7 +1143,8 @@ inline bool SlangInterpreter::SlangFuncList(SlangList* argIt,SlangHeader** res){
 			return false;
 		
 		StackAddArg(leval);
-		NEXT_ARG(&argIt);
+		NEXT_ARG();
+		argIt = GetCurrArg();
 	}
 	// last elem
 	if (!WrappedEvalExpr(argIt->left,&leval))
@@ -1134,7 +1158,8 @@ inline bool SlangInterpreter::SlangFuncList(SlangList* argIt,SlangHeader** res){
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncVec(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncVec(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	if (!argIt){
 		*res = (SlangHeader*)AllocateVec(0);
 		return true;
@@ -1147,7 +1172,8 @@ inline bool SlangInterpreter::SlangFuncVec(SlangList* argIt,SlangHeader** res){
 			return false;
 		
 		StackAddArg(leval);
-		NEXT_ARG(&argIt);
+		NEXT_ARG();
+		argIt = GetCurrArg();
 	}
 	// last elem
 	if (!WrappedEvalExpr(argIt->left,&leval))
@@ -1161,10 +1187,12 @@ inline bool SlangInterpreter::SlangFuncVec(SlangList* argIt,SlangHeader** res){
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncVecAlloc(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncVecAlloc(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* sizeObj;
 	if (!WrappedEvalExpr(argIt->left,&sizeObj))
 		return false;
+	argIt = GetCurrArg();
 	
 	if (GetType(sizeObj)!=SlangType::Int){
 		TypeError(sizeObj,GetType(sizeObj),SlangType::Int);
@@ -1174,7 +1202,8 @@ inline bool SlangInterpreter::SlangFuncVecAlloc(SlangList* argIt,SlangHeader** r
 	
 	SlangHeader* fill = nullptr;
 	if (argIt->right){
-		NEXT_ARG(&argIt);
+		NEXT_ARG();
+		argIt = GetCurrArg();
 		if (!WrappedEvalExpr(argIt->left,&fill))
 			return false;
 	}
@@ -1184,7 +1213,8 @@ inline bool SlangInterpreter::SlangFuncVecAlloc(SlangList* argIt,SlangHeader** r
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncVecSize(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncVecSize(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* vecObj;
 	if (!WrappedEvalExpr(argIt->left,&vecObj))
 		return false;
@@ -1200,7 +1230,8 @@ inline bool SlangInterpreter::SlangFuncVecSize(SlangList* argIt,SlangHeader** re
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncVecGet(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncVecGet(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* vecObj;
 	if (!WrappedEvalExpr(argIt->left,&vecObj))
 		return false;
@@ -1212,7 +1243,8 @@ inline bool SlangInterpreter::SlangFuncVecGet(SlangList* argIt,SlangHeader** res
 	
 	SlangVec* vec = (SlangVec*)vecObj;
 	
-	NEXT_ARG(&argIt);
+	NEXT_ARG();
+	argIt = GetCurrArg();
 
 	SlangHeader* indexObj;
 	if (!WrappedEvalExpr(argIt->left,&indexObj))
@@ -1227,7 +1259,7 @@ inline bool SlangInterpreter::SlangFuncVecGet(SlangList* argIt,SlangHeader** res
 	if (index<0) index += vecLen;
 	if (index>=(ssize_t)vecLen||index<0){
 		if (index<0) index -= vecLen;
-		IndexError(argIt->left,vecLen,index);
+		IndexError(GetCurrArg()->left,vecLen,index);
 		return false;
 	}
 	
@@ -1235,7 +1267,8 @@ inline bool SlangInterpreter::SlangFuncVecGet(SlangList* argIt,SlangHeader** res
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncVecSet(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncVecSet(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* vecObj;
 	if (!WrappedEvalExpr(argIt->left,&vecObj))
 		return false;
@@ -1248,7 +1281,8 @@ inline bool SlangInterpreter::SlangFuncVecSet(SlangList* argIt,SlangHeader** res
 	SlangVec* vec = (SlangVec*)vecObj;
 	StackAddArg((SlangHeader*)vec);
 	
-	NEXT_ARG(&argIt);
+	NEXT_ARG();
+	argIt = GetCurrArg();
 
 	SlangHeader* indexObj;
 	if (!WrappedEvalExpr(argIt->left,&indexObj))
@@ -1263,11 +1297,12 @@ inline bool SlangInterpreter::SlangFuncVecSet(SlangList* argIt,SlangHeader** res
 	if (index<0) index += vecLen;
 	if (index>=(ssize_t)vecLen||index<0){
 		if (index<0) index -= vecLen;
-		IndexError(argIt->left,vecLen,index);
+		IndexError(GetCurrArg()->left,vecLen,index);
 		return false;
 	}
 	
-	NEXT_ARG(&argIt);
+	NEXT_ARG();
+	argIt = GetCurrArg();
 	SlangHeader* val;
 	if (!WrappedEvalExpr(argIt->left,&val))
 		return false;
@@ -1278,7 +1313,8 @@ inline bool SlangInterpreter::SlangFuncVecSet(SlangList* argIt,SlangHeader** res
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncPair(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncPair(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangList* pairObj = AllocateList();
 	// for GC
 	StackAddArg((SlangHeader*)pairObj);
@@ -1292,7 +1328,8 @@ inline bool SlangInterpreter::SlangFuncPair(SlangList* argIt,SlangHeader** res){
 		
 	((SlangList*)funcArgStack[frameIndex-1])->left = left;
 	
-	NEXT_ARG(&argIt);
+	NEXT_ARG();
+	argIt = GetCurrArg();
 	
 	SlangHeader* right = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&right))
@@ -1304,7 +1341,8 @@ inline bool SlangInterpreter::SlangFuncPair(SlangList* argIt,SlangHeader** res){
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncLeft(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncLeft(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* pairObj = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&pairObj))
 		return false;
@@ -1319,7 +1357,8 @@ inline bool SlangInterpreter::SlangFuncLeft(SlangList* argIt,SlangHeader** res){
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncRight(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncRight(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* pairObj = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&pairObj))
 		return false;
@@ -1334,7 +1373,8 @@ inline bool SlangInterpreter::SlangFuncRight(SlangList* argIt,SlangHeader** res)
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncSetLeft(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncSetLeft(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* pairObj = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&pairObj))
 		return false;
@@ -1344,9 +1384,15 @@ inline bool SlangInterpreter::SlangFuncSetLeft(SlangList* argIt,SlangHeader** re
 		return false;
 	}
 	
+	if (!arena->InCurrSet((uint8_t*)pairObj)){
+		PushError(pairObj,"SetError:\n    Cannot set left of const data!");
+		return false;
+	}
+	
 	SlangList* pair = (SlangList*)pairObj;
 	
-	NEXT_ARG(&argIt);
+	NEXT_ARG();
+	argIt = GetCurrArg();
 	
 	SlangHeader* valObj = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&valObj))
@@ -1357,7 +1403,8 @@ inline bool SlangInterpreter::SlangFuncSetLeft(SlangList* argIt,SlangHeader** re
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncSetRight(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncSetRight(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* pairObj = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&pairObj))
 		return false;
@@ -1366,9 +1413,16 @@ inline bool SlangInterpreter::SlangFuncSetRight(SlangList* argIt,SlangHeader** r
 		TypeError(pairObj,GetType(pairObj),SlangType::List);
 		return false;
 	}
+	
+	if (!arena->InCurrSet((uint8_t*)pairObj)){
+		PushError(pairObj,"SetError:\n    Cannot set right of const data!");
+		return false;
+	}
+	
 	SlangList* pair = (SlangList*)pairObj;
 	
-	NEXT_ARG(&argIt);
+	NEXT_ARG();
+	argIt = GetCurrArg();
 	
 	SlangHeader* valObj = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&valObj))
@@ -1379,7 +1433,8 @@ inline bool SlangInterpreter::SlangFuncSetRight(SlangList* argIt,SlangHeader** r
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncInc(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncInc(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* numObj = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&numObj))
 		return false;
@@ -1393,7 +1448,8 @@ inline bool SlangInterpreter::SlangFuncInc(SlangList* argIt,SlangHeader** res){
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncDec(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncDec(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* numObj = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&numObj))
 		return false;
@@ -1407,7 +1463,8 @@ inline bool SlangInterpreter::SlangFuncDec(SlangList* argIt,SlangHeader** res){
 	return true;
 }
 
-inline bool SlangInterpreter::AddReals(SlangList* argIt,SlangHeader** res,double curr){
+inline bool SlangInterpreter::AddReals(SlangHeader** res,double curr){
+	SlangList* argIt = GetCurrArg();
 	while (argIt){
 		SlangHeader* valObj = nullptr;
 		if (!WrappedEvalExpr(argIt->left,&valObj))
@@ -1422,14 +1479,16 @@ inline bool SlangInterpreter::AddReals(SlangList* argIt,SlangHeader** res,double
 			return false;
 		}
 		
-		NEXT_ARG(&argIt);
+		NEXT_ARG();
+		argIt = GetCurrArg();
 	}
 	
 	*res = (SlangHeader*)MakeReal(curr);
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncAdd(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncAdd(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	int64_t sum = 0;
 	size_t argCount = 0;
 	while (argIt){
@@ -1440,22 +1499,24 @@ inline bool SlangInterpreter::SlangFuncAdd(SlangList* argIt,SlangHeader** res){
 		if (GetType(valObj)==SlangType::Int){
 			sum += ((SlangObj*)valObj)->integer;
 		} else if (GetType(valObj)==SlangType::Real){
-			NEXT_ARG(&argIt);
-			return AddReals(argIt,res,((SlangObj*)valObj)->real+(double)sum);
+			NEXT_ARG();
+			return AddReals(res,((SlangObj*)valObj)->real+(double)sum);
 		} else {
 			TypeError(valObj,GetType(valObj),SlangType::Int,argCount+1);
 			return false;
 		}
 		
 		++argCount;
-		NEXT_ARG(&argIt);
+		NEXT_ARG();
+		argIt = GetCurrArg();
 	}
 	
 	*res = (SlangHeader*)MakeInt(sum);
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncSub(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncSub(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* l = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&l))
 		return false;
@@ -1466,7 +1527,8 @@ inline bool SlangInterpreter::SlangFuncSub(SlangList* argIt,SlangHeader** res){
 	}
 	StackAddArg(l);
 	
-	NEXT_ARG(&argIt);
+	NEXT_ARG();
+	argIt = GetCurrArg();
 	SlangHeader* r = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&r))
 		return false;
@@ -1499,7 +1561,8 @@ inline bool SlangInterpreter::SlangFuncSub(SlangList* argIt,SlangHeader** res){
 	}
 }
 
-inline bool SlangInterpreter::MulReals(SlangList* argIt,SlangHeader** res,double curr){
+inline bool SlangInterpreter::MulReals(SlangHeader** res,double curr){
+	SlangList* argIt = GetCurrArg();
 	while (argIt){
 		SlangHeader* valObj = nullptr;
 		if (!WrappedEvalExpr(argIt->left,&valObj))
@@ -1514,14 +1577,16 @@ inline bool SlangInterpreter::MulReals(SlangList* argIt,SlangHeader** res,double
 			return false;
 		}
 		
-		NEXT_ARG(&argIt);
+		NEXT_ARG();
+		argIt = GetCurrArg();
 	}
 	
 	*res = (SlangHeader*)MakeReal(curr);
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncMul(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncMul(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	int64_t prod = 1;
 	size_t argCount = 0;
 	while (argIt){
@@ -1532,14 +1597,15 @@ inline bool SlangInterpreter::SlangFuncMul(SlangList* argIt,SlangHeader** res){
 		if (GetType(valObj)==SlangType::Int){
 			prod *= ((SlangObj*)valObj)->integer;
 		} else if (GetType(valObj)==SlangType::Real){
-			NEXT_ARG(&argIt);
-			return MulReals(argIt,res,(double)prod*((SlangObj*)valObj)->real);
+			NEXT_ARG();
+			return MulReals(res,(double)prod*((SlangObj*)valObj)->real);
 		} else {
 			TypeError(valObj,GetType(valObj),SlangType::Int,argCount+1);
 			return false;
 		}
 		
-		NEXT_ARG(&argIt);
+		NEXT_ARG();
+		argIt = GetCurrArg();
 		++argCount;
 	}
 	
@@ -1557,7 +1623,8 @@ inline int64_t floormod(int64_t a,int64_t b){
 	return a-floordiv(a,b)*b;
 }
 
-inline bool SlangInterpreter::SlangFuncDiv(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncDiv(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* l = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&l))
 		return false;
@@ -1567,7 +1634,8 @@ inline bool SlangInterpreter::SlangFuncDiv(SlangList* argIt,SlangHeader** res){
 		return false;
 	}
 	
-	NEXT_ARG(&argIt);
+	NEXT_ARG();
+	argIt = GetCurrArg();
 	
 	SlangHeader* r = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&r))
@@ -1584,14 +1652,14 @@ inline bool SlangInterpreter::SlangFuncDiv(SlangList* argIt,SlangHeader** res){
 	if (l->type==SlangType::Int){
 		if (r->type==SlangType::Int){
 			if (robj->integer==0){
-				ZeroDivisionError((SlangHeader*)argIt);
+				ZeroDivisionError((SlangHeader*)GetCurrArg());
 				return false;
 			}
 			*res = (SlangHeader*)MakeInt(floordiv(lobj->integer,robj->integer));
 			return true;
 		} else {
 			if (robj->real==0.0){
-				ZeroDivisionError((SlangHeader*)argIt);
+				ZeroDivisionError((SlangHeader*)GetCurrArg());
 				return false;
 			}
 			*res = (SlangHeader*)MakeReal((double)lobj->integer/robj->real);
@@ -1600,14 +1668,14 @@ inline bool SlangInterpreter::SlangFuncDiv(SlangList* argIt,SlangHeader** res){
 	} else {
 		if (r->type==SlangType::Int){
 			if (robj->integer==0){
-				ZeroDivisionError((SlangHeader*)argIt);
+				ZeroDivisionError((SlangHeader*)GetCurrArg());
 				return false;
 			}
 			*res = (SlangHeader*)MakeReal(lobj->real/(double)robj->integer);
 			return true;
 		} else {
 			if (robj->real==0.0){
-				ZeroDivisionError((SlangHeader*)argIt);
+				ZeroDivisionError((SlangHeader*)GetCurrArg());
 				return false;
 			}
 			*res = (SlangHeader*)MakeReal(lobj->real/robj->real);
@@ -1616,7 +1684,8 @@ inline bool SlangInterpreter::SlangFuncDiv(SlangList* argIt,SlangHeader** res){
 	}
 }
 
-inline bool SlangInterpreter::SlangFuncMod(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncMod(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* l = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&l))
 		return false;
@@ -1626,7 +1695,8 @@ inline bool SlangInterpreter::SlangFuncMod(SlangList* argIt,SlangHeader** res){
 		return false;
 	}
 	
-	NEXT_ARG(&argIt);
+	NEXT_ARG();
+	argIt = GetCurrArg();
 	SlangHeader* r = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&r))
 		return false;
@@ -1642,14 +1712,14 @@ inline bool SlangInterpreter::SlangFuncMod(SlangList* argIt,SlangHeader** res){
 	if (l->type==SlangType::Int){
 		if (r->type==SlangType::Int){
 			if (robj->integer==0){
-				ZeroDivisionError((SlangHeader*)argIt);
+				ZeroDivisionError((SlangHeader*)GetCurrArg());
 				return false;
 			}
 			*res = (SlangHeader*)MakeInt(floormod(lobj->integer,robj->integer));
 			return true;
 		} else {
 			if (robj->real==0.0){
-				ZeroDivisionError((SlangHeader*)argIt);
+				ZeroDivisionError((SlangHeader*)GetCurrArg());
 				return false;
 			}
 			*res = (SlangHeader*)MakeReal(fmod((double)lobj->integer,robj->real));
@@ -1658,14 +1728,14 @@ inline bool SlangInterpreter::SlangFuncMod(SlangList* argIt,SlangHeader** res){
 	} else {
 		if (r->type==SlangType::Int){
 			if (robj->integer==0){
-				ZeroDivisionError((SlangHeader*)argIt);
+				ZeroDivisionError((SlangHeader*)GetCurrArg());
 				return false;
 			}
 			*res = (SlangHeader*)MakeReal(fmod(lobj->real,(double)robj->integer));
 			return true;
 		} else {
 			if (robj->real==0.0){
-				ZeroDivisionError((SlangHeader*)argIt);
+				ZeroDivisionError((SlangHeader*)GetCurrArg());
 				return false;
 			}
 			*res = (SlangHeader*)MakeReal(fmod(lobj->real,robj->real));
@@ -1674,10 +1744,10 @@ inline bool SlangInterpreter::SlangFuncMod(SlangList* argIt,SlangHeader** res){
 	}
 }
 
-inline bool SlangInterpreter::SlangFuncPrint(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncPrint(SlangHeader** res){
 	SlangHeader* printObj = nullptr;
-	if (!WrappedEvalExpr(argIt->left,&printObj)){
-		EvalError(argIt->left);
+	if (!WrappedEvalExpr(GetCurrArg()->left,&printObj)){
+		EvalError(GetCurrArg()->left);
 		return false;
 	}
 	
@@ -1690,9 +1760,9 @@ inline bool SlangInterpreter::SlangFuncPrint(SlangList* argIt,SlangHeader** res)
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncAssert(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncAssert(SlangHeader** res){
 	SlangHeader* cond = nullptr;
-	if (!WrappedEvalExpr(argIt->left,&cond))
+	if (!WrappedEvalExpr(GetCurrArg()->left,&cond))
 		return false;
 	
 	bool test;
@@ -1702,7 +1772,7 @@ inline bool SlangInterpreter::SlangFuncAssert(SlangList* argIt,SlangHeader** res
 	}
 	
 	if (!test){
-		AssertError(argIt->left);
+		AssertError(GetCurrArg()->left);
 		return false;
 	}
 	
@@ -1782,13 +1852,15 @@ bool StringEquality(const SlangStr* a,const SlangStr* b){
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncEq(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncEq(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* l = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&l))
 		return false;
 	StackAddArg(l);
 	
-	NEXT_ARG(&argIt);
+	NEXT_ARG();
+	argIt = GetCurrArg();
 	SlangHeader* r = nullptr;
 	if (!WrappedEvalExpr(argIt->left,&r))
 		return false;
@@ -1799,22 +1871,20 @@ inline bool SlangInterpreter::SlangFuncEq(SlangList* argIt,SlangHeader** res){
 	return true;
 }
 
-inline bool SlangInterpreter::SlangFuncIs(SlangList* argIt,SlangHeader** res){
+inline bool SlangInterpreter::SlangFuncIs(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
 	SlangHeader* l = nullptr;
-	if (!WrappedEvalExpr(argIt->left,&l)){
-		EvalError(argIt->left);
+	if (!WrappedEvalExpr(argIt->left,&l))
 		return false;
-	}
-		
+	
 	StackAddArg(l);
 	
 	SlangHeader* r = nullptr;
-	NEXT_ARG(&argIt);
-	if (!WrappedEvalExpr(argIt->left,&r)){
-		EvalError(argIt->left);
+	NEXT_ARG();
+	argIt = GetCurrArg();
+	if (!WrappedEvalExpr(argIt->left,&r))
 		return false;
-	}
-		
+	
 	l = funcArgStack[--frameIndex];
 	
 	if (l==r){
@@ -1876,11 +1946,52 @@ inline void SlangInterpreter::PopEnv(){
 	--envIndex;
 }
 
+inline void SlangInterpreter::PushArg(SlangList* list){
+	if (argIndex>=argStack.size()-1){
+		argStack.resize(argStack.size()*3/2);
+	}
+	argStack[++argIndex] = list;
+}
+
+inline void SlangInterpreter::PopArg(){
+	assert(argIndex!=0);
+	--argIndex;
+}
+
+inline void SlangInterpreter::PushExpr(SlangHeader* expr){
+	if (exprIndex>=exprStack.size()-1){
+		exprStack.resize(exprStack.size()*3/2);
+	}
+	exprStack[++exprIndex] = expr;
+	if (expr && expr->type==SlangType::List){
+		PushArg((SlangList*)expr);
+	} else {
+		PushArg(nullptr);
+	}
+}
+
+inline void SlangInterpreter::SetExpr(SlangHeader* expr){
+	exprStack[exprIndex] = expr;
+	if (expr && expr->type==SlangType::List){
+		argStack[argIndex] = (SlangList*)expr;
+	} else {
+		argStack[argIndex] = nullptr;
+	}
+}
+
+inline void SlangInterpreter::PopExpr(){
+	assert(exprIndex!=0);
+	PopArg();
+	--exprIndex;
+}
+
 inline bool SlangInterpreter::WrappedEvalExpr(SlangHeader* expr,SlangHeader** res){
 	++gCurrDepth;
 	if (gCurrDepth>gMaxDepth) gMaxDepth = gCurrDepth;
 	PushEnv(GetCurrEnv());
-	bool b = EvalExpr(expr,res);
+	PushExpr(expr);
+	bool b = EvalExpr(res);
+	PopExpr();
 	PopEnv();
 	--gCurrDepth;
 	return b;
@@ -1940,7 +2051,11 @@ inline bool SlangInterpreter::GetLetParams(
 			return false;
 		}
 		
-		NEXT_ARG(&paramIt);
+		if (!IsList(paramIt->right)){
+			EvalError((SlangHeader*)paramIt);
+			return false;
+		}
+		paramIt = (SlangList*)paramIt->right;
 	}
 	return true;
 }
@@ -1951,10 +2066,11 @@ inline bool SlangInterpreter::GetLetParams(
 		return false; \
 	}
 
-bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
+bool SlangInterpreter::EvalExpr(SlangHeader** res){
 	++gEvalRecurCounter;
+	SlangHeader* expr;
 	while (true){
-		//currEnv = env;
+		expr = GetCurrExpr();
 		if (!expr){
 			*res = nullptr;
 			return true;
@@ -1994,7 +2110,6 @@ bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
 				}
 				
 				PrintCurrEnv(GetCurrEnv());
-				
 				UndefinedError(expr);
 				return false;
 			}
@@ -2002,12 +2117,13 @@ bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
 			// function
 			case SlangType::List: {
 				SlangHeader* head = nullptr;
-				SlangList* argIt = (SlangList*)expr;
-				NEXT_ARG(&argIt);
-				if (!WrappedEvalExpr(((SlangList*)expr)->left,&head)){
+				SlangList* argIt = GetCurrArg();
+				if (!WrappedEvalExpr(argIt->left,&head)){
 					EvalError(expr);
 					return false;
 				}
+				NEXT_ARG();
+				argIt = GetCurrArg();
 				size_t base = frameIndex;
 				
 				size_t argCount = GetArgCount(argIt);
@@ -2033,7 +2149,8 @@ bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
 								return false;
 							}
 							StackAddArg(fArg);
-							NEXT_ARG(&argIt);
+							NEXT_ARG();
+							argIt = GetCurrArg();
 						}
 						
 						SlangList* list = MakeList(funcArgStack,base,frameIndex);
@@ -2050,7 +2167,8 @@ bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
 								return false;
 							}
 							StackAddArg(fArg);
-							NEXT_ARG(&argIt);
+							NEXT_ARG();
+							argIt = GetCurrArg();
 						}
 						
 						lam = (SlangLambda*)funcArgStack[headIndex];
@@ -2060,7 +2178,8 @@ bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
 					}
 					
 					lam = (SlangLambda*)funcArgStack[headIndex];
-					expr = lam->expr;
+					SetExpr(lam->expr);
+					
 					envStack[envIndex] = lam->env;
 					frameIndex = base;
 					--frameIndex;
@@ -2073,11 +2192,11 @@ bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
 					switch (symbol){
 						case SLANG_DEFINE:
 							ARITY_EXACT_CHECK(2);
-							success = SlangFuncDefine(argIt,res);
+							success = SlangFuncDefine(res);
 							return success;
 						case SLANG_LAMBDA:
 							ARITY_EXACT_CHECK(2);
-							success = SlangFuncLambda(argIt,res);
+							success = SlangFuncLambda(res);
 							return success;
 						case SLANG_LET: {
 							if (argCount!=2&&argCount!=3){
@@ -2089,7 +2208,8 @@ bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
 							// named let
 							if (GetType(argIt->left)==SlangType::Symbol){
 								letName = ((SlangObj*)argIt->left)->symbol;
-								NEXT_ARG(&argIt);
+								NEXT_ARG();
+								argIt = GetCurrArg();
 							} else {
 								letName = LET_SELF_SYM;
 							}
@@ -2108,7 +2228,8 @@ bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
 								EvalError(paramIt);
 								return false;
 							}
-							NEXT_ARG(&argIt);
+							NEXT_ARG();
+							argIt = GetCurrArg();
 							SlangHeader* letExpr = argIt->left;
 							
 							// use this to GC the let env
@@ -2127,7 +2248,6 @@ bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
 									return false;
 								}
 								if (!GetCurrEnv()->SetSymbol(param,initObj)){
-									//std::cout << "Could not set param '" << param << "' of " << *initObj << '\n';
 									EvalError(initExprs[i]);
 									return false;
 								}
@@ -2136,12 +2256,12 @@ bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
 							
 							tempLambda = (SlangLambda*)funcArgStack[--frameIndex];
 							// last call tail call
-							expr = tempLambda->expr;
+							SetExpr(tempLambda->expr);
 							continue;
 						}
 						case SLANG_SET:
 							ARITY_EXACT_CHECK(2);
-							success = SlangFuncSet(argIt,res);
+							success = SlangFuncSet(res);
 							if (!success)
 								EvalError(expr);
 							return success;
@@ -2153,36 +2273,74 @@ bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
 							// while next arg is not null
 							while (argIt->right){
 								if (!WrappedEvalExpr(argIt->left,res)){
-									EvalError(argIt->left);
+									EvalError(GetCurrArg()->left);
 									return false;
 								}
-								NEXT_ARG(&argIt);
+								NEXT_ARG();
+								argIt = GetCurrArg();
 							}
 							
 							// elide last call
-							expr = argIt->left;
+							SetExpr(argIt->left);
+							continue;
+						}
+						case SLANG_PARSE: {
+							ARITY_EXACT_CHECK(1);
+							
+							SlangHeader* strObj;
+							if (!WrappedEvalExpr(argIt->left,&strObj))
+								return false;
+								
+							if (GetType(strObj)!=SlangType::String){
+								TypeError(strObj,GetType(strObj),SlangType::String);
+								return false;
+							}
+							
+							SlangStr* str = (SlangStr*)strObj;
+							SlangHeader* parsed;
+							if (!str->storage||str->storage->size==0){
+								parsed = nullptr;
+							} else {
+								parsed = parser.ParseSlangString(*str);
+							}
+							
+							*res = parsed;
+							
+							return true;
+						}
+						case SLANG_EVAL: {
+							ARITY_EXACT_CHECK(1);
+							
+							SlangHeader* newExpr;
+							if (!WrappedEvalExpr(argIt->left,&newExpr))
+								return false;
+								
+							SetExpr(newExpr);
 							continue;
 						}
 						case SLANG_APPLY: {
 							// (apply func args)
 							ARITY_EXACT_CHECK(2);
 							SlangHeader* head = argIt->left;
-							NEXT_ARG(&argIt);
+							StackAddArg(head);
+							NEXT_ARG();
+							argIt = GetCurrArg();
 							SlangHeader* args;
 							if (!WrappedEvalExpr(argIt->left,&args))
 								return false;
 							
 							if (!IsList(args)){
-								EvalError(argIt->left);
+								EvalError(GetCurrArg()->left);
 								TypeError(args,GetType(args),SlangType::List);
 								return false;
 							}
+							StackAddArg(args);
 							
 							SlangList* listHead = AllocateList();
-							listHead->left = head;
-							listHead->right = args;
+							listHead->right = funcArgStack[--frameIndex];
+							listHead->left = funcArgStack[--frameIndex];
 							
-							expr = (SlangHeader*)listHead;
+							SetExpr((SlangHeader*)listHead);
 							continue;
 						}
 						case SLANG_IF: {
@@ -2194,118 +2352,120 @@ bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
 								return false;
 							}
 							if (!ConvertToBool(condObj,test)){
-								TypeError(argIt->left,GetType(argIt->left),SlangType::Bool);
+								TypeError(GetCurrArg()->left,GetType(GetCurrArg()->left),SlangType::Bool);
 								EvalError(expr);
 								return false;
 							}
 							
-							NEXT_ARG(&argIt);
+							NEXT_ARG();
+							argIt = GetCurrArg();
 							if (test){
-								expr = argIt->left;
+								SetExpr(argIt->left);
 								continue;
 							}
-							NEXT_ARG(&argIt);
-							expr = argIt->left;
+							NEXT_ARG();
+							argIt = GetCurrArg();
+							SetExpr(argIt->left);
 							continue;
 						}
 						case SLANG_QUOTE:
 							ARITY_EXACT_CHECK(1);
-							success = SlangFuncQuote(argIt,res);
+							success = SlangFuncQuote(res);
 							return success;
 						case SLANG_NOT:
 							ARITY_EXACT_CHECK(1);
-							success = SlangFuncNot(argIt,res);
+							success = SlangFuncNot(res);
 							return success;
 						case SLANG_NEG:
 							ARITY_EXACT_CHECK(1);
-							success = SlangFuncNegate(argIt,res);
+							success = SlangFuncNegate(res);
 							return success;
 						case SLANG_LIST:
-							success = SlangFuncList(argIt,res);
+							success = SlangFuncList(res);
 							return success;
 						case SLANG_VEC:
-							success = SlangFuncVec(argIt,res);
+							success = SlangFuncVec(res);
 							return success;
 						case SLANG_VEC_ALLOC:
 							if (argCount!=1&&argCount!=2){
 								ArityError(expr,argCount,1);
 								return false;
 							}
-							success = SlangFuncVecAlloc(argIt,res);
+							success = SlangFuncVecAlloc(res);
 							return success;
 						case SLANG_VEC_SIZE:
 							ARITY_EXACT_CHECK(1);
-							success = SlangFuncVecSize(argIt,res);
+							success = SlangFuncVecSize(res);
 							return success;
 						case SLANG_VEC_GET:
 							ARITY_EXACT_CHECK(2);
-							success = SlangFuncVecGet(argIt,res);
+							success = SlangFuncVecGet(res);
 							return success;
 						case SLANG_VEC_SET:
 							ARITY_EXACT_CHECK(3);
-							success = SlangFuncVecSet(argIt,res);
+							success = SlangFuncVecSet(res);
 							return success;
 						case SLANG_PAIR:
 							ARITY_EXACT_CHECK(2);
-							success = SlangFuncPair(argIt,res);
+							success = SlangFuncPair(res);
 							return success;
 						case SLANG_LEFT:
 							ARITY_EXACT_CHECK(1);
-							success = SlangFuncLeft(argIt,res);
+							success = SlangFuncLeft(res);
 							return success;
 						case SLANG_RIGHT:
 							ARITY_EXACT_CHECK(1);
-							success = SlangFuncRight(argIt,res);
+							success = SlangFuncRight(res);
 							return success;
 						case SLANG_INC:
 							ARITY_EXACT_CHECK(1);
-							success = SlangFuncInc(argIt,res);
+							success = SlangFuncInc(res);
 							return success;
 						case SLANG_DEC:	
 							ARITY_EXACT_CHECK(1);
-							success = SlangFuncDec(argIt,res);
+							success = SlangFuncDec(res);
 							return success;
 						case SLANG_ADD:
-							success = SlangFuncAdd(argIt,res);
+							success = SlangFuncAdd(res);
 							return success;
 						case SLANG_SUB:
 							ARITY_EXACT_CHECK(2);
-							success = SlangFuncSub(argIt,res);
+							success = SlangFuncSub(res);
 							return success;
 						case SLANG_MUL:
-							success = SlangFuncMul(argIt,res);
+							success = SlangFuncMul(res);
 							return success;
 						case SLANG_DIV:
 							ARITY_EXACT_CHECK(2);
-							success = SlangFuncDiv(argIt,res);
+							success = SlangFuncDiv(res);
 							return success;
 						case SLANG_MOD:
 							ARITY_EXACT_CHECK(2);
-							success = SlangFuncMod(argIt,res);
+							success = SlangFuncMod(res);
 							return success;
 						case SLANG_SET_LEFT:
 							ARITY_EXACT_CHECK(2);
-							success = SlangFuncSetLeft(argIt,res);
+							success = SlangFuncSetLeft(res);
 							return success;
 						case SLANG_SET_RIGHT:
 							ARITY_EXACT_CHECK(2);
-							success = SlangFuncSetRight(argIt,res);
+							success = SlangFuncSetRight(res);
 							return success;
 						case SLANG_PRINT:
 							ARITY_EXACT_CHECK(1);
-							success = SlangFuncPrint(argIt,res);
+							success = SlangFuncPrint(res);
 							return success;
 						case SLANG_ASSERT:
 							ARITY_EXACT_CHECK(1);
-							success = SlangFuncAssert(argIt,res);
+							success = SlangFuncAssert(res);
 							return success;
 						case SLANG_EQ:
 							ARITY_EXACT_CHECK(2);
-							success = SlangFuncEq(argIt,res);
+							success = SlangFuncEq(res);
 							return success;
 						case SLANG_IS:
 							ARITY_EXACT_CHECK(2);
-							success = SlangFuncIs(argIt,res);
+							success = SlangFuncIs(res);
 							return success;
 						case SLANG_IS_NULL:
 							ARITY_EXACT_CHECK(1);
@@ -2394,7 +2554,7 @@ bool SlangInterpreter::EvalExpr(SlangHeader* expr,SlangHeader** res){
 								ProcError(head);
 								return false;
 							}
-							success = extFuncs.at(symbol)(this,argIt,res);
+							success = extFuncs.at(symbol)(this,res);
 							if (!success)
 								EvalError(expr);
 							return success;
@@ -2526,9 +2686,13 @@ void SlangInterpreter::Run(SlangHeader* prog){
 	gDebugInterpreter = this;
 	
 	funcArgStack.resize(32);
-	envStack.resize(32);
+	envStack.resize(16);
+	exprStack.resize(32);
+	argStack.resize(32);
 	frameIndex = 0;
 	envIndex = 0;
+	exprIndex = 0;
+	argIndex = 0;
 	errors = {};
 	genIndex = 1;
 	
@@ -2537,6 +2701,8 @@ void SlangInterpreter::Run(SlangHeader* prog){
 	SlangEnv* env = AllocateEnv(4);
 	env->parent = nullptr;
 	envStack[0] = env;
+	argStack[0] = nullptr;
+	exprStack[0] = nullptr;
 	
 	auto start = std::chrono::steady_clock::now();
 	WrappedEvalExpr(prog,&res);
@@ -2551,6 +2717,8 @@ void SlangInterpreter::Run(SlangHeader* prog){
 	
 	frameIndex = 0;
 	envIndex = 0;
+	exprIndex = 0;
+	argIndex = 0;
 	SmallGC(0);
 	
 //	size_t tenureCount = arena->tenureSets.size();
@@ -2722,9 +2890,9 @@ inline void SlangParser::NextToken(){
 		return;
 	}
 	
-	token = tokenizer.NextToken();
+	token = tokenizer->NextToken();
 	while (token.type==SlangTokenType::Comment){
-		token = tokenizer.NextToken();
+		token = tokenizer->NextToken();
 	}
 		
 	if (token.type==SlangTokenType::Error){
@@ -3109,18 +3277,15 @@ SlangObj* SlangParser::LoadIntoBuffer(SlangObj* prog){
 	return &codeBuffer[i];
 }*/
 
-SlangHeader* SlangParser::Parse(const std::string& code){
+
+SlangHeader* SlangParser::Parse(){
 	gDebugParser = this;
+	errors.clear();
 	
-//	codeBuffer = {};
-//	codeIndex = 0;
-//	size_t codeStart = gHeapAllocTotal;
-	
-	auto start = std::chrono::steady_clock::now();
-	
-	tokenizer.SetText(code);
 	token.type = SlangTokenType::Comment;
 	NextToken();
+	
+	auto start = std::chrono::steady_clock::now();
 	
 	std::vector<SlangHeader*> exprs = {};
 	SlangHeader* temp;
@@ -3130,22 +3295,30 @@ SlangHeader* SlangParser::Parse(const std::string& code){
 		
 		if (token.type==SlangTokenType::EndOfFile) break;
 	}
+	if (!errors.empty()) return nullptr;
 	
-	if (!errors.empty()){
-		PrintErrors(errors);
-		return nullptr;
+	SlangHeader* prog = nullptr;
+	if (exprs.size()==1){
+		prog = exprs.front();
+	} else if (exprs.size()>1){
+		prog = WrapProgram(exprs);
 	}
-	
-	SlangHeader* prog = WrapProgram(exprs);
 	
 	std::chrono::duration<double> diff = std::chrono::steady_clock::now()-start;
 	gParseTime = diff.count();
 	
-//	codeCount = gHeapAllocTotal - codeStart;
-//	codeBuffer.resize(codeCount);
-	//LoadIntoBuffer(prog);
-	
 	return prog;
+}
+
+SlangHeader* SlangParser::ParseString(const std::string& code){
+	tokenizer = std::make_unique<SlangTokenizer>(code);
+	return Parse();
+}
+
+SlangHeader* SlangParser::ParseSlangString(const SlangStr& code){
+	std::string_view sv{(const char*)code.storage->data,code.storage->size};
+	tokenizer = std::make_unique<SlangTokenizer>(sv);
+	return Parse();
 }
 
 inline LocationData SlangParser::GetExprLocation(const SlangHeader* expr){
@@ -3184,7 +3357,12 @@ SlangInterpreter::SlangInterpreter(){
 }
 
 SlangHeader* SlangInterpreter::Parse(const std::string& code){
-	return parser.Parse(code);
+	SlangHeader* parsed = parser.ParseString(code);
+	if (!parser.errors.empty()){
+		PrintErrors(parser.errors);
+		return nullptr;
+	}
+	return parsed;
 }
 
 std::ostream& operator<<(std::ostream& os,const SlangHeader& obj){
@@ -3237,40 +3415,42 @@ std::ostream& operator<<(std::ostream& os,const SlangHeader& obj){
 			SlangStorage* storage = ((SlangStr*)&obj)->storage;
 			os << '"';
 			uint8_t c;
-			for (size_t i=0;i<storage->size;++i){
-				c = storage->data[i];
-				if (!IsPrintable(c)){
-					switch (c){
-						case '\n':
-							os << "\\n";
-							break;
-						case '\r':
-							os << "\\r";
-							break;
-						case '\t':
-							os << "\\t";
-							break;
-						case '\v':
-							os << "\\v";
-							break;
-						case '\a':
-							os << "\\a";
-							break;
-						case '\f':
-							os << "\\f";
-							break;
-						case '\b':
-							os << "\\b";
-							break;
-						case 27:
-							os << "\\e";
-							break;
-						default:
-							os << "\\x" << std::hex << (c>>4) << (c&0xf) << std::dec;
-							break;
+			if (storage){
+				for (size_t i=0;i<storage->size;++i){
+					c = storage->data[i];
+					if (!IsPrintable(c)){
+						switch (c){
+							case '\n':
+								os << "\\n";
+								break;
+							case '\r':
+								os << "\\r";
+								break;
+							case '\t':
+								os << "\\t";
+								break;
+							case '\v':
+								os << "\\v";
+								break;
+							case '\a':
+								os << "\\a";
+								break;
+							case '\f':
+								os << "\\f";
+								break;
+							case '\b':
+								os << "\\b";
+								break;
+							case 27:
+								os << "\\e";
+								break;
+							default:
+								os << "\\x" << std::hex << (c>>4) << (c&0xf) << std::dec;
+								break;
+						}
+					} else {
+						os << c;
 					}
-				} else {
-					os << c;
 				}
 			}
 			os << '"';
@@ -3280,13 +3460,15 @@ std::ostream& operator<<(std::ostream& os,const SlangHeader& obj){
 			SlangStorage* storage = ((SlangVec*)&obj)->storage;
 			
 			os << "#[";
-			for (size_t i=0;i<storage->size;++i){
-				if (i!=0)
-					os << ' ';
-				if (!storage->objs[i])
-					os << "()";
-				else
-					os << *storage->objs[i];
+			if (storage){
+				for (size_t i=0;i<storage->size;++i){
+					if (i!=0)
+						os << ' ';
+					if (!storage->objs[i])
+						os << "()";
+					else
+						os << *storage->objs[i];
+				}
 			}
 			os << "]";
 			break;

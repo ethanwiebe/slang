@@ -159,8 +159,9 @@
 (def v (vec 1 2 'hello 5))
 (print (list 1 2 'hello 4))
 (print v)
-(print (vec-get v 3))
 (print '-5)
+(print (vec-get v 3))
+(print (vec))
 (def aa -.3)
 (print -aa)
 (print .3)
@@ -180,7 +181,9 @@
 
 (def limited-use (& (func max)
 	(let ((count max))
-		(& args (if !count 
+		(& args 
+		(print args)
+		(if !count 
 			(assert false)
 			(do
 				(set! count (-- count))
@@ -191,7 +194,10 @@
 	)
 ))
 
+
 (def limit-add (limited-use + 3))
 (print (limit-add 2 3))
 (print (limit-add 2 3))
 (print (limit-add 2 3))
+
+(print (parse "(+ 100 3"))

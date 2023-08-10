@@ -35,7 +35,7 @@
 (def makebig (& () (make-int-list N)))
 (def biglist (make-int-list N))
 (assert (= N (list-len biglist)))
-(setL! biglist 3)
+(set-L! biglist 3)
 (assert (= (list-len (makebig)) N))
 (make-int-list 1000)
 (assert (= (list-sum biglist) 4999950003))

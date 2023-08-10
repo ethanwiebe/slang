@@ -5,7 +5,7 @@
 			(assert (= (L a) 1))
 			(assert (= (L sec) (R sec)))
 			(assert (is (L sec) (R sec)))
-			(setL! (L sec) 5)
+			(set-L! (L sec) 5)
 			(assert (= (L (R sec)) 5))
 	)
 ))
@@ -13,12 +13,12 @@
 ; testing setL
 (def testquote (& ()
 	(let (
-		(x '((1 2) (3 4)))
+		(x (list '(1 2) '(3 4)))
 		(y (L x))
 		)
 		
 		(print x)
-		(setL! (L x) 12)
+		(set-L! (L x) 12)
 		(assert (= (L (L x)) 12))
 		(assert (= (L y) 12))
 	)

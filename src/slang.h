@@ -7,6 +7,7 @@
 #include <vector>
 #include <list>
 #include <ostream>
+#include <memory>
 #include <assert.h>
 
 #define SMALL_SET_SIZE 32768
@@ -164,7 +165,7 @@ namespace slang {
 	
 	static_assert(sizeof(SlangObj)==16);
 	struct SlangInterpreter;
-	typedef bool(*SlangFunc)(SlangInterpreter* s,SlangList* args,SlangHeader** res);
+	typedef bool(*SlangFunc)(SlangInterpreter* s,SlangHeader** res);
 	
 	struct ExternalFunc {
 		const char* name;
@@ -281,7 +282,7 @@ namespace slang {
 		SlangObj** GetSymbol(SymbolName);
 	};*/
 	
-	typedef std::string::const_iterator StringIt;
+	typedef std::string_view::const_iterator StringIt;
 	
 	struct LocationData {
 		uint32_t line,col;
@@ -317,14 +318,13 @@ namespace slang {
 	};
 	
 	struct SlangTokenizer {
-		std::string tokenStr;
+		std::string_view tokenStr;
 		StringIt pos,end;
 		uint32_t line,col;
 		
-		inline void SetText(const std::string& code){
-			tokenStr = code;
-			pos = tokenStr.begin();
-			end = tokenStr.end();
+		inline SlangTokenizer(std::string_view code) : tokenStr(code){
+			pos = tokenStr.cbegin();
+			end = tokenStr.cend();
 			line = 0;
 			col = 0;
 		}
@@ -332,7 +332,7 @@ namespace slang {
 	};
 	
 	struct SlangParser {
-		SlangTokenizer tokenizer;
+		std::unique_ptr<SlangTokenizer> tokenizer;
 		SlangToken token;
 		
 		SymbolNameDict nameDict;
@@ -376,7 +376,9 @@ namespace slang {
 		SlangHeader* LoadIntoBuffer(SlangHeader* prog);
 		void TestSeqMacro(SlangList* list,size_t argCount);
 		
-		SlangHeader* Parse(const std::string& code);
+		SlangHeader* ParseString(const std::string& code);
+		SlangHeader* ParseSlangString(const SlangStr&);
+		SlangHeader* Parse();
 	};
 	
 	struct SlangInterpreter {
@@ -384,76 +386,95 @@ namespace slang {
 		SlangHeader* program;
 		MemArena* arena;
 		bool gcParity;
-		size_t envIndex,frameIndex;
+		size_t envIndex,exprIndex,argIndex,frameIndex;
 		
 		SymbolName genIndex;
 		
 		std::vector<SlangHeader*> funcArgStack;
 		std::vector<SlangEnv*> envStack;
+		std::vector<SlangHeader*> exprStack;
+		std::vector<SlangList*> argStack;
+		
 		std::vector<ErrorData> errors;
 		std::map<SymbolName,SlangFunc> extFuncs;
 		
-		inline bool NextArg(SlangList** expr){
-			if (GetType((SlangHeader*)*expr)!=SlangType::List){
-				TypeError((SlangHeader*)*expr,GetType((SlangHeader*)*expr),SlangType::List);
-				return false;
-			}
-			*expr = (SlangList*)(*expr)->right;
-			return true;
-		}
 		
 		SlangInterpreter();
 		void AddExternalFunction(const ExternalFunc&);
 		
-		inline SlangEnv* GetCurrEnv(){
+		inline SlangEnv* GetCurrEnv() const {
 			return envStack[envIndex];
 		}
+		
 		inline void PushEnv(SlangEnv* env);
 		inline void PopEnv();
 		
+		inline SlangList* GetCurrArg() const {
+			return argStack[argIndex];
+		}
+		
+		inline SlangHeader* GetCurrExpr() const {
+			return exprStack[exprIndex];
+		}
+		inline void PushArg(SlangList* expr);
+		inline void PopArg();
+		inline void PushExpr(SlangHeader* expr);
+		inline void SetExpr(SlangHeader* expr);
+		inline void PopExpr();
+		
+		inline bool NextArg(){
+			SlangList* currArg = GetCurrArg();
+			if (GetType(currArg->right)!=SlangType::List&&currArg->right!=nullptr){
+				TypeError((SlangHeader*)currArg,GetType((SlangHeader*)currArg),SlangType::List);
+				return false;
+			}
+			argStack[argIndex] = (SlangList*)currArg->right;
+			return true;
+		}
+		
 		inline bool SetRecursiveSymbol(SlangEnv*,SymbolName,SlangHeader*);
 		
-		inline bool AddReals(SlangList* args,SlangHeader** res,double curr);
-		inline bool MulReals(SlangList* args,SlangHeader** res,double curr);
+		inline bool AddReals(SlangHeader** res,double curr);
+		inline bool MulReals(SlangHeader** res,double curr);
 		bool GetLetParams(
 			std::vector<SymbolName>& params,
 			std::vector<SlangHeader*>& exprs,
 			SlangList* paramIt
 		);
 		
-		inline bool SlangFuncDefine(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncLambda(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncSet(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncQuote(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncNot(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncNegate(SlangList* args,SlangHeader** res);
+		inline bool SlangFuncDefine(SlangHeader** res);
+		inline bool SlangFuncLambda(SlangHeader** res);
+		inline bool SlangFuncSet(SlangHeader** res);
+		inline bool SlangFuncQuote(SlangHeader** res);
+		inline bool SlangFuncNot(SlangHeader** res);
+		inline bool SlangFuncNegate(SlangHeader** res);
 		
-		inline bool SlangFuncInc(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncDec(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncAdd(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncSub(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncMul(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncDiv(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncMod(SlangList* args,SlangHeader** res);
+		inline bool SlangFuncInc(SlangHeader** res);
+		inline bool SlangFuncDec(SlangHeader** res);
+		inline bool SlangFuncAdd(SlangHeader** res);
+		inline bool SlangFuncSub(SlangHeader** res);
+		inline bool SlangFuncMul(SlangHeader** res);
+		inline bool SlangFuncDiv(SlangHeader** res);
+		inline bool SlangFuncMod(SlangHeader** res);
 		
-		inline bool SlangFuncList(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncVec(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncVecAlloc(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncVecSize(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncVecGet(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncVecSet(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncPair(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncLeft(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncRight(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncSetLeft(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncSetRight(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncPrint(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncAssert(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncEq(SlangList* args,SlangHeader** res);
-		inline bool SlangFuncIs(SlangList* args,SlangHeader** res);
+		inline bool SlangFuncList(SlangHeader** res);
+		inline bool SlangFuncVec(SlangHeader** res);
+		inline bool SlangFuncVecAlloc(SlangHeader** res);
+		inline bool SlangFuncVecSize(SlangHeader** res);
+		inline bool SlangFuncVecGet(SlangHeader** res);
+		inline bool SlangFuncVecSet(SlangHeader** res);
+		inline bool SlangFuncPair(SlangHeader** res);
+		inline bool SlangFuncLeft(SlangHeader** res);
+		inline bool SlangFuncRight(SlangHeader** res);
+		inline bool SlangFuncSetLeft(SlangHeader** res);
+		inline bool SlangFuncSetRight(SlangHeader** res);
+		inline bool SlangFuncPrint(SlangHeader** res);
+		inline bool SlangFuncAssert(SlangHeader** res);
+		inline bool SlangFuncEq(SlangHeader** res);
+		inline bool SlangFuncIs(SlangHeader** res);
 		
 		inline bool WrappedEvalExpr(SlangHeader* expr,SlangHeader** res);
-		bool EvalExpr(SlangHeader* expr,SlangHeader** res);
+		bool EvalExpr(SlangHeader** res);
 		
 		inline void StackAddArg(SlangHeader*);
 		

@@ -37,10 +37,25 @@
 (assert (= N (list-len biglist)))
 (set-L! biglist 3)
 (assert (= (list-len (makebig)) N))
+(assert (= (len (makebig)) N))
 (make-int-list 1000)
 (assert (= (list-sum biglist) 4999950003))
+
+(assert (= (gc-rec-size '(1 2 3)) 120))
+
+(def bigvec 
+	(vec-alloc 100000 0)
+)
+(assert (= (len bigvec) 100000))
+
 (set! biglist ())
-(list-sum ())
-(list-len ())
+(set! list-sum ())
+(set! make-int-list ())
+(set! list-len ())
+(set! makebig ())
+(set! bigvec ())
+
 (gc-collect)
-(print 'passed)
+; assert memory was cleaned up
+(assert (< (gc-mem-cap) 100000))
+(output "mem passed\n")

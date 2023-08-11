@@ -1,7 +1,6 @@
 ; pair with two equal pointers
 (def testref (& ()
 	(let ((a (pair 1 2)) (sec (pair a a)))
-			(print sec)
 			(assert (= (L a) 1))
 			(assert (= (L sec) (R sec)))
 			(assert (is (L sec) (R sec)))
@@ -17,7 +16,6 @@
 		(y (L x))
 		)
 		
-		(print x)
 		(set-L! (L x) 12)
 		(assert (= (L (L x)) 12))
 		(assert (= (L y) 12))
@@ -42,4 +40,4 @@
 (assert (= v2 20))
 (assert (= v1 21))
 
-(print 'passed)
+(output "pair passed\n")

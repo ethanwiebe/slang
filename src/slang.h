@@ -19,6 +19,8 @@ namespace slang {
 	typedef uint64_t SymbolName;
 	typedef std::unordered_map<std::string,SymbolName> SymbolNameDict;
 	
+	void PrintInfo();
+	
 	enum class SlangType : uint8_t {
 		NullType,
 		
@@ -30,6 +32,7 @@ namespace slang {
 		Real,
 		Vector,
 		String,
+		Maybe,
 		// inaccessible
 		Env,
 		Params,
@@ -37,10 +40,11 @@ namespace slang {
 	};
 	
 	enum SlangFlag {
-		FLAG_FORWARDED =       0b1,
-		FLAG_TENURED =        0b10,
-		FLAG_BOOL_VALUE =    0b100,
-		FLAG_VARIADIC =     0b1000
+		FLAG_FORWARDED =          0b1,
+		FLAG_TENURED =           0b10,
+		FLAG_BOOL_VALUE =       0b100,
+		FLAG_VARIADIC =        0b1000,
+		FLAG_MAYBE_OCCUPIED = 0b10000
 	};
 	
 	struct SlangHeader {
@@ -94,6 +98,11 @@ namespace slang {
 			};
 		};
 	};
+	
+	inline size_t GetStorageSize(const SlangStorage* s){
+		if (!s) return 0;
+		return s->size;
+	}
 	
 	static_assert(sizeof(SlangStorage)==24);
 	
@@ -160,6 +169,7 @@ namespace slang {
 			int64_t integer;
 			double real;
 			bool boolean;
+			SlangHeader* maybe;
 		};
 	};
 	
@@ -167,9 +177,13 @@ namespace slang {
 	struct SlangInterpreter;
 	typedef bool(*SlangFunc)(SlangInterpreter* s,SlangHeader** res);
 	
+	#define VARIADIC_ARG_COUNT -1ULL
+	
 	struct ExternalFunc {
 		const char* name;
 		SlangFunc func;
+		size_t minArgs = 0;
+		size_t maxArgs = 0;
 	};
 	
 	inline SlangType GetType(const SlangHeader* expr){
@@ -207,16 +221,12 @@ namespace slang {
 		
 		uint8_t* currPointer = nullptr;
 		
-		//std::list<SlangObj*> tenureSets = {};
-		//SlangObj* currTenureSet = nullptr;
-		//SlangObj* currTenurePointer = nullptr;
-		
-		inline void SetSpace(uint8_t* ptr,size_t size){
+		inline void SetSpace(uint8_t* ptr,size_t size,uint8_t* newCurr){
 			assert((size&7) == 0);
 			assert(((uint64_t)ptr&7) == 0);
 			memSet = ptr;
 			currSet = ptr;
-			currPointer = ptr;
+			currPointer = newCurr;
 			otherSet = ptr+size/2;
 			memSize = size;
 		}
@@ -226,61 +236,12 @@ namespace slang {
 			otherSet = currSet;
 			currSet = currPointer;
 		}
-		/*
-		inline SlangObj* TenureObj(){
-			if (!currTenureSet){
-				currTenureSet = (SlangObj*)malloc(LARGE_SET_SIZE*sizeof(SlangObj));
-				tenureSets.push_back(currTenureSet);
-				currTenurePointer = currTenureSet;
-			}
-			
-			SlangObj* ptr = currTenurePointer++;
-			if (currTenurePointer-currTenureSet > LARGE_SET_SIZE){
-				currTenureSet = nullptr;
-			}
-			return ptr;
-		}
-		
-		inline void ClearTenuredSets(){
-			for (auto* ptr : tenureSets){
-				free(ptr);
-			}
-			tenureSets.clear();
-		}*/
-		/*
-		inline bool SameTenureSet(const SlangObj* s1,const SlangObj* s2) const {
-			if (s1==s2) return true;
-			if (std::abs(s1-s2)>LARGE_SET_SIZE) return false;
-			for (auto it=tenureSets.rbegin();it!=tenureSets.rend();++it){
-				if (s1<*it || s1>=(*it+LARGE_SET_SIZE)) continue;
-				if (s2<*it || s2>=(*it+LARGE_SET_SIZE)) return false;
-				return true;
-			}
-			return false;
-		}*/
 		
 		inline bool InCurrSet(const uint8_t* obj) const {
 			return obj>=&currSet[0] && 
 					obj<(&currSet[0]+memSize/2);
 		}
 	};
-	
-	/*struct Env {
-		std::vector<SymbolName> params;
-		std::map<SymbolName,SlangHeader*> symbolMap;
-		Env* parent = nullptr;
-		bool variadic;
-		bool marked;
-		
-		inline bool IsGlobal() const {
-			return parent==nullptr;
-		}
-		
-		inline void Clear();
-		bool DefSymbol(SymbolName,SlangHeader*);
-		// symbol might not exist
-		SlangObj** GetSymbol(SymbolName);
-	};*/
 	
 	typedef std::string_view::const_iterator StringIt;
 	
@@ -304,6 +265,7 @@ namespace slang {
 		Quote,
 		Not,
 		Negation,
+		Dot,
 		Comment,
 		True,
 		False,
@@ -317,12 +279,15 @@ namespace slang {
 		uint32_t line,col;
 	};
 	
+	struct SlangParser;
+	
 	struct SlangTokenizer {
 		std::string_view tokenStr;
+		SlangParser* parser;
 		StringIt pos,end;
 		uint32_t line,col;
 		
-		inline SlangTokenizer(std::string_view code) : tokenStr(code){
+		inline SlangTokenizer(std::string_view code,SlangParser* parser) : tokenStr(code),parser(parser){
 			pos = tokenStr.cbegin();
 			end = tokenStr.cend();
 			line = 0;
@@ -377,15 +342,12 @@ namespace slang {
 		void TestSeqMacro(SlangList* list,size_t argCount);
 		
 		SlangHeader* ParseString(const std::string& code);
-		SlangHeader* ParseSlangString(const SlangStr&);
 		SlangHeader* Parse();
 	};
 	
 	struct SlangInterpreter {
 		SlangParser parser;
-		SlangHeader* program;
 		MemArena* arena;
-		bool gcParity;
 		size_t envIndex,exprIndex,argIndex,frameIndex;
 		
 		SymbolName genIndex;
@@ -396,11 +358,13 @@ namespace slang {
 		std::vector<SlangList*> argStack;
 		
 		std::vector<ErrorData> errors;
-		std::map<SymbolName,SlangFunc> extFuncs;
-		
+		std::map<SymbolName,ExternalFunc> extFuncs;
 		
 		SlangInterpreter();
+		~SlangInterpreter();
 		void AddExternalFunction(const ExternalFunc&);
+		
+		SlangHeader* ParseSlangString(const SlangStr&);
 		
 		inline SlangEnv* GetCurrEnv() const {
 			return envStack[envIndex];
@@ -448,6 +412,7 @@ namespace slang {
 		inline bool SlangFuncQuote(SlangHeader** res);
 		inline bool SlangFuncNot(SlangHeader** res);
 		inline bool SlangFuncNegate(SlangHeader** res);
+		inline bool SlangFuncLen(SlangHeader** res);
 		
 		inline bool SlangFuncInc(SlangHeader** res);
 		inline bool SlangFuncDec(SlangHeader** res);
@@ -456,13 +421,25 @@ namespace slang {
 		inline bool SlangFuncMul(SlangHeader** res);
 		inline bool SlangFuncDiv(SlangHeader** res);
 		inline bool SlangFuncMod(SlangHeader** res);
+		inline bool SlangFuncPow(SlangHeader** res);
+		inline bool SlangFuncAbs(SlangHeader** res);
 		
+		inline bool SlangFuncGT(SlangHeader** res);
+		inline bool SlangFuncLT(SlangHeader** res);
+		inline bool SlangFuncGTE(SlangHeader** res);
+		inline bool SlangFuncLTE(SlangHeader** res);
+		
+		inline bool SlangFuncUnwrap(SlangHeader** res);
 		inline bool SlangFuncList(SlangHeader** res);
 		inline bool SlangFuncVec(SlangHeader** res);
 		inline bool SlangFuncVecAlloc(SlangHeader** res);
 		inline bool SlangFuncVecSize(SlangHeader** res);
 		inline bool SlangFuncVecGet(SlangHeader** res);
 		inline bool SlangFuncVecSet(SlangHeader** res);
+		inline bool SlangFuncVecAppend(SlangHeader** res);
+		inline bool SlangFuncVecPop(SlangHeader** res);
+		inline bool SlangFuncStrGet(SlangHeader** res);
+		inline bool SlangFuncStrSet(SlangHeader** res);
 		inline bool SlangFuncPair(SlangHeader** res);
 		inline bool SlangFuncLeft(SlangHeader** res);
 		inline bool SlangFuncRight(SlangHeader** res);
@@ -478,20 +455,21 @@ namespace slang {
 		
 		inline void StackAddArg(SlangHeader*);
 		
-		//void Reset();
 		void PushError(const SlangHeader*,const std::string&);
 		void EvalError(const SlangHeader*);
+		void ValueError(const SlangHeader*,const std::string&);
+		void UnwrapError(const SlangHeader*);
 		void IndexError(const SlangHeader*,size_t,ssize_t);
 		void UndefinedError(const SlangHeader*);
 		void RedefinedError(const SlangHeader*,SymbolName);
 		void ProcError(const SlangHeader*);
 		void TypeError(const SlangHeader*,SlangType found,SlangType expected,size_t index=-1ULL);
 		void AssertError(const SlangHeader*);
-		void ArityError(const SlangHeader* head,size_t found,size_t expected);
+		void ArityError(const SlangHeader* head,size_t found,size_t expectMin,size_t expectMax);
 		void ZeroDivisionError(const SlangHeader*);
 		
 		SlangHeader* Parse(const std::string& code);
-		void Run(SlangHeader* prog);
+		bool Run(SlangHeader* prog,SlangHeader** res);
 		
 		inline void* Allocate(size_t);
 		inline SlangObj* AllocateSmallObj();
@@ -505,11 +483,9 @@ namespace slang {
 		inline SlangHeader* Evacuate(uint8_t** write,SlangHeader* obj);
 		inline void EvacuateOrForward(uint8_t** write,SlangHeader** obj);
 		inline void ForwardObj(SlangHeader* obj);
-		//inline SlangObj* TenureEntireObj(SlangObj** write,SlangObj* obj);
 		inline void ReallocSet(size_t newSize);
 		inline void EvacuateEnv(uint8_t** write,SlangEnv* env);
 		inline void ScavengeObj(uint8_t** write,SlangHeader* read);
-		//inline void ScavengeTenure(SlangObj** write,SlangObj* start,SlangObj* end);
 		inline void Scavenge(uint8_t** write,uint8_t* read);
 		inline void DeleteEnv(SlangEnv* env);
 		inline void EnvCleanup();
@@ -521,6 +497,7 @@ namespace slang {
 		inline SymbolName GenSym();
 		inline SlangEnv* CreateEnv(size_t);
 		
+		inline SlangObj* MakeMaybe(SlangHeader*,bool);
 		inline SlangObj* MakeInt(int64_t);
 		inline SlangObj* MakeReal(double);
 		inline SlangObj* MakeBool(bool);

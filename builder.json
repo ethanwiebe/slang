@@ -57,6 +57,13 @@
 				"-g",
 				"-O0"
 			]
+		},
+		"test":{
+			"compileCmd":"",
+			"linkCmd":"",
+			"preCmds":[
+				["bin/slang","tests/*.sl"]
+			]
 		}
 	}
 }

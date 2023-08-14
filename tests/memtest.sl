@@ -44,9 +44,9 @@
 (assert (= (gc-rec-size '(1 2 3)) 120))
 
 (def bigvec 
-	(vec-alloc 100000 0)
+	(vec-alloc N 0)
 )
-(assert (= (len bigvec) 100000))
+(assert (= (len bigvec) N))
 
 (set! biglist ())
 (set! list-sum ())

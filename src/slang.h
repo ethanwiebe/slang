@@ -32,6 +32,9 @@ namespace slang {
 		Real,
 		Vector,
 		String,
+		InputStream,
+		OutputStream,
+		EndOfFile,
 		Maybe,
 		// inaccessible
 		Env,
@@ -55,6 +58,7 @@ namespace slang {
 				union {
 					uint16_t varCount;
 					uint16_t elemSize;
+					uint8_t isFile;
 					uint8_t padding[6];
 				};
 			};
@@ -104,6 +108,16 @@ namespace slang {
 		return s->size;
 	}
 	
+	inline size_t GetStorageCapacity(const SlangStorage* s){
+		if (!s) return 0;
+		return s->capacity;
+	}
+	
+	inline size_t GetStorageFreeSpace(const SlangStorage* s){
+		if (!s) return 0;
+		return s->capacity - s->size;
+	}
+	
 	static_assert(sizeof(SlangStorage)==24);
 	
 	struct SlangStr {
@@ -131,13 +145,30 @@ namespace slang {
 		}
 	};
 	
+	struct SlangStream {
+		SlangHeader header;
+		size_t pos;
+		union {
+			SlangStr* str;
+			FILE* file;
+		};
+		
+		inline bool IsAtEnd() const {
+			if (header.isFile){
+				return feof(file);
+			} else {
+				return pos>=GetStorageSize(str->storage);
+			}
+		}
+	};
+	
 	struct SlangEnv {
 		SlangHeader header;
 		SlangEnv* parent;
 		SlangEnv* next;
 		SlangMapping mappings[SLANG_ENV_BLOCK_SIZE];
 		
-		inline bool GetSymbol(SymbolName,SlangHeader**);
+		inline bool GetSymbol(SymbolName,SlangHeader**) const;
 		inline bool DefSymbol(SymbolName,SlangHeader*);
 		inline bool SetSymbol(SymbolName,SlangHeader*);
 		inline void AddBlock(SlangEnv*);
@@ -345,6 +376,13 @@ namespace slang {
 		SlangHeader* Parse();
 	};
 	
+	typedef void(*FinalizerFunc)(SlangInterpreter* s,SlangHeader* obj);
+	
+	struct Finalizer {
+		SlangHeader* obj;
+		FinalizerFunc func;
+	};
+	
 	struct SlangInterpreter {
 		SlangParser parser;
 		MemArena* arena;
@@ -356,12 +394,19 @@ namespace slang {
 		std::vector<SlangEnv*> envStack;
 		std::vector<SlangHeader*> exprStack;
 		std::vector<SlangList*> argStack;
+		std::vector<Finalizer> finalizers;
 		
 		std::vector<ErrorData> errors;
 		std::map<SymbolName,ExternalFunc> extFuncs;
 		
 		SlangInterpreter();
 		~SlangInterpreter();
+		
+		SlangInterpreter(const SlangInterpreter&) = delete;
+		SlangInterpreter& operator=(const SlangInterpreter&) = delete;
+		SlangInterpreter(SlangInterpreter&&) = delete;
+		SlangInterpreter& operator=(SlangInterpreter&&) = delete;
+		
 		void AddExternalFunction(const ExternalFunc&);
 		
 		SlangHeader* ParseSlangString(const SlangStr&);
@@ -372,6 +417,14 @@ namespace slang {
 		
 		inline void PushEnv(SlangEnv* env);
 		inline void PopEnv();
+		
+		void SetGlobalSymbol(const std::string& name,SlangHeader* value);
+		bool GetGlobalSymbol(const std::string& name,SlangHeader** value);
+		bool CallLambda(
+			const SlangLambda* lam,
+			const std::vector<SlangHeader*>& args,
+			SlangHeader** res
+		);
 		
 		inline SlangList* GetCurrArg() const {
 			return argStack[argIndex];
@@ -385,6 +438,9 @@ namespace slang {
 		inline void PushExpr(SlangHeader* expr);
 		inline void SetExpr(SlangHeader* expr);
 		inline void PopExpr();
+		
+		inline void AddFinalizer(const Finalizer&);
+		inline void RemoveFinalizer(SlangHeader*);
 		
 		inline bool NextArg(){
 			SlangList* currArg = GetCurrArg();
@@ -440,6 +496,22 @@ namespace slang {
 		inline bool SlangFuncVecPop(SlangHeader** res);
 		inline bool SlangFuncStrGet(SlangHeader** res);
 		inline bool SlangFuncStrSet(SlangHeader** res);
+		inline bool SlangFuncMakeStrIStream(SlangHeader** res);
+		inline bool SlangFuncMakeStrOStream(SlangHeader** res);
+		inline bool SlangFuncStreamGetStr(SlangHeader** res);
+		inline bool SlangFuncStreamWrite(SlangHeader** res);
+		inline bool SlangFuncStreamRead(SlangHeader** res);
+		inline bool SlangFuncStreamWriteByte(SlangHeader** res);
+		inline bool SlangFuncStreamReadByte(SlangHeader** res);
+		inline bool SlangFuncStreamSeekPrefix(SlangStream** stream,ssize_t* offset);
+		inline bool SlangFuncStreamSeekBegin(SlangHeader** res);
+		inline bool SlangFuncStreamSeekEnd(SlangHeader** res);
+		inline bool SlangFuncStreamSeekOffset(SlangHeader** res);
+		inline bool SlangFuncStreamTell(SlangHeader** res);
+		
+		inline bool SlangFuncOutputTo(SlangHeader** res);
+		inline bool SlangFuncInputFrom(SlangHeader** res);
+		
 		inline bool SlangFuncPair(SlangHeader** res);
 		inline bool SlangFuncLeft(SlangHeader** res);
 		inline bool SlangFuncRight(SlangHeader** res);
@@ -450,6 +522,11 @@ namespace slang {
 		inline bool SlangFuncEq(SlangHeader** res);
 		inline bool SlangFuncIs(SlangHeader** res);
 		
+		inline bool SlangOutputToFile(FILE* file,SlangHeader* obj);
+		inline SlangHeader* SlangInputFromFile(FILE* file);
+		inline bool SlangOutputToString(SlangStream* stream,SlangHeader* obj);
+		inline SlangHeader* SlangInputFromString(SlangStream* stream);
+		
 		inline bool WrappedEvalExpr(SlangHeader* expr,SlangHeader** res);
 		bool EvalExpr(SlangHeader** res);
 		
@@ -458,6 +535,8 @@ namespace slang {
 		void PushError(const SlangHeader*,const std::string&);
 		void EvalError(const SlangHeader*);
 		void ValueError(const SlangHeader*,const std::string&);
+		void FileError(const SlangHeader*,const std::string&);
+		void StreamError(const SlangHeader*,const std::string&);
 		void UnwrapError(const SlangHeader*);
 		void IndexError(const SlangHeader*,size_t,ssize_t);
 		void UndefinedError(const SlangHeader*);
@@ -478,22 +557,17 @@ namespace slang {
 		inline SlangStr* AllocateStr(size_t);
 		inline SlangEnv* AllocateEnv(size_t);
 		inline SlangList* AllocateList();
+		inline SlangStream* AllocateStream(SlangType streamType);
 		inline SlangLambda* AllocateLambda();
 		inline SlangParams* AllocateParams(size_t);
-		inline SlangHeader* Evacuate(uint8_t** write,SlangHeader* obj);
-		inline void EvacuateOrForward(uint8_t** write,SlangHeader** obj);
-		inline void ForwardObj(SlangHeader* obj);
+		inline SlangStr* ReallocateStr(SlangStr*,size_t);
+		inline SlangStream* ReallocateStream(SlangStream*,size_t);
 		inline void ReallocSet(size_t newSize);
-		inline void EvacuateEnv(uint8_t** write,SlangEnv* env);
-		inline void ScavengeObj(uint8_t** write,SlangHeader* read);
-		inline void Scavenge(uint8_t** write,uint8_t* read);
-		inline void DeleteEnv(SlangEnv* env);
-		inline void EnvCleanup();
 		inline void SmallGC(size_t);
 		
 		inline SlangHeader* Copy(SlangHeader*);
 		
-		inline void DefEnvSymbol(SymbolName name,SlangHeader* val);
+		inline void DefEnvSymbol(SlangEnv* e,SymbolName name,SlangHeader* val);
 		inline SymbolName GenSym();
 		inline SlangEnv* CreateEnv(size_t);
 		
@@ -508,7 +582,11 @@ namespace slang {
 			bool variadic,
 			bool extraSlot=false);
 		inline SlangObj* MakeSymbol(SymbolName);
+		inline SlangHeader* MakeEOF();
+		inline SlangStream* MakeStringInputStream(SlangStr*);
+		inline SlangStream* MakeStringOutputStream(SlangStr*);
 		inline SlangList* MakeList(const std::vector<SlangHeader*>&,size_t start=0,size_t end=-1ULL);
+		inline void ConcatLists(SlangList* a,SlangList* b) const;
 		inline SlangVec* MakeVec(const std::vector<SlangHeader*>&,size_t start=0,size_t end=-1ULL);
 	};
 	

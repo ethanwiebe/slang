@@ -99,6 +99,12 @@ inline const char* TypeToString(SlangType type){
 			return "Params";
 		case SlangType::Storage:
 			return "Storage";
+		case SlangType::InputStream:
+			return "IStream";
+		case SlangType::OutputStream:
+			return "OStream";
+		case SlangType::EndOfFile:
+			return "EndOfFile";
 		case SlangType::NullType:
 			return "NullType";
 	}
@@ -127,6 +133,9 @@ inline size_t SlangHeader::GetSize() const {
 			SlangParams* params = (SlangParams*)this;
 			return sizeof(SlangParams)+params->size*sizeof(SymbolName);
 		}
+		case SlangType::InputStream:
+		case SlangType::OutputStream:
+			return sizeof(SlangStream);
 		case SlangType::Int:
 		case SlangType::Real:
 		case SlangType::Symbol:
@@ -137,6 +146,8 @@ inline size_t SlangHeader::GetSize() const {
 			return sizeof(SlangLambda);
 		case SlangType::List:
 			return sizeof(SlangList);
+		case SlangType::EndOfFile:
+			return sizeof(SlangHeader);
 		case SlangType::NullType:
 			assert(false);
 			return 0;
@@ -293,42 +304,81 @@ inline SlangStr* SlangInterpreter::AllocateStr(size_t size){
 	return obj;
 }
 
-/*
-inline SlangObj* SlangInterpreter::TenureEntireObj(SlangObj** write,SlangObj* obj){
-	if (!arena->InCurrSet(obj)) return obj;
-	
-	SlangObj* toPtr = arena->TenureObj();
-	obj->flags |= FLAG_TENURED;
-	++gTenureCount;
-	
-	memcpy(toPtr,obj,sizeof(SlangObj));
-	obj->flags |= FLAG_FORWARDED;
-	obj->forwarded = toPtr;
-	obj->type = (SlangType)37;
-	
-	
-	if (toPtr->type==SlangType::List){
-		toPtr->left = TenureEntireObj(write,toPtr->left);
-		toPtr->right = TenureEntireObj(write,toPtr->right);
-	} else if (toPtr->type==SlangType::Lambda){
-		for (auto& [name,envObj] : toPtr->env->symbolMap){
-			envObj = TenureEntireObj(write,envObj);
-		}
-		toPtr->expr = TenureEntireObj(write,toPtr->expr);
+inline SlangStr* SlangInterpreter::ReallocateStr(SlangStr* str,size_t newSize){
+	newSize = QuantizeSize(newSize);
+	SlangStorage* storage = str->storage;
+	if (!storage){
+		if (newSize==0) return str;
+		
+		StackAddArg((SlangHeader*)str);
+		SlangStorage* newStorage = AllocateStorage(newSize,sizeof(uint8_t),nullptr);
+		newStorage->size = 0;
+		str = (SlangStr*)funcArgStack[--frameIndex];
+		str->storage = newStorage;
+		return str;
 	}
 	
-	return toPtr;
-}*/
+	// shrink
+	if (newSize<=storage->capacity){
+		storage->capacity = newSize;
+		storage->size = (storage->size > storage->capacity) ? storage->capacity : storage->size;
+		return str;
+	}
+	
+	StackAddArg((SlangHeader*)str);
+	SlangStorage* newStorage = AllocateStorage(newSize,sizeof(uint8_t),nullptr);
+	str = (SlangStr*)funcArgStack[--frameIndex];
+	memcpy(&newStorage->data[0],&str->storage->data[0],str->storage->size*sizeof(uint8_t));
+	newStorage->size = str->storage->size;
+	str->storage = newStorage;
+	return str;
+}
 
-inline SlangHeader* SlangInterpreter::Evacuate(uint8_t** write,SlangHeader* obj){
+inline SlangStream* SlangInterpreter::ReallocateStream(SlangStream* stream,size_t addLen){
+	assert(stream->header.isFile==false);
+	assert(stream->str);
+	size_t currCap = GetStorageCapacity(stream->str->storage);
+	size_t currSize = GetStorageSize(stream->str->storage);
+	size_t sizeIncr = addLen-(currSize-stream->pos);
+	sizeIncr = ((ssize_t)sizeIncr<0) ? 0 : sizeIncr;
+	// enough room
+	if (sizeIncr<=currCap-currSize){
+		if (stream->str->storage)
+			stream->str->storage->size += sizeIncr;
+		return stream;
+	}
+	
+	StackAddArg((SlangHeader*)stream);
+	size_t newSize = (currCap+sizeIncr)*3/2+8;
+	SlangStr* newStr = ReallocateStr(stream->str,newSize);
+	newStr->storage->size = currSize+sizeIncr;
+	stream = (SlangStream*)funcArgStack[--frameIndex];
+	assert(stream->str==newStr);
+	stream->str = newStr;
+	return stream;
+}
+
+inline SlangStream* SlangInterpreter::AllocateStream(SlangType type){
+	SlangStream* stream = (SlangStream*)Allocate(sizeof(SlangStream));
+	stream->header.type = type;
+	stream->header.flags = 0;
+	return stream;
+}
+
+struct EvacData {
+	uint8_t** write;
+	MemArena* arena;
+};
+
+inline SlangHeader* Evacuate(SlangHeader* obj,EvacData* data){
 	if (!obj) return nullptr;
-	if (!arena->InCurrSet((uint8_t*)obj)) return obj;
+	if (!data->arena->InCurrSet((uint8_t*)obj)) return obj;
 	
 	SlangHeader* toPtr;
 	
-	toPtr = (SlangHeader*)*write;
+	toPtr = (SlangHeader*)*data->write;
 	size_t s = obj->GetSize();
-	*write += s;
+	*data->write += s;
 	memcpy(toPtr,obj,s);
 	
 	obj->Forward(toPtr);
@@ -336,159 +386,96 @@ inline SlangHeader* SlangInterpreter::Evacuate(uint8_t** write,SlangHeader* obj)
 	return obj->GetForwardAddress();
 }
 
-inline void SlangInterpreter::EvacuateOrForward(uint8_t** write,SlangHeader** obj){
+void EvacuateOrForward(SlangHeader** obj,EvacData* data){
 	if (*obj && (*obj)->IsForwarded())
 		*obj = (*obj)->GetForwardAddress();
 	else
-		*obj = Evacuate(write,*obj);
+		*obj = Evacuate(*obj,data);
 }
 
-inline void SlangInterpreter::ScavengeObj(uint8_t** write,SlangHeader* read){
-	switch (read->type){
-		case SlangType::List: {
-			SlangList* list = (SlangList*)read;
-			EvacuateOrForward(write,&list->left);
-			EvacuateOrForward(write,&list->right);
-			return;
-		}
-		case SlangType::Lambda: {
-			SlangLambda* lam = (SlangLambda*)read;
-			EvacuateOrForward(write,&lam->expr);
-			EvacuateOrForward(write,(SlangHeader**)&lam->params);
-			EvacuateOrForward(write,(SlangHeader**)&lam->env);
-			return;
-		}
-		case SlangType::Vector: {
-			SlangVec* vec = (SlangVec*)read;
-			EvacuateOrForward(write,(SlangHeader**)&vec->storage);
-			
-			SlangStorage* storage = vec->storage;
-			if (storage){
-				for (size_t i=0;i<storage->size;++i){
-					EvacuateOrForward(write,(SlangHeader**)&storage->objs[i]);
-				}
-			}
-			return;
-		}
-		case SlangType::Env: {
-			SlangEnv* env = (SlangEnv*)read;
-			for (size_t i=0;i<env->header.varCount;++i){
-				EvacuateOrForward(write,&env->mappings[i].obj);
-			}
-			EvacuateOrForward(write,(SlangHeader**)&env->next);
-			EvacuateOrForward(write,(SlangHeader**)&env->parent);
-			return;
-		}
-		case SlangType::String: {
-			SlangStr* str = (SlangStr*)read;
-			EvacuateOrForward(write,(SlangHeader**)&str->storage);
-			return;
-		}
-		case SlangType::Maybe: {
-			SlangObj* maybe = (SlangObj*)read;
-			if (maybe->header.flags & FLAG_MAYBE_OCCUPIED){
-				EvacuateOrForward(write,(SlangHeader**)&maybe->maybe);
-			}
-			return;
-		}
-		
-		case SlangType::Params:
-		case SlangType::Int:
-		case SlangType::Real:
-		case SlangType::Bool:
-		case SlangType::Symbol:
-		case SlangType::Storage:
-		case SlangType::NullType:
-			return;
-	}
-	assert(false);
-}
+typedef void(*WalkFunc)(SlangHeader** ref,void* data);
 
-inline void SlangInterpreter::ForwardObj(SlangHeader* obj){
+inline void SlangWalkRefs(SlangHeader* obj,WalkFunc func,void* data){
 	switch (obj->type){
 		case SlangType::List: {
 			SlangList* list = (SlangList*)obj;
-			if (list->left && list->left->IsForwarded())
-				list->left = list->left->GetForwardAddress();
-			if (list->right && list->right->IsForwarded())
-				list->right = list->right->GetForwardAddress();
+			func(&list->left,data);
+			func(&list->right,data);
 			return;
 		}
 		case SlangType::Lambda: {
 			SlangLambda* lam = (SlangLambda*)obj;
-			if (lam->expr && lam->expr->IsForwarded())
-				lam->expr = lam->expr->GetForwardAddress();
-			if (lam->params && lam->params->header.IsForwarded())
-				lam->params = (SlangParams*)lam->params->header.GetForwardAddress();
-			if (lam->env && lam->env->header.IsForwarded())
-				lam->env = (SlangEnv*)lam->env->header.GetForwardAddress();
+			func(&lam->expr,data);
+			func((SlangHeader**)&lam->params,data);
+			func((SlangHeader**)&lam->env,data);
 			return;
 		}
 		case SlangType::Vector: {
 			SlangVec* vec = (SlangVec*)obj;
-			if (vec->storage && vec->storage->header.IsForwarded())
-				vec->storage = (SlangStorage*)vec->storage->header.GetForwardAddress();
+			func((SlangHeader**)&vec->storage,data);
 			
 			SlangStorage* storage = vec->storage;
-			for (size_t i=0;i<storage->size;++i){
-				if (storage->objs[i] && storage->objs[i]->IsForwarded())
-					storage->objs[i] = storage->objs[i]->GetForwardAddress();
+			if (storage){
+				for (size_t i=0;i<storage->size;++i){
+					func(&storage->objs[i],data);
+				}
 			}
 			return;
 		}
 		case SlangType::Env: {
 			SlangEnv* env = (SlangEnv*)obj;
 			for (size_t i=0;i<env->header.varCount;++i){
-				SlangHeader* obj = env->mappings[i].obj;
-				if (obj && obj->IsForwarded())
-					env->mappings[i].obj = obj->GetForwardAddress();
+				func(&env->mappings[i].obj,data);
 			}
-			if (env->next && env->next->header.IsForwarded())
-				env->next = (SlangEnv*)env->next->header.GetForwardAddress();
-			if (env->parent && env->parent->header.IsForwarded())
-				env->parent = (SlangEnv*)env->parent->header.GetForwardAddress();
+			func((SlangHeader**)&env->next,data);
+			func((SlangHeader**)&env->parent,data);
 			return;
 		}
 		case SlangType::String: {
 			SlangStr* str = (SlangStr*)obj;
-			if (str->storage && str->storage->header.IsForwarded())
-				str->storage = (SlangStorage*)str->storage->header.GetForwardAddress();
+			func((SlangHeader**)&str->storage,data);
 			return;
 		}
 		case SlangType::Maybe: {
-			if (obj->flags & FLAG_MAYBE_OCCUPIED){
-				SlangObj* maybe = (SlangObj*)obj;
-				if (maybe->maybe && maybe->maybe->IsForwarded())
-					maybe->maybe = maybe->maybe->GetForwardAddress();
+			SlangObj* maybe = (SlangObj*)obj;
+			if (maybe->header.flags & FLAG_MAYBE_OCCUPIED){
+				func(&maybe->maybe,data);
+			}
+			return;
+		}
+		case SlangType::InputStream:
+		case SlangType::OutputStream: {
+			SlangStream* stream = (SlangStream*)obj;
+			if (!stream->header.isFile){
+				func((SlangHeader**)&stream->str,data);
 			}
 			return;
 		}
 		
 		case SlangType::Params:
-		case SlangType::Storage:
 		case SlangType::Int:
 		case SlangType::Real:
 		case SlangType::Bool:
 		case SlangType::Symbol:
+		case SlangType::Storage:
+		case SlangType::EndOfFile:
 		case SlangType::NullType:
 			return;
 	}
 	assert(false);
 }
-/*
-inline void SlangInterpreter::ScavengeTenure(SlangObj** write,SlangObj* start,SlangObj* end){
-	while (start!=end){
-		ScavengeObj(write,start);
-		++start;
-	}
-}*/
 
-inline void SlangInterpreter::Scavenge(uint8_t** write,uint8_t* read){
-	while (read<*write){
+inline void Scavenge(uint8_t* read,EvacData* data){
+	while (read<*data->write){
 		SlangHeader* obj = (SlangHeader*)read;
-		ScavengeObj(write,obj);
 		read += obj->GetSize();
+		SlangWalkRefs(obj,(WalkFunc)&EvacuateOrForward,(void*)data);
 	}
+}
+
+inline void ForwardObjWalker(SlangHeader** obj,void*){
+	if (*obj && (*obj)->IsForwarded())
+		*obj = (*obj)->GetForwardAddress();
 }
 
 inline void SlangInterpreter::ReallocSet(size_t newSize){
@@ -496,10 +483,14 @@ inline void SlangInterpreter::ReallocSet(size_t newSize){
 	// shrinking and the arena sets have good parity
 	if (newSize<=arena->memSize&&arena->currSet<arena->otherSet){
 		// no pointer changes needed
+	#ifdef NDEBUG
+		uint8_t* newPtr = (uint8_t*)realloc(arena->memSet,newSize);
+	#else
 		uint8_t* oldPtr = arena->memSet;
 		uint8_t* newPtr = (uint8_t*)realloc(arena->memSet,newSize);
 		assert(newPtr==oldPtr);
-		arena->SetSpace(arena->memSet,newSize,arena->currPointer);
+	#endif
+		arena->SetSpace(newPtr,newSize,arena->currPointer);
 		return;
 	}
 	
@@ -522,9 +513,8 @@ inline void SlangInterpreter::ReallocSet(size_t newSize){
 	newStart = newPtr;
 	while (newStart<newCurrPointer){
 		SlangHeader* obj = (SlangHeader*)newStart;
-		ForwardObj(obj);
-		
 		newStart += obj->GetSize();
+		SlangWalkRefs(obj,&ForwardObjWalker,nullptr);
 	}
 	
 	for (size_t i=0;i<frameIndex;++i){
@@ -542,6 +532,12 @@ inline void SlangInterpreter::ReallocSet(size_t newSize){
 			argStack[i] = (SlangList*)argStack[i]->header.GetForwardAddress();
 	}
 	
+	for (size_t i=0;i<finalizers.size();++i){
+		auto& finalizer = finalizers[i];
+		if (finalizer.obj->IsForwarded())
+			finalizer.obj = finalizer.obj->GetForwardAddress();
+	}
+	
 	free(arena->memSet);
 	arena->SetSpace(newPtr,newSize,newCurrPointer);
 	gMaxArenaSize = (newSize > gMaxArenaSize) ?
@@ -553,24 +549,39 @@ inline void SlangInterpreter::ReallocSet(size_t newSize){
 inline void SlangInterpreter::SmallGC(size_t allocAttempt){
 	uint8_t* write = arena->otherSet;
 	uint8_t* read = write;
+	EvacData data = {&write,arena};
 	for (size_t i=0;i<frameIndex;++i){
-		EvacuateOrForward(&write,&funcArgStack[i]);
+		EvacuateOrForward(&funcArgStack[i],&data);
 	}
 	
 	for (size_t i=0;i<=envIndex;++i){
-		EvacuateOrForward(&write,(SlangHeader**)&envStack[i]);
+		EvacuateOrForward((SlangHeader**)&envStack[i],&data);
 	}
 	
 	assert(exprIndex==argIndex);
 	for (size_t i=1;i<=exprIndex;++i){
-		EvacuateOrForward(&write,&exprStack[i]);
-		EvacuateOrForward(&write,(SlangHeader**)&argStack[i]);
+		EvacuateOrForward(&exprStack[i],&data);
+		EvacuateOrForward((SlangHeader**)&argStack[i],&data);
 	}
 	
-	Scavenge(&write,read);
+	Scavenge(read,&data);
 	
 	arena->SwapSets();
 	arena->currPointer = write;
+	
+	for (size_t i=0;i<finalizers.size();++i){
+		auto& finalizer = finalizers[i];
+		if (!finalizer.obj->IsForwarded()){
+			std::cout << "gc finalize\n";
+			finalizer.func(this,finalizer.obj);
+			finalizers.erase(finalizers.begin()+i);
+			--i;
+		} else {
+			finalizer.obj = finalizer.obj->GetForwardAddress();
+			std::cout << "gc saved final\n";
+		}
+	}
+	
 	ssize_t spaceLeft = arena->currSet+arena->memSize/2-write;
 	// less than 1/4 of the set left
 	if (spaceLeft-(ssize_t)allocAttempt<(ssize_t)arena->memSize/8){
@@ -580,6 +591,7 @@ inline void SlangInterpreter::SmallGC(size_t allocAttempt){
 		size_t m = std::max((size_t)(arena->memSize-spaceLeft*2)*3/2,(size_t)SMALL_SET_SIZE*2);
 		ReallocSet(m);
 	}
+	
 	++gSmallGCs;
 }
 
@@ -589,11 +601,8 @@ SlangHeader* SlangInterpreter::Copy(SlangHeader* expr){
 	StackAddArg(expr);
 	size_t size = expr->GetSize();
 	SlangHeader* copied = (SlangHeader*)Allocate(size);
-	if (expr->IsForwarded())
-		memcpy(copied,expr->GetForwardAddress(),size);
-	else
-		memcpy(copied,expr,size);
-	--frameIndex;
+	expr = funcArgStack[--frameIndex];
+	memcpy(copied,expr,size);
 	
 	return copied;
 }
@@ -628,6 +637,8 @@ enum SlangGlobalSymbol {
 	SLANG_NOT,
 	SLANG_NEG,
 	SLANG_LIST,
+	SLANG_OUTPUT_TO,
+	SLANG_INPUT_FROM,
 	SLANG_VEC,
 	SLANG_VEC_ALLOC,
 	SLANG_VEC_GET,
@@ -636,6 +647,17 @@ enum SlangGlobalSymbol {
 	SLANG_VEC_POP,
 	SLANG_STR_GET,
 	SLANG_STR_SET,
+	SLANG_MAKE_STR_ISTREAM,
+	SLANG_MAKE_STR_OSTREAM,
+	SLANG_STREAM_GET_STR,
+	SLANG_STREAM_WRITE,
+	SLANG_STREAM_READ,
+	SLANG_STREAM_WRITE_BYTE,
+	SLANG_STREAM_READ_BYTE,
+	SLANG_STREAM_SEEK_BEGIN,
+	SLANG_STREAM_SEEK_END,
+	SLANG_STREAM_SEEK_OFFSET,
+	SLANG_STREAM_TELL,
 	SLANG_PAIR,
 	SLANG_LEFT,
 	SLANG_RIGHT,
@@ -667,6 +689,7 @@ enum SlangGlobalSymbol {
 	SLANG_IS_VECTOR,
 	SLANG_IS_MAYBE,
 	SLANG_IS_BOUND,
+	SLANG_IS_EOF,
 	GLOBAL_SYMBOL_COUNT
 };
 
@@ -687,6 +710,8 @@ SymbolNameDict gDefaultNameDict = {
 	{"try",SLANG_TRY},
 	{"unwrap",SLANG_UNWRAP},
 	{"empty?",SLANG_EMPTY},
+	{"output-to!",SLANG_OUTPUT_TO},
+	{"input-from!",SLANG_INPUT_FROM},
 	{"list",SLANG_LIST},
 	{"vec",SLANG_VEC},
 	{"vec-alloc",SLANG_VEC_ALLOC},
@@ -696,6 +721,17 @@ SymbolNameDict gDefaultNameDict = {
 	{"vec-pop!",SLANG_VEC_POP},
 	{"str-get",SLANG_STR_GET},
 	{"str-set!",SLANG_STR_SET},
+	{"make-str-istream",SLANG_MAKE_STR_ISTREAM},
+	{"make-str-ostream",SLANG_MAKE_STR_OSTREAM},
+	{"stream-get-str",SLANG_STREAM_GET_STR},
+	{"write!",SLANG_STREAM_WRITE},
+	{"read!",SLANG_STREAM_READ},
+	{"write-byte!",SLANG_STREAM_WRITE_BYTE},
+	{"read-byte!",SLANG_STREAM_READ_BYTE},
+	{"seek!",SLANG_STREAM_SEEK_BEGIN},
+	{"seek-end!",SLANG_STREAM_SEEK_END},
+	{"seek-off!",SLANG_STREAM_SEEK_OFFSET},
+	{"tell",SLANG_STREAM_TELL},
 	{"pair",SLANG_PAIR},
 	{"L",SLANG_LEFT},
 	{"R",SLANG_RIGHT},
@@ -726,7 +762,8 @@ SymbolNameDict gDefaultNameDict = {
 	{"proc?",SLANG_IS_PROC},
 	{"vec?",SLANG_IS_VECTOR},
 	{"maybe?",SLANG_IS_MAYBE},
-	{"bound?",SLANG_IS_BOUND}
+	{"bound?",SLANG_IS_BOUND},
+	{"eof?",SLANG_IS_EOF}
 };
 
 inline void SlangEnv::AddBlock(SlangEnv* newEnv){
@@ -763,7 +800,7 @@ inline bool SlangEnv::SetSymbol(SymbolName name,SlangHeader* obj){
 	return next->SetSymbol(name,obj);
 }
 
-inline bool SlangEnv::GetSymbol(SymbolName name,SlangHeader** res){
+inline bool SlangEnv::GetSymbol(SymbolName name,SlangHeader** res) const {
 	for (size_t i=0;i<header.varCount;++i){
 		if (mappings[i].sym==name){
 			*res = mappings[i].obj;
@@ -823,6 +860,13 @@ inline SlangObj* SlangInterpreter::MakeSymbol(SymbolName symbol){
 	return obj;
 }
 
+inline SlangHeader* SlangInterpreter::MakeEOF(){
+	SlangHeader* obj = (SlangHeader*)Allocate(sizeof(SlangHeader));
+	obj->type = SlangType::EndOfFile;
+	obj->flags = 0;
+	return obj;
+}
+
 inline SlangParams* SlangInterpreter::MakeParams(const std::vector<SymbolName>& args){
 	SlangParams* params = AllocateParams(args.size());
 	size_t i=0;
@@ -857,8 +901,12 @@ inline SlangLambda* SlangInterpreter::MakeLambda(
 	obj->env->parent = GetCurrEnv();
 	
 	for (const auto& arg : args){
+	#ifdef NDEBUG
+		obj->env->DefSymbol(arg,nullptr);
+	#else
 		bool ret = obj->env->DefSymbol(arg,nullptr);
 		assert(ret);
+	#endif
 	}
 	
 	return obj;
@@ -875,6 +923,7 @@ inline SlangVec* SlangInterpreter::MakeVec(const std::vector<SlangHeader*>& objs
 }
 
 inline SlangList* SlangInterpreter::MakeList(const std::vector<SlangHeader*>& objs,size_t start,size_t end){
+	if (start==end) return nullptr;
 	SlangList* listHead = nullptr;
 	SlangList* list = nullptr;
 	SlangList* prev = nullptr;
@@ -901,6 +950,43 @@ inline SlangList* SlangInterpreter::MakeList(const std::vector<SlangHeader*>& ob
 	return listHead;
 }
 
+inline void SlangInterpreter::ConcatLists(SlangList* a,SlangList* b) const {
+	while (a->right){
+		a = (SlangList*)a->right;
+	}
+	a->right = (SlangHeader*)b;
+}
+
+inline SlangStream* SlangInterpreter::MakeStringInputStream(SlangStr* str){
+	StackAddArg((SlangHeader*)str);
+	SlangStream* stream = AllocateStream(SlangType::InputStream);
+	stream->header.isFile = false;
+	stream->pos = 0;
+	stream->str = (SlangStr*)funcArgStack[--frameIndex];
+	return stream;
+}
+
+inline SlangStream* SlangInterpreter::MakeStringOutputStream(SlangStr* str){
+	StackAddArg((SlangHeader*)str);
+	SlangStream* stream = AllocateStream(SlangType::OutputStream);
+	stream->header.isFile = false;
+	if (str==nullptr){
+		// create new string
+		StackAddArg((SlangHeader*)stream);
+		str = AllocateStr(8);
+		str->storage->size = 0;
+		
+		stream = (SlangStream*)funcArgStack[--frameIndex];
+		stream->str = str;
+		stream->pos = 0;
+		--frameIndex;
+	} else {
+		stream->str = (SlangStr*)funcArgStack[--frameIndex];
+		stream->pos = GetStorageSize(str->storage);
+	}
+	return stream;
+}
+
 bool GCManualCollect(SlangInterpreter* s,SlangHeader** res){
 	s->SmallGC(0);
 	*res = nullptr;
@@ -917,6 +1003,7 @@ size_t GetRecursiveSize(SlangHeader* obj){
 		case SlangType::Symbol:
 		case SlangType::Params:
 		case SlangType::Storage:
+		case SlangType::EndOfFile:
 			return obj->GetSize();
 		
 		case SlangType::List: {
@@ -970,6 +1057,16 @@ size_t GetRecursiveSize(SlangHeader* obj){
 			c += GetRecursiveSize((SlangHeader*)lam->env);
 			c += GetRecursiveSize((SlangHeader*)lam->params);
 			c += GetRecursiveSize(lam->expr);
+			return c;
+		}
+		
+		case SlangType::InputStream:
+		case SlangType::OutputStream: {
+			size_t c = obj->GetSize();
+			SlangStream* stream = (SlangStream*)obj;
+			if (!stream->header.isFile){
+				c += GetRecursiveSize((SlangHeader*)stream->str);
+			}
 			return c;
 		}
 		
@@ -1039,11 +1136,29 @@ bool GCMemCapacity(SlangInterpreter* s,SlangHeader** res){
 	return true;
 }
 
+#define NEXT_ARG() { \
+	if (!NextArg()){ \
+		EvalError((SlangHeader*)GetCurrArg()); \
+		return false; \
+	}}
+	
+#define TYPE_CHECK_EXACT(obj,type) { \
+	if (GetType(obj)!=(type)){ \
+		TypeError((obj),GetType(obj),(type)); \
+		return false; \
+	}}
+	
 #define EXT_NEXT_ARG() { \
 	if (!s->NextArg()){ \
 		s->EvalError((SlangHeader*)s->GetCurrArg()); \
 		return false; \
 	}} \
+	
+#define EXT_TYPE_CHECK_EXACT(obj,type) { \
+	if (GetType(obj)!=(type)){ \
+		s->TypeError((obj),GetType(obj),(type)); \
+		return false; \
+	}}
 
 bool ExtFuncPrint(SlangInterpreter* s,SlangHeader** res){
 	SlangList* argIt = s->GetCurrArg();
@@ -1065,21 +1180,12 @@ bool ExtFuncPrint(SlangInterpreter* s,SlangHeader** res){
 		argIt = s->GetCurrArg();
 	}
 	
-	*res = printObj;
+	*res = nullptr;
 	return true;
 }
 
 bool ExtFuncInput(SlangInterpreter* s,SlangHeader** res){
-	static char inputArr[1024];
-	
-	fgets(inputArr,sizeof(inputArr),stdin);
-	
-	// -1 because of newline
-	size_t len = strnlen(inputArr,sizeof(inputArr))-1;
-	SlangStr* str = s->AllocateStr(len);
-	memcpy(str->storage->data,inputArr,len);
-	
-	*res = (SlangHeader*)str;
+	*res = s->SlangInputFromFile(stdin);
 	return true;
 }
 
@@ -1093,34 +1199,208 @@ bool ExtFuncOutput(SlangInterpreter* s,SlangHeader** res){
 			return false;
 		}
 		
-		switch (GetType(printObj)){
-			case SlangType::String: {
-				SlangStr* str = (SlangStr*)printObj;
-				for (size_t i=0;i<GetStorageSize(str->storage);++i){
-					std::cout << str->storage->data[i];
-				}
-				break;
-			}
-			case SlangType::Int: {
-				SlangObj* obj = (SlangObj*)printObj;
-				std::cout << obj->integer;
-				break;
-			}
-			case SlangType::Real: {
-				SlangObj* obj = (SlangObj*)printObj;
-				std::cout << obj->real;
-				break;
-			}
-			default:
-				s->TypeError(printObj,GetType(printObj),SlangType::String);
-				return false;
-		}
-		
+		if (!s->SlangOutputToFile(stdout,printObj))
+			return false;
+			
 		EXT_NEXT_ARG();
 		argIt = s->GetCurrArg();
 	}
 	
 	*res = nullptr;
+	return true;
+}
+
+void ExtFileFinalizer(SlangInterpreter*,SlangHeader* obj){
+	assert(obj->type==SlangType::InputStream||obj->type==SlangType::OutputStream);
+	SlangStream* stream = (SlangStream*)obj;
+	assert(stream->header.isFile);
+	if (stream->file){
+		fclose(stream->file);
+		stream->file = NULL;
+	}
+}
+
+bool ExtFuncFileClose(SlangInterpreter* s,SlangHeader** res){
+	SlangList* argIt = s->GetCurrArg();
+	
+	SlangHeader* streamObj;
+	if (!s->WrappedEvalExpr(argIt->left,&streamObj))
+		return false;
+	
+	if (GetType(streamObj)!=SlangType::InputStream&&GetType(streamObj)!=SlangType::OutputStream){
+		s->TypeError(s->GetCurrArg()->left,GetType(streamObj),SlangType::InputStream);
+		return false;
+	}
+	
+	if (!streamObj->isFile){
+		s->StreamError(s->GetCurrArg()->left,"Stream is not a file stream!");
+		return false;
+	}
+	
+	SlangStream* stream = (SlangStream*)streamObj;
+	if (stream->file){
+		fclose(stream->file);
+		stream->file = NULL;
+	}
+	
+	s->RemoveFinalizer(streamObj);
+	
+	*res = nullptr;
+	return true;
+}
+
+bool ExtFuncStdIn(SlangInterpreter* s,SlangHeader** res){
+	SlangStream* stream = s->AllocateStream(SlangType::InputStream);
+	stream->header.isFile = true;
+	stream->pos = 0;
+	stream->file = stdin;
+	
+	*res = (SlangHeader*)stream;
+	return true;
+}
+
+bool ExtFuncStdOut(SlangInterpreter* s,SlangHeader** res){
+	SlangStream* stream = s->AllocateStream(SlangType::OutputStream);
+	stream->header.isFile = true;
+	stream->pos = 0;
+	stream->file = stdout;
+	
+	*res = (SlangHeader*)stream;
+	return true;
+}
+
+bool ExtFuncStdErr(SlangInterpreter* s,SlangHeader** res){
+	SlangStream* stream = s->AllocateStream(SlangType::OutputStream);
+	stream->header.isFile = true;
+	stream->pos = 0;
+	stream->file = stderr;
+	
+	*res = (SlangHeader*)stream;
+	return true;
+}
+
+bool ExtGetFilename(SlangInterpreter* s,std::string& str){
+	SlangList* argIt = s->GetCurrArg();
+	
+	SlangHeader* strObj;
+	if (!s->WrappedEvalExpr(argIt->left,&strObj))
+		return false;
+		
+	EXT_TYPE_CHECK_EXACT(strObj,SlangType::String);
+	
+	SlangStr* filename = (SlangStr*)strObj;
+	if (GetStorageSize(filename->storage)==0){
+		s->FileError(s->GetCurrArg()->left,"Could not open file with empty filename!");
+		return false;
+	}
+	
+	str.resize(filename->storage->size);
+	memcpy(str.data(),&filename->storage->data[0],sizeof(uint8_t)*filename->storage->size);
+	return true;
+}
+
+bool ExtFuncFileOpenWithMode(
+		SlangInterpreter* s,
+		SlangHeader** res,
+		const char* mode,
+		SlangType streamType){
+	std::string str{};
+	if (!ExtGetFilename(s,str))
+		return false;
+	
+	FILE* f = fopen(str.c_str(),mode);
+	if (!f){
+		std::stringstream ss{};
+		ss << "Could not open path '" << str << "'";
+		s->FileError(s->GetCurrArg()->left,ss.str());
+		return false;
+	}
+	
+	SlangStream* stream = s->AllocateStream(streamType);
+	stream->header.isFile = true;
+	stream->file = f;
+	stream->pos = 0;
+	
+	s->AddFinalizer({(SlangHeader*)stream,&ExtFileFinalizer});
+	
+	*res = (SlangHeader*)stream;
+	return true;
+}
+
+bool ExtFuncFileOpenRead(SlangInterpreter* s,SlangHeader** res){
+	return ExtFuncFileOpenWithMode(s,res,"r",SlangType::InputStream);
+}
+
+bool ExtFuncFileOpenWrite(SlangInterpreter* s,SlangHeader** res){
+	return ExtFuncFileOpenWithMode(s,res,"w",SlangType::OutputStream);
+}
+
+bool ExtFuncFileOpenWriteApp(SlangInterpreter* s,SlangHeader** res){
+	return ExtFuncFileOpenWithMode(s,res,"a",SlangType::OutputStream);
+}
+
+bool ExtFuncFileFlush(SlangInterpreter* s,SlangHeader** res){
+	SlangList* argIt = s->GetCurrArg();
+	
+	SlangHeader* streamObj;
+	if (!s->WrappedEvalExpr(argIt->left,&streamObj))
+		return false;
+	
+	if (GetType(streamObj)!=SlangType::InputStream&&GetType(streamObj)!=SlangType::OutputStream){
+		s->TypeError(s->GetCurrArg()->left,GetType(streamObj),SlangType::InputStream);
+		return false;
+	}
+	
+	if (!streamObj->isFile){
+		*res = streamObj;
+		return true;
+	}
+	
+	SlangStream* stream = (SlangStream*)streamObj;
+	if (!stream->file){
+		s->FileError(s->GetCurrArg()->left,"Cannot flush a closed file!");
+		return false;
+	}
+	
+	fflush(stream->file);
+	*res = (SlangHeader*)stream;
+	return true;
+}
+
+bool ExtFuncIsFile(SlangInterpreter* s,SlangHeader** res){
+	SlangList* argIt = s->GetCurrArg();
+	
+	SlangHeader* streamObj;
+	if (!s->WrappedEvalExpr(argIt->left,&streamObj))
+		return false;
+	
+	if (GetType(streamObj)!=SlangType::InputStream&&GetType(streamObj)!=SlangType::OutputStream){
+		s->TypeError(s->GetCurrArg()->left,GetType(streamObj),SlangType::InputStream);
+		return false;
+	}
+	
+	*res = (SlangHeader*)s->MakeBool(streamObj->isFile);
+	return true;
+}
+
+bool ExtFuncIsFileOpen(SlangInterpreter* s,SlangHeader** res){
+	SlangList* argIt = s->GetCurrArg();
+	
+	SlangHeader* streamObj;
+	if (!s->WrappedEvalExpr(argIt->left,&streamObj))
+		return false;
+	
+	if (GetType(streamObj)!=SlangType::InputStream&&GetType(streamObj)!=SlangType::OutputStream){
+		s->TypeError(s->GetCurrArg()->left,GetType(streamObj),SlangType::InputStream);
+		return false;
+	}
+	
+	if (!streamObj->isFile){
+		s->StreamError(s->GetCurrArg()->left,"Stream is not a file stream!");
+		return false;
+	}
+	
+	*res = (SlangHeader*)s->MakeBool(((SlangStream*)streamObj)->file!=NULL);
 	return true;
 }
 
@@ -1140,8 +1420,7 @@ inline bool GetRecursiveSymbol(SlangEnv* e,SymbolName name,SlangHeader** val){
 	return false;
 
 }
-inline void SlangInterpreter::DefEnvSymbol(SymbolName name,SlangHeader* val){
-	SlangEnv* e = GetCurrEnv();
+inline void SlangInterpreter::DefEnvSymbol(SlangEnv* e,SymbolName name,SlangHeader* val){
 	StackAddArg(val);
 	if (!e->DefSymbol(name,val)){
 		SlangEnv* newEnv = AllocateEnv(1);
@@ -1163,12 +1442,145 @@ inline bool SlangInterpreter::SetRecursiveSymbol(SlangEnv* e,SymbolName name,Sla
 	return false;
 }
 
-#define NEXT_ARG() { \
-	if (!NextArg()){ \
-		EvalError((SlangHeader*)GetCurrArg()); \
-		return false; \
-	}} \
+inline bool SlangInterpreter::SlangOutputToFile(FILE* file,SlangHeader* obj){
+	switch (GetType(obj)){
+		case SlangType::String: {
+			SlangStr* str = (SlangStr*)obj;
+			for (size_t i=0;i<GetStorageSize(str->storage);++i){
+				fputc(str->storage->data[i],file);
+			}
+			break;
+		}
+		case SlangType::Int: {
+			SlangObj* intObj = (SlangObj*)obj;
+			fprintf(file,"%ld",intObj->integer);
+			break;
+		}
+		case SlangType::Real: {
+			SlangObj* realObj = (SlangObj*)obj;
+			fprintf(file,"%.16g",realObj->real);
+			break;
+		}
+		case SlangType::EndOfFile:
+			break;
+		default:
+			TypeError(obj,GetType(obj),SlangType::String);
+			return false;
+	}
+	return true;
+}
+
+inline SlangHeader* SlangInterpreter::SlangInputFromFile(FILE* file){
+	std::string temp{};
+	temp.reserve(256);
+	int c;
+	while ((c = fgetc(file))!=EOF){
+		if (c=='\n') break;
+		temp.push_back(c);
+	}
 	
+	if (temp.empty()&&c==EOF){
+		return MakeEOF();
+	}
+	
+	SlangStr* str = AllocateStr(temp.size());
+	if (temp.empty()) return (SlangHeader*)str;
+	memcpy(&str->storage->data[0],temp.data(),temp.size());
+	return (SlangHeader*)str;
+}
+
+inline bool SlangInterpreter::SlangOutputToString(SlangStream* stream,SlangHeader* obj){
+	static char numChars[64];
+	
+	SlangStr* sstr = stream->str;
+	switch (GetType(obj)){
+		case SlangType::String: {
+			SlangStr* str = (SlangStr*)obj;
+			if (GetStorageSize(str->storage)==0) break;
+			
+			StackAddArg((SlangHeader*)str);
+			stream = ReallocateStream(stream,str->storage->size);
+			sstr = stream->str;
+			str = (SlangStr*)funcArgStack[--frameIndex];
+			// stream is now guaranteed big enough
+			
+			uint8_t* it = sstr->storage->data+stream->pos;
+			uint8_t* otherIt = str->storage->data;
+			for (size_t i=0;i<str->storage->size;++i){
+				*it++ = *otherIt++;
+			}
+			
+			stream->pos += str->storage->size;
+			break;
+		}
+		case SlangType::Int: {
+			SlangObj* intObj = (SlangObj*)obj;
+			ssize_t size = snprintf(numChars,sizeof(numChars),"%ld",intObj->integer);
+			assert(size!=-1);
+			stream = ReallocateStream(stream,size);
+			sstr = stream->str;
+			
+			uint8_t* it = sstr->storage->data+stream->pos;
+			uint8_t* otherIt = (uint8_t*)&numChars[0];
+			for (ssize_t i=0;i<size;++i){
+				*it++ = *otherIt++;
+			}
+			
+			stream->pos += size;
+			break;
+		}
+		case SlangType::Real: {
+			SlangObj* realObj = (SlangObj*)obj;
+			ssize_t size = snprintf(numChars,sizeof(numChars),"%.16g",realObj->real);
+			assert(size!=-1);
+			stream = ReallocateStream(stream,size);
+			sstr = stream->str;
+			
+			uint8_t* it = sstr->storage->data+stream->pos;
+			uint8_t* otherIt = (uint8_t*)&numChars[0];
+			for (ssize_t i=0;i<size;++i){
+				*it++ = *otherIt++;
+			}
+			
+			stream->pos += size;
+			break;
+		}
+		case SlangType::EndOfFile:
+			break;
+		default:
+			TypeError(obj,GetType(obj),SlangType::String);
+			return false;
+	}
+	return true;
+}
+
+inline SlangHeader* SlangInterpreter::SlangInputFromString(SlangStream* stream){
+	std::string temp{};
+	temp.reserve(256);
+	uint8_t c;
+	size_t strSize = GetStorageSize(stream->str->storage);
+	if (!strSize||stream->pos>=strSize){
+		return MakeEOF();
+	}
+	
+	while (true){
+		c = stream->str->storage->data[stream->pos++];
+		if (c=='\n')
+			break;
+		temp.push_back(c);
+		if (stream->pos>=strSize) break;
+	}
+	
+	if (temp.empty()&&stream->pos>=strSize){
+		return MakeEOF();
+	}
+	
+	SlangStr* str = AllocateStr(temp.size());
+	if (temp.empty()) return (SlangHeader*)str;
+	memcpy(&str->storage->data[0],temp.data(),temp.size());
+	return (SlangHeader*)str;
+}
+
 inline bool SlangInterpreter::SlangFuncDefine(SlangHeader** res){
 	// can't exist
 	SlangList* argIt = GetCurrArg();
@@ -1194,7 +1606,7 @@ inline bool SlangInterpreter::SlangFuncDefine(SlangHeader** res){
 	if (redefined){
 		GetCurrEnv()->SetSymbol(sym,valObj);
 	} else {
-		DefEnvSymbol(sym,valObj);
+		DefEnvSymbol(GetCurrEnv(),sym,valObj);
 	}
 	*res = valObj;
 	return true;
@@ -1213,34 +1625,38 @@ inline bool SlangInterpreter::SlangFuncLambda(SlangHeader** res){
 	
 	std::vector<SymbolName> params = {};
 	params.reserve(5);
-	if (!variadic){
-		std::set<SymbolName> seen = {};
-		SlangList* paramIt = (SlangList*)argIt->left;
-		while (paramIt){
-			if (paramIt->header.type!=SlangType::List){
-				TypeError((SlangHeader*)paramIt,paramIt->header.type,SlangType::List);
-				return false;
-			}
+	std::set<SymbolName> seen = {};
+	SlangList* paramIt = (SlangList*)argIt->left;
+	SlangObj* symObj;
+	while (paramIt){
+		if (paramIt->header.type==SlangType::Symbol){
+			// last variadic arg
+			variadic = true;
+			symObj = (SlangObj*)paramIt;
+		} else if (paramIt->header.type==SlangType::List){
 			if (GetType(paramIt->left)!=SlangType::Symbol){
 				TypeError(paramIt->left,GetType(paramIt->left),SlangType::Symbol);
 				return false;
 			}
-			SlangObj* symObj = (SlangObj*)paramIt->left;
-			if (seen.contains(symObj->symbol)){
-				std::stringstream msg = {};
-				msg << "LambdaError:\n    Lambda parameter '" << 
-					*paramIt->left << "' was reused!";
-				PushError((SlangHeader*)symObj,msg.str());
-				return false;
-			}
-			
-			params.push_back(symObj->symbol);
-			seen.insert(symObj->symbol);
-			
-			paramIt = (SlangList*)paramIt->right;
+			symObj = (SlangObj*)paramIt->left;
+		} else {
+			TypeError((SlangHeader*)paramIt,paramIt->header.type,SlangType::List);
+			return false;
 		}
-	} else { // variadic
-		params.push_back(((SlangObj*)argIt->left)->symbol);
+		
+		if (seen.contains(symObj->symbol)){
+			std::stringstream msg = {};
+			msg << "LambdaError:\n    Lambda parameter '" << 
+				*(SlangHeader*)symObj << "' was reused!";
+			PushError((SlangHeader*)symObj,msg.str());
+			return false;
+		}
+		
+		params.push_back(symObj->symbol);
+		seen.insert(symObj->symbol);
+		
+		if (variadic) break;
+		paramIt = (SlangList*)paramIt->right;
 	}
 	NEXT_ARG();
 	argIt = GetCurrArg();
@@ -1291,6 +1707,9 @@ inline bool ConvertToBool(const SlangHeader* obj,bool& res){
 		case SlangType::NullType:
 		case SlangType::Storage:
 			return false;
+		case SlangType::EndOfFile:
+			res = false;
+			return true;
 		case SlangType::Bool:
 			res = ((SlangObj*)obj)->boolean;
 			return true;
@@ -1321,6 +1740,14 @@ inline bool ConvertToBool(const SlangHeader* obj,bool& res){
 			}
 			return true;
 		}
+		case SlangType::InputStream: {
+			SlangStream* stream = (SlangStream*)obj;
+			res = !stream->IsAtEnd();
+			return true;
+		}
+		case SlangType::OutputStream:
+			res = true;
+			return true;
 		case SlangType::Params:
 			res = ((SlangParams*)obj)->size!=0;
 			return true;
@@ -1402,7 +1829,6 @@ inline bool SlangInterpreter::SlangFuncLen(SlangHeader** res){
 			*res = (SlangHeader*)MakeInt(ListLen((SlangList*)v));
 			return true;
 		case SlangType::Vector:
-			
 			*res = (SlangHeader*)MakeInt(GetStorageSize(((SlangVec*)v)->storage));
 			return true;
 		case SlangType::String:
@@ -1679,10 +2105,7 @@ inline bool SlangInterpreter::SlangFuncStrGet(SlangHeader** res){
 	if (!WrappedEvalExpr(argIt->left,&strObj))
 		return false;
 	
-	if (GetType(strObj)!=SlangType::String){
-		TypeError(strObj,GetType(strObj),SlangType::String);
-		return false;
-	}
+	TYPE_CHECK_EXACT(strObj,SlangType::String);
 	
 	SlangStr* str = (SlangStr*)strObj;
 	StackAddArg((SlangHeader*)str);
@@ -1694,10 +2117,8 @@ inline bool SlangInterpreter::SlangFuncStrGet(SlangHeader** res){
 	if (!WrappedEvalExpr(argIt->left,&indexObj))
 		return false;
 	
-	if (GetType(indexObj)!=SlangType::Int){
-		TypeError(indexObj,GetType(indexObj),SlangType::Int);
-		return false;
-	}
+	TYPE_CHECK_EXACT(indexObj,SlangType::Int);
+	
 	str = (SlangStr*)funcArgStack[frameIndex-1];
 	ssize_t index = ((SlangObj*)indexObj)->integer;
 	size_t strLen = GetStorageSize(str->storage);
@@ -1721,10 +2142,7 @@ inline bool SlangInterpreter::SlangFuncStrSet(SlangHeader** res){
 	if (!WrappedEvalExpr(argIt->left,&strObj))
 		return false;
 	
-	if (GetType(strObj)!=SlangType::String){
-		TypeError(strObj,GetType(strObj),SlangType::String);
-		return false;
-	}
+	TYPE_CHECK_EXACT(strObj,SlangType::String);
 	
 	SlangStr* str = (SlangStr*)strObj;
 	StackAddArg((SlangHeader*)str);
@@ -1735,10 +2153,8 @@ inline bool SlangInterpreter::SlangFuncStrSet(SlangHeader** res){
 	if (!WrappedEvalExpr(argIt->left,&indexObj))
 		return false;
 		
-	if (GetType(indexObj)!=SlangType::Int){
-		TypeError(indexObj,GetType(indexObj),SlangType::Int);
-		return false;
-	}
+	TYPE_CHECK_EXACT(indexObj,SlangType::Int);
+	
 	str = (SlangStr*)funcArgStack[frameIndex-1];
 	ssize_t index = ((SlangObj*)indexObj)->integer;
 	size_t strLen = GetStorageSize(str->storage);
@@ -1755,10 +2171,7 @@ inline bool SlangInterpreter::SlangFuncStrSet(SlangHeader** res){
 	if (!WrappedEvalExpr(argIt->left,&val))
 		return false;
 		
-	if (GetType(val)!=SlangType::String){
-		TypeError(val,GetType(val),SlangType::String);
-		return false;
-	}
+	TYPE_CHECK_EXACT(val,SlangType::String);
 	
 	size_t valLen = GetStorageSize(((SlangStr*)val)->storage);
 	if (valLen!=1){
@@ -1769,6 +2182,515 @@ inline bool SlangInterpreter::SlangFuncStrSet(SlangHeader** res){
 	str = (SlangStr*)funcArgStack[--frameIndex];
 	str->storage->data[index] = ((SlangStr*)val)->storage->data[0];
 	*res = (SlangHeader*)str;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncMakeStrIStream(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	
+	SlangHeader* strObj;
+	if (!WrappedEvalExpr(argIt->left,&strObj))
+		return false;
+		
+	TYPE_CHECK_EXACT(strObj,SlangType::String);
+	
+	SlangStr* str = (SlangStr*)strObj;
+	
+	SlangStream* stream = MakeStringInputStream(str);
+	*res = (SlangHeader*)stream;
+	
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncMakeStrOStream(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	SlangStream* stream;
+	if (!argIt){
+		stream = MakeStringOutputStream(nullptr);
+	} else {
+		SlangHeader* strObj;
+		if (!WrappedEvalExpr(argIt->left,&strObj))
+			return false;
+			
+		TYPE_CHECK_EXACT(strObj,SlangType::String);
+		
+		stream = MakeStringOutputStream((SlangStr*)strObj);
+	}
+	
+	*res = (SlangHeader*)stream;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncStreamGetStr(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	SlangHeader* streamObj;
+	if (!WrappedEvalExpr(argIt->left,&streamObj))
+		return false;
+	
+	SlangType type = GetType(streamObj);
+	if (type!=SlangType::InputStream&&type!=SlangType::OutputStream){
+		TypeError(streamObj,type,SlangType::InputStream);
+		return false;
+	}
+	
+	if (streamObj->isFile){
+		StreamError(streamObj,"Stream has no underlying string!");
+		return false;
+	}
+	
+	SlangStream* stream = (SlangStream*)streamObj;
+	*res = (SlangHeader*)stream->str;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncStreamWrite(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	SlangHeader* streamObj;
+	if (!WrappedEvalExpr(argIt->left,&streamObj))
+		return false;
+	
+	TYPE_CHECK_EXACT(streamObj,SlangType::OutputStream);
+	StackAddArg(streamObj);
+	
+	NEXT_ARG();
+	argIt = GetCurrArg();
+	
+	SlangHeader* strObj;
+	if (!WrappedEvalExpr(argIt->left,&strObj))
+		return false;
+		
+	TYPE_CHECK_EXACT(strObj,SlangType::String);
+	if (GetStorageSize(((SlangStr*)strObj)->storage)==0){
+		*res = funcArgStack[--frameIndex];
+		return true;
+	}
+	
+	SlangStream* stream = (SlangStream*)funcArgStack[frameIndex-1];
+	SlangStr* str = (SlangStr*)strObj;
+	if (stream->header.isFile){
+		if (!stream->file){
+			FileError(GetCurrArg()->left,"Cannot write to a closed file!");
+			--frameIndex;
+			return false;
+		}
+		fwrite(&str->storage->data[0],sizeof(uint8_t),str->storage->size,stream->file);
+	} else {
+		if (!SlangOutputToString(stream,strObj)){
+			--frameIndex;
+			return false;
+		}
+		
+		/*size_t currCap = GetStorageCapacity(streamstr->storage);
+		size_t currSize = GetStorageSize(streamstr->storage);
+		size_t sizeIncrease;
+		if (currSize-stream->pos>str->storage->size){
+			sizeIncrease = 0;
+		} else {
+			sizeIncrease = str->storage->size-(currSize-stream->pos);
+		}
+		
+		// needs realloc
+		if (currCap-currSize<sizeIncrease){
+			StackAddArg((SlangHeader*)stream);
+			StackAddArg((SlangHeader*)str);
+			size_t newCap = sizeIncrease+GetStorageSize(streamstr->storage);
+			newCap = newCap*3/2+8;
+			SlangStorage* newStorage = AllocateStorage(newCap,sizeof(uint8_t),nullptr);
+			
+			// fix pointers
+			str = (SlangStr*)funcArgStack[--frameIndex];
+			stream = (SlangStream*)funcArgStack[--frameIndex];
+			streamstr = stream->str;
+			
+			newStorage->size = streamstr->storage->size;
+			memcpy(newStorage->data,streamstr->storage->data,sizeof(uint8_t)*streamstr->storage->size);
+			streamstr->storage = newStorage;
+		}*/
+		
+		// copy data over
+		/*uint8_t* it = &streamstr->storage->data[stream->pos];
+		uint8_t* otherIt = &str->storage->data[0];
+		uint8_t* end = it+str->storage->size;
+		while (it<end){
+			*it++ = *otherIt++;
+		}
+		streamstr->storage->size += sizeIncrease;
+		stream->pos += str->storage->size;*/
+	}
+	
+	*res = funcArgStack[--frameIndex];
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncStreamRead(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	SlangHeader* streamObj;
+	if (!WrappedEvalExpr(argIt->left,&streamObj))
+		return false;
+	
+	TYPE_CHECK_EXACT(streamObj,SlangType::InputStream);
+	bool isFile = streamObj->isFile;
+	
+	StackAddArg(streamObj);
+	NEXT_ARG();
+	argIt = GetCurrArg();
+	size_t count = UINT64_MAX;
+	if (argIt){
+		SlangHeader* intObj;
+		if (!WrappedEvalExpr(argIt->left,&intObj))
+			return false;
+			
+		TYPE_CHECK_EXACT(intObj,SlangType::Int);
+		ssize_t c = ((SlangObj*)intObj)->integer;
+		count = (c < 0) ? 0 : c;
+	}
+	
+	if (isFile){
+		SlangStream* stream = (SlangStream*)funcArgStack[--frameIndex];
+		if (!stream->file){
+			FileError(GetCurrArg()->left,"Cannot read from a closed file!");
+			return false;
+		}
+		
+		std::string temp{};
+		temp.reserve(64);
+		int c=0;
+		while (count--&&(c = fgetc(stream->file))!=EOF){
+			temp.push_back(c);
+		}
+		
+		if (temp.empty()){
+			*res = MakeEOF();
+			--frameIndex;
+			return true;
+		}
+		
+		SlangStr* intoStr = AllocateStr(temp.size());
+		memcpy(&intoStr->storage->data[0],temp.data(),temp.size());
+		*res = (SlangHeader*)intoStr;
+	} else {
+		SlangStream* stream = (SlangStream*)funcArgStack[frameIndex-1];
+		size_t bytesLeft = GetStorageSize(stream->str->storage)-stream->pos;
+		if (bytesLeft==0){
+			*res = MakeEOF();
+			--frameIndex;
+			return true;
+		}
+		count = (count>bytesLeft) ? bytesLeft : count;
+		
+		SlangStr* intoStr = AllocateStr(count);
+		stream = (SlangStream*)funcArgStack[--frameIndex];
+		
+		uint8_t* it = &intoStr->storage->data[0];
+		uint8_t* otherIt = (stream->str->storage) ? &stream->str->storage->data[stream->pos] : nullptr;
+		
+		stream->pos += count;
+		while (count-->0){
+			*it++ = *otherIt++;
+		}
+		
+		*res = (SlangHeader*)intoStr;
+	}
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncStreamWriteByte(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	SlangHeader* streamObj;
+	if (!WrappedEvalExpr(argIt->left,&streamObj))
+		return false;
+	
+	TYPE_CHECK_EXACT(streamObj,SlangType::OutputStream);
+	
+	NEXT_ARG();
+	argIt = GetCurrArg();
+	
+	StackAddArg(streamObj);
+	
+	SlangHeader* wObj;
+	if (!WrappedEvalExpr(argIt->left,&wObj))
+		return false;
+	
+	TYPE_CHECK_EXACT(wObj,SlangType::Int);
+	
+	uint8_t byte = ((SlangObj*)wObj)->integer&0xFF;
+	
+	SlangStream* stream = (SlangStream*)funcArgStack[--frameIndex];
+	if (streamObj->isFile){
+		if (!stream->file){
+			FileError(GetCurrArg()->left,"Cannot write to a closed file!");
+			return false;
+		}
+		fputc(byte,stream->file);
+	} else {
+		SlangStr* streamstr = stream->str;
+		size_t currCap = GetStorageCapacity(streamstr->storage);
+		
+		// needs realloc
+		if (currCap==stream->pos){
+			StackAddArg((SlangHeader*)stream);
+			size_t newCap = 1+GetStorageSize(streamstr->storage);
+			newCap = newCap*3/2+8;
+			SlangStorage* newStorage = AllocateStorage(newCap,sizeof(uint8_t),nullptr);
+			
+			// fix pointers
+			stream = (SlangStream*)funcArgStack[--frameIndex];
+			streamstr = stream->str;
+			
+			newStorage->size = streamstr->storage->size;
+			memcpy(newStorage->data,streamstr->storage->data,sizeof(uint8_t)*streamstr->storage->size);
+			streamstr->storage = newStorage;
+		}
+		
+		if (stream->pos==streamstr->storage->size)
+			streamstr->storage->size++;
+		streamstr->storage->data[stream->pos++] = byte;
+	}
+	
+	*res = (SlangHeader*)stream;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncStreamReadByte(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	SlangHeader* streamObj;
+	if (!WrappedEvalExpr(argIt->left,&streamObj))
+		return false;
+	
+	TYPE_CHECK_EXACT(streamObj,SlangType::InputStream);
+	bool isFile = streamObj->isFile;
+	
+	SlangStream* stream = (SlangStream*)streamObj;
+	if (isFile){
+		if (!stream->file){
+			FileError(GetCurrArg()->left,"Cannot read from a closed file!");
+			return false;
+		}
+		int c = fgetc(stream->file);
+		if (c==EOF){
+			*res = MakeEOF();
+			return true;
+		}
+		*res = (SlangHeader*)MakeInt(c&0xFF);
+	} else {
+		size_t bytesLeft = GetStorageSize(stream->str->storage)-stream->pos;
+		if (bytesLeft==0){
+			*res = MakeEOF();
+			return true;
+		}
+		
+		uint8_t byte = stream->str->storage->data[stream->pos++];
+		
+		*res = (SlangHeader*)MakeInt(byte);
+	}
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncStreamSeekPrefix(SlangStream** stream,ssize_t* offset){
+	SlangList* argIt = GetCurrArg();
+	SlangHeader* streamObj;
+	if (!WrappedEvalExpr(argIt->left,&streamObj))
+		return false;
+	
+	if (GetType(streamObj)!=SlangType::InputStream&&GetType(streamObj)!=SlangType::OutputStream){
+		TypeError(GetCurrArg()->left,GetType(streamObj),SlangType::InputStream);
+		return false;
+	}
+	
+	StackAddArg(streamObj);
+	
+	*offset = 0;
+	NEXT_ARG();
+	argIt = GetCurrArg();
+	if (argIt){
+		SlangHeader* intObj;
+		if (!WrappedEvalExpr(argIt->left,&intObj))
+			return false;
+		TYPE_CHECK_EXACT(intObj,SlangType::Int);
+		*offset = ((SlangObj*)intObj)->integer;
+	}
+	
+	*stream = (SlangStream*)funcArgStack[--frameIndex];
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncStreamSeekBegin(SlangHeader** res){
+	SlangStream* stream;
+	ssize_t offset;
+	if (!SlangFuncStreamSeekPrefix(&stream,&offset))
+		return false;
+		
+	if (stream->header.isFile){
+		if (!stream->file){
+			FileError(GetCurrArg()->left,"Cannot seek in a closed file!");
+			return false;
+		}
+		fseek(stream->file,offset,SEEK_SET);
+	} else {
+		stream->pos = (offset<0) ? 0 : offset;
+		if (stream->pos > GetStorageSize(stream->str->storage)){
+			stream->pos = GetStorageSize(stream->str->storage);
+		}
+	}
+	*res = (SlangHeader*)stream;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncStreamSeekEnd(SlangHeader** res){
+	SlangStream* stream;
+	ssize_t offset;
+	if (!SlangFuncStreamSeekPrefix(&stream,&offset))
+		return false;
+		
+	if (stream->header.isFile){
+		if (!stream->file){
+			FileError(GetCurrArg()->left,"Cannot seek in a closed file!");
+			return false;
+		}
+		fseek(stream->file,-offset,SEEK_END);
+	} else {
+		ssize_t ssize = GetStorageSize(stream->str->storage);
+		if (offset>ssize){
+			offset = ssize;
+		} else if (offset<0){
+			offset = 0;
+		}
+		stream->pos = ssize-offset;
+		if (stream->pos > GetStorageSize(stream->str->storage)){
+			stream->pos = GetStorageSize(stream->str->storage);
+		}
+	}
+	*res = (SlangHeader*)stream;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncStreamSeekOffset(SlangHeader** res){
+	SlangStream* stream;
+	ssize_t offset;
+	if (!SlangFuncStreamSeekPrefix(&stream,&offset))
+		return false;
+		
+	if (stream->header.isFile){
+		if (!stream->file){
+			FileError(GetCurrArg()->left,"Cannot seek in a closed file!");
+			return false;
+		}
+		fseek(stream->file,offset,SEEK_CUR);
+	} else {
+		ssize_t ssize = GetStorageSize(stream->str->storage);
+		if (offset>(ssize_t)(ssize-stream->pos)){
+			offset = ssize-stream->pos;
+		} else if (offset<-(ssize_t)stream->pos){
+			offset = -stream->pos;
+		}
+		stream->pos += offset;
+	}
+	*res = (SlangHeader*)stream;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncStreamTell(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	SlangHeader* streamObj;
+	if (!WrappedEvalExpr(argIt->left,&streamObj))
+		return false;
+	
+	if (GetType(streamObj)!=SlangType::InputStream&&GetType(streamObj)!=SlangType::OutputStream){
+		TypeError(GetCurrArg()->left,GetType(streamObj),SlangType::InputStream);
+		return false;
+	}
+	
+	SlangStream* stream = (SlangStream*)streamObj;
+	ssize_t t;
+	if (stream->header.isFile){
+		if (!stream->file){
+			FileError(GetCurrArg()->left,"Cannot tell position of a closed file!");
+			return false;
+		}
+		t = ftell(stream->file);
+	} else {
+		t = stream->pos;
+	}
+	//StackAddArg(streamObj);
+	*res = (SlangHeader*)MakeInt(t);
+	//--frameIndex;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncOutputTo(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	SlangHeader* streamObj;
+	if (!WrappedEvalExpr(argIt->left,&streamObj))
+		return false;
+		
+	TYPE_CHECK_EXACT(streamObj,SlangType::OutputStream);
+	
+	NEXT_ARG();
+	argIt = GetCurrArg();
+	SlangStream* stream = (SlangStream*)streamObj;
+	SlangHeader* obj;
+	StackAddArg((SlangHeader*)stream);
+	if (streamObj->isFile){
+		if (!stream->file){
+			FileError(GetCurrArg()->left,"Cannot write to a closed file!");
+			return false;
+		}
+		while (argIt){
+			if (!WrappedEvalExpr(argIt->left,&obj)){
+				--frameIndex;
+				return false;
+			}
+				
+			stream = (SlangStream*)funcArgStack[frameIndex-1];
+			if (!SlangOutputToFile(stream->file,obj)){
+				--frameIndex;
+				return false;
+			}
+			
+			NEXT_ARG();
+			argIt = GetCurrArg();
+		}
+	} else {
+		while (argIt){
+			if (!WrappedEvalExpr(argIt->left,&obj)){
+				--frameIndex;
+				return false;
+			}
+				
+			stream = (SlangStream*)funcArgStack[frameIndex-1];
+			if (!SlangOutputToString(stream,obj)){
+				--frameIndex;
+				return false;
+			}
+			
+			NEXT_ARG();
+			argIt = GetCurrArg();
+		}
+	}
+	
+	*res = funcArgStack[--frameIndex];
+	
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncInputFrom(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	SlangHeader* streamObj;
+	if (!WrappedEvalExpr(argIt->left,&streamObj))
+		return false;
+		
+	TYPE_CHECK_EXACT(streamObj,SlangType::InputStream);
+	
+	SlangStream* stream = (SlangStream*)streamObj;
+	if (streamObj->isFile){
+		if (!stream->file){
+			FileError(GetCurrArg()->left,"Cannot read from a closed file!");
+			return false;
+		}
+		*res = SlangInputFromFile(stream->file);
+	} else {
+		*res = SlangInputFromString(stream);
+	}
 	return true;
 }
 
@@ -2521,6 +3443,14 @@ bool EqualObjs(const SlangHeader* a,const SlangHeader* b){
 			case SlangType::Symbol:
 				// union moment
 				return ((SlangObj*)a)->integer==((SlangObj*)b)->integer;
+			case SlangType::EndOfFile:
+				return true;
+			case SlangType::InputStream:
+			case SlangType::OutputStream:
+				if (a->isFile!=b->isFile)
+					return false;
+				// union moment (covers both str and file)
+				return ((SlangStream*)a)->str==((SlangStream*)b)->str;
 		}
 	} else {
 		if (b->type==SlangType::Int) std::swap(a,b);
@@ -2565,6 +3495,46 @@ bool StringEquality(const SlangStr* a,const SlangStr* b){
 	return true;
 }
 
+inline bool IdenticalObjs(const SlangHeader* l,const SlangHeader* r){
+	if (l==r)
+		return true;
+	if (!l||!r)
+		return false;
+	if (l->type!=r->type)
+		return false;
+	
+	// if both are list type, comparing pointers
+	// alone is enough to determine if l IS r
+	switch (l->type){
+		case SlangType::Vector:
+		case SlangType::String:
+		case SlangType::List:
+		case SlangType::NullType:
+		case SlangType::Env:
+		case SlangType::Params:
+		case SlangType::Lambda:
+		case SlangType::Storage:
+		case SlangType::InputStream:
+		case SlangType::OutputStream:
+			return false;
+		case SlangType::Maybe:
+			if ((l->flags & FLAG_MAYBE_OCCUPIED) != (r->flags & FLAG_MAYBE_OCCUPIED)){
+				return false;
+			}
+			return ((SlangObj*)l)->maybe==((SlangObj*)r)->maybe;
+		case SlangType::Int:
+		case SlangType::Real:
+		case SlangType::Bool:
+		case SlangType::Symbol:
+			// union moment
+			return ((SlangObj*)l)->integer==((SlangObj*)r)->integer;
+		case SlangType::EndOfFile:
+			return true;
+	}
+	
+	return false;
+}
+
 inline bool SlangInterpreter::SlangFuncEq(SlangHeader** res){
 	SlangList* argIt = GetCurrArg();
 	SlangHeader* l = nullptr;
@@ -2600,50 +3570,7 @@ inline bool SlangInterpreter::SlangFuncIs(SlangHeader** res){
 	
 	l = funcArgStack[--frameIndex];
 	
-	if (l==r){
-		*res = (SlangHeader*)MakeBool(true);
-		return true;
-	}
-	if (!l||!r){
-		*res = (SlangHeader*)MakeBool(false);
-		return true;
-	}
-	
-	if (l->type!=r->type){
-		*res = (SlangHeader*)MakeBool(false);
-		return true;
-	}
-	
-	// if both are list type, comparing pointers
-	// alone is enough to determine if l IS r
-	switch (l->type){
-		case SlangType::Vector:
-		case SlangType::String:
-		case SlangType::List:
-		case SlangType::NullType:
-		case SlangType::Env:
-		case SlangType::Params:
-		case SlangType::Lambda:
-		case SlangType::Storage:
-			*res = (SlangHeader*)MakeBool(false);
-			return true;
-		case SlangType::Maybe:
-			if ((l->flags & FLAG_MAYBE_OCCUPIED) != (r->flags & FLAG_MAYBE_OCCUPIED)){
-				*res = (SlangHeader*)MakeBool(false);
-				return true;
-			}
-			*res = (SlangHeader*)MakeBool(((SlangObj*)l)->maybe==((SlangObj*)r)->maybe);
-			return true;
-		case SlangType::Int:
-		case SlangType::Real:
-		case SlangType::Bool:
-		case SlangType::Symbol:
-			// union moment
-			*res = (SlangHeader*)MakeBool(((SlangObj*)l)->integer==((SlangObj*)r)->integer);
-			return true;
-	}
-	
-	*res = (SlangHeader*)MakeBool(false);
+	*res = (SlangHeader*)MakeBool(IdenticalObjs(l,r));
 	return true;
 }
 
@@ -2784,7 +3711,25 @@ inline bool SlangInterpreter::GetLetParams(
 
 #define ARITY_EXACT_CHECK(x) \
 	if (argCount!=(x)){ \
-		ArityError(expr,argCount,(x),(x)); \
+		ArityError(((SlangList*)GetCurrExpr())->left,argCount,(x),(x)); \
+		return false; \
+	}
+	
+#define ARITY_BETWEEN_CHECK(x,y) \
+	if (argCount<(x)||argCount>(y)){ \
+		ArityError(((SlangList*)GetCurrExpr())->left,argCount,(x),(y)); \
+		return false; \
+	}
+	
+#define ARITY_AT_LEAST_CHECK(x) \
+	if (argCount<(x)){ \
+		ArityError(((SlangList*)GetCurrExpr())->left,argCount,(x),VARIADIC_ARG_COUNT); \
+		return false; \
+	}
+	
+#define ARITY_AT_MOST_CHECK(x) \
+	if (argCount>(x)){ \
+		ArityError(((SlangList*)GetCurrExpr())->left,argCount,(x),VARIADIC_ARG_COUNT); \
 		return false; \
 	}
 
@@ -2803,14 +3748,24 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 			case SlangType::Real:
 			case SlangType::Int:
 			case SlangType::Bool:
-			case SlangType::String:
 			case SlangType::Vector:
 			case SlangType::Env:
 			case SlangType::Storage:
 			case SlangType::Params:
 			case SlangType::Maybe:
+			case SlangType::InputStream:
+			case SlangType::OutputStream:
+			case SlangType::EndOfFile:
 			case SlangType::Lambda: {
 				*res = expr;
+				return true;
+			}
+			case SlangType::String: {
+				if (arena->InCurrSet((uint8_t*)expr)){
+					*res = expr;
+					return true;
+				}
+				*res = Copy(expr);
 				return true;
 			}
 			case SlangType::Symbol: {
@@ -2843,7 +3798,8 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 				// optimization for predefined syms
 				if (GetType(argIt->left)==SlangType::Symbol&&
 					((SlangObj*)argIt->left)->symbol<GLOBAL_SYMBOL_COUNT){
-					head = argIt->left;
+					if (!GetRecursiveSymbol(GetCurrEnv(),((SlangObj*)argIt->left)->symbol,&head))
+						head = argIt->left;
 				} else {
 					if (!WrappedEvalExpr(argIt->left,&head)){
 						EvalError(expr);
@@ -2856,20 +3812,50 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 				
 				size_t argCount = GetArgCount(argIt);
 				
-				if (head->type==SlangType::Lambda){
+				SlangType headType = GetType(head);
+				if (headType==SlangType::Lambda){
 					SlangLambda* lam = (SlangLambda*)head;
+					size_t headIndex = frameIndex;
 					StackAddArg(head);
-					size_t headIndex = frameIndex-1;
 					base = frameIndex;
 					SlangParams* funcParams = lam->params;
 					bool variadic = lam->header.flags&FLAG_VARIADIC;
 					size_t paramCount = (funcParams) ? funcParams->size : 0;
-					if (!variadic&&paramCount!=argCount){
-						ArityError(expr,argCount,paramCount,paramCount);
-						return false;
+					if (variadic){
+						/*if (argCount<paramCount-1){
+							ArityError(((SlangList*)GetCurrExpr())->left,
+									argCount,paramCount-1,VARIADIC_ARG_COUNT);
+							return false;
+						}*/
+						ARITY_AT_LEAST_CHECK(paramCount-1);
+					} else {
+						ARITY_EXACT_CHECK(paramCount);
+						/*if (paramCount!=argCount){
+							ArityError(((SlangList*)GetCurrExpr())->left,
+									argCount,paramCount,paramCount);
+							return false;
+						}*/
+					}
+					
+					size_t orderedArgCount = (variadic) ? paramCount-1 : paramCount;
+					for (size_t i=0;i<orderedArgCount;++i){
+						SlangHeader* fArg = nullptr;
+						if (!WrappedEvalExpr(argIt->left,&fArg)){
+							EvalError(expr);
+							return false;
+						}
+						StackAddArg(fArg);
+						NEXT_ARG();
+						argIt = GetCurrArg();
+					}
+					
+					lam = (SlangLambda*)funcArgStack[headIndex];
+					for (size_t i=0;i<orderedArgCount;++i){
+						lam->env->SetSymbol(lam->params->params[i],funcArgStack[base+i]);
 					}
 					
 					if (variadic){
+						size_t variadicBase = frameIndex;
 						while (argIt){
 							SlangHeader* fArg = nullptr;
 							if (!WrappedEvalExpr(argIt->left,&fArg)){
@@ -2881,28 +3867,12 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 							argIt = GetCurrArg();
 						}
 						
-						SlangList* list = MakeList(funcArgStack,base,frameIndex);
+						SlangList* list = MakeList(funcArgStack,variadicBase,frameIndex);
 						lam = (SlangLambda*)funcArgStack[headIndex];
 						lam->env->SetSymbol(
-							lam->params->params[0],
+							lam->params->params[paramCount-1],
 							(SlangHeader*)list
 						);
-					} else {
-						for (size_t i=0;i<argCount;++i){
-							SlangHeader* fArg = nullptr;
-							if (!WrappedEvalExpr(argIt->left,&fArg)){
-								EvalError(expr);
-								return false;
-							}
-							StackAddArg(fArg);
-							NEXT_ARG();
-							argIt = GetCurrArg();
-						}
-						
-						lam = (SlangLambda*)funcArgStack[headIndex];
-						for (size_t i=0;i<argCount;++i){
-							lam->env->SetSymbol(lam->params->params[i],funcArgStack[base+i]);
-						}
 					}
 					
 					lam = (SlangLambda*)funcArgStack[headIndex];
@@ -2912,7 +3882,7 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 					frameIndex = base;
 					--frameIndex;
 					continue;
-				} else if (head->type==SlangType::Symbol){
+				} else if (headType==SlangType::Symbol){
 					SymbolName symbol = ((SlangObj*)head)->symbol;
 					frameIndex = base;
 					// handle predefined symbols
@@ -2927,10 +3897,7 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 							success = SlangFuncLambda(res);
 							return success;
 						case SLANG_LET: {
-							if (argCount!=2&&argCount!=3){
-								ArityError(expr,argCount,2,3);
-								return false;
-							}
+							ARITY_BETWEEN_CHECK(2,3);
 							
 							SymbolName letName;
 							// named let
@@ -2994,10 +3961,7 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 								EvalError(expr);
 							return success;
 						case SLANG_DO: {
-							if (argCount==0){
-								ArityError(expr,argCount,1,VARIADIC_ARG_COUNT);
-								return false;
-							}
+							ARITY_AT_LEAST_CHECK(1);
 							// while next arg is not null
 							while (argIt->right){
 								if (!WrappedEvalExpr(argIt->left,res)){
@@ -3041,25 +4005,55 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 						}
 						case SLANG_APPLY: {
 							// (apply func args)
-							ARITY_EXACT_CHECK(2);
+							// (apply func arg1 arg2 ... argN args)
+							ARITY_AT_LEAST_CHECK(2);
 							SlangHeader* head = argIt->left;
 							StackAddArg(head);
 							NEXT_ARG();
 							argIt = GetCurrArg();
+							size_t preArgsBase = frameIndex;
+							
+							while (argIt->right){
+								SlangHeader* a;
+								if (!WrappedEvalExpr(argIt->left,&a))
+									return false;
+									
+								StackAddArg(a);
+								
+								NEXT_ARG();
+								argIt = GetCurrArg();
+								if (!IsList((SlangHeader*)argIt)){
+									TypeError((SlangHeader*)argIt,
+												GetType((SlangHeader*)argIt),
+												SlangType::List);
+									return false;
+								}
+							}
+							
+							size_t preArgsEnd = frameIndex;
+							
 							SlangHeader* args;
 							if (!WrappedEvalExpr(argIt->left,&args))
 								return false;
-							
+								
 							if (!IsList(args)){
-								EvalError(GetCurrArg()->left);
 								TypeError(args,GetType(args),SlangType::List);
 								return false;
 							}
+							
 							StackAddArg(args);
 							
 							SlangList* listHead = AllocateList();
-							listHead->right = funcArgStack[--frameIndex];
-							listHead->left = funcArgStack[--frameIndex];
+							if (preArgsBase!=preArgsEnd){
+								SlangList* preArgsList = MakeList(funcArgStack,preArgsBase,preArgsEnd);
+								ConcatLists(preArgsList,(SlangList*)funcArgStack[--frameIndex]);
+								listHead->right = (SlangHeader*)preArgsList;
+							} else {
+								listHead->right = funcArgStack[--frameIndex]; // args
+							}
+							frameIndex = preArgsBase;
+							
+							listHead->left = funcArgStack[--frameIndex]; // head
 							
 							SetExpr((SlangHeader*)listHead);
 							continue;
@@ -3140,6 +4134,14 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 							
 							*res = (SlangHeader*)MakeBool(!((*res)->flags & FLAG_MAYBE_OCCUPIED));
 							return true;
+						case SLANG_OUTPUT_TO:
+							ARITY_AT_LEAST_CHECK(1);
+							success = SlangFuncOutputTo(res);
+							return success;
+						case SLANG_INPUT_FROM:
+							ARITY_EXACT_CHECK(1);
+							success = SlangFuncInputFrom(res);
+							return success;
 						case SLANG_LIST:
 							success = SlangFuncList(res);
 							return success;
@@ -3147,10 +4149,7 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 							success = SlangFuncVec(res);
 							return success;
 						case SLANG_VEC_ALLOC:
-							if (argCount!=1&&argCount!=2){
-								ArityError(expr,argCount,1,2);
-								return false;
-							}
+							ARITY_BETWEEN_CHECK(1,2);
 							success = SlangFuncVecAlloc(res);
 							return success;
 						case SLANG_VEC_GET:
@@ -3176,6 +4175,50 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 						case SLANG_STR_SET:
 							ARITY_EXACT_CHECK(3);
 							success = SlangFuncStrSet(res);
+							return success;
+						case SLANG_MAKE_STR_ISTREAM:
+							ARITY_EXACT_CHECK(1);
+							success = SlangFuncMakeStrIStream(res);
+							return success;
+						case SLANG_MAKE_STR_OSTREAM:
+							ARITY_AT_MOST_CHECK(1);
+							success = SlangFuncMakeStrOStream(res);
+							return success;
+						case SLANG_STREAM_GET_STR:
+							ARITY_EXACT_CHECK(1);
+							success = SlangFuncStreamGetStr(res);
+							return success;
+						case SLANG_STREAM_WRITE:
+							ARITY_EXACT_CHECK(2);
+							success = SlangFuncStreamWrite(res);
+							return success;
+						case SLANG_STREAM_READ:
+							ARITY_BETWEEN_CHECK(1,2);
+							success = SlangFuncStreamRead(res);
+							return success;
+						case SLANG_STREAM_WRITE_BYTE:
+							ARITY_EXACT_CHECK(2);
+							success = SlangFuncStreamWriteByte(res);
+							return success;
+						case SLANG_STREAM_READ_BYTE:
+							ARITY_EXACT_CHECK(1);
+							success = SlangFuncStreamReadByte(res);
+							return success;
+						case SLANG_STREAM_SEEK_BEGIN:
+							ARITY_BETWEEN_CHECK(1,2);
+							success = SlangFuncStreamSeekBegin(res);
+							return success;
+						case SLANG_STREAM_SEEK_END:
+							ARITY_BETWEEN_CHECK(1,2);
+							success = SlangFuncStreamSeekEnd(res);
+							return success;
+						case SLANG_STREAM_SEEK_OFFSET:
+							ARITY_BETWEEN_CHECK(1,2);
+							success = SlangFuncStreamSeekOffset(res);
+							return success;
+						case SLANG_STREAM_TELL:
+							ARITY_EXACT_CHECK(1);
+							success = SlangFuncStreamTell(res);
 							return success;
 						case SLANG_PAIR:
 							ARITY_EXACT_CHECK(2);
@@ -3324,6 +4367,13 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 							
 							*res = (SlangHeader*)MakeBool(GetType(*res)==SlangType::Maybe);
 							return true;
+						case SLANG_IS_EOF:
+							ARITY_EXACT_CHECK(1);
+							if (!WrappedEvalExpr(argIt->left,res))
+								return false;
+							
+							*res = (SlangHeader*)MakeBool(GetType(*res)==SlangType::EndOfFile);
+							return true;
 						case SLANG_IS_BOUND: {
 							ARITY_EXACT_CHECK(1);
 							
@@ -3366,7 +4416,7 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 					}
 				} else {
 					//PrintCurrEnv(GetCurrEnv());
-					TypeError(head,GetType(head),SlangType::Lambda);
+					TypeError(head,headType,SlangType::Lambda);
 					return false;
 				}
 			}
@@ -3396,6 +4446,18 @@ void SlangInterpreter::ValueError(const SlangHeader* expr,const std::string& m){
 	PushError(expr,msg.str());
 }
 
+void SlangInterpreter::StreamError(const SlangHeader* expr,const std::string& m){
+	std::stringstream msg = {};
+	msg << "StreamError:\n    " << m;
+	PushError(expr,msg.str());
+}
+
+void SlangInterpreter::FileError(const SlangHeader* expr,const std::string& m){
+	std::stringstream msg = {};
+	msg << "FileError:\n    " << m;
+	PushError(expr,msg.str());
+}
+
 void SlangInterpreter::UndefinedError(const SlangHeader* expr){
 	std::stringstream msg = {};
 	msg << "UndefinedError:\n    Symbol '";
@@ -3403,7 +4465,6 @@ void SlangInterpreter::UndefinedError(const SlangHeader* expr){
 		msg << *expr << "' is not defined!";
 	else
 	 	msg << "()' is not defined!";
-		
 	
 	PushError(expr,msg.str());
 }
@@ -3531,6 +4592,39 @@ void PrintInfo(){
 		std::cout << "Run Time: " << gRunTime*1000 << "ms\n";
 }
 
+void SlangInterpreter::SetGlobalSymbol(const std::string& name,SlangHeader* value){
+	SymbolName sym = parser.RegisterSymbol(name);
+	SlangEnv* globalEnv = envStack.front();
+	if (!globalEnv->SetSymbol(sym,value)){
+		DefEnvSymbol(globalEnv,sym,value);
+	}
+}
+
+bool SlangInterpreter::GetGlobalSymbol(const std::string& name,SlangHeader** value){
+	SymbolName sym = parser.RegisterSymbol(name);
+	SlangEnv* globalEnv = envStack.front();
+	return globalEnv->GetSymbol(sym,value);
+}
+
+bool SlangInterpreter::CallLambda(
+		const SlangLambda* lam,
+		const std::vector<SlangHeader*>& args,
+		SlangHeader** res){
+	bool variadic = (lam->header.flags & FLAG_VARIADIC);
+	if (!variadic&&args.size()!=lam->params->size){
+		ArityError((SlangHeader*)lam,args.size(),lam->params->size,lam->params->size);
+		return false;
+	}
+	
+	size_t i=0;
+	for (auto* arg : args){
+		lam->env->SetSymbol(lam->params->params[i],arg);
+		++i;
+	}
+	
+	return WrappedEvalExpr(lam->expr,res);
+}
+
 bool SlangInterpreter::Run(SlangHeader* prog,SlangHeader** res){
 	errors.clear();
 	auto start = std::chrono::steady_clock::now();
@@ -3554,6 +4648,20 @@ inline void SlangInterpreter::AddExternalFunction(const ExternalFunc& ext){
 	extFuncs[sym] = ext;
 }
 
+inline void SlangInterpreter::AddFinalizer(const Finalizer& f){
+	assert(f.obj);
+	finalizers.push_back(f);
+}
+
+inline void SlangInterpreter::RemoveFinalizer(SlangHeader* obj){
+	for (ssize_t i=finalizers.size()-1;i>=0;--i){
+		if (obj==finalizers[i].obj){
+			finalizers.erase(finalizers.begin()+i);
+			break;
+		}
+	}
+}
+
 SlangInterpreter::SlangInterpreter(){
 	extFuncs = {};
 	AddExternalFunction({"gc-collect",&GCManualCollect});
@@ -3565,6 +4673,16 @@ SlangInterpreter::SlangInterpreter(){
 	AddExternalFunction({"input",&ExtFuncInput});
 	AddExternalFunction({"output",&ExtFuncOutput,0,VARIADIC_ARG_COUNT});
 	AddExternalFunction({"print",&ExtFuncPrint,0,VARIADIC_ARG_COUNT});
+	AddExternalFunction({"make-file-istream",&ExtFuncFileOpenRead,1,1});
+	AddExternalFunction({"make-file-ostream",&ExtFuncFileOpenWrite,1,1});
+	AddExternalFunction({"make-file-ostream-app",&ExtFuncFileOpenWriteApp,1,1});
+	AddExternalFunction({"file-close!",&ExtFuncFileClose,1,1});
+	AddExternalFunction({"flush!",&ExtFuncFileFlush,1,1});
+	AddExternalFunction({"stdin",&ExtFuncStdIn});
+	AddExternalFunction({"stdout",&ExtFuncStdOut});
+	AddExternalFunction({"stderr",&ExtFuncStdErr});
+	AddExternalFunction({"file?",&ExtFuncIsFile,1,1});
+	AddExternalFunction({"file-open?",&ExtFuncIsFileOpen,1,1});
 	
 	arena = new MemArena();
 	size_t memSize = SMALL_SET_SIZE*2;
@@ -3579,6 +4697,8 @@ SlangInterpreter::SlangInterpreter(){
 	envStack.resize(16);
 	exprStack.resize(32);
 	argStack.resize(32);
+	finalizers.clear();
+	finalizers.reserve(32);
 	frameIndex = 0;
 	envIndex = 0;
 	exprIndex = 0;
@@ -3593,6 +4713,10 @@ SlangInterpreter::SlangInterpreter(){
 }
 
 SlangInterpreter::~SlangInterpreter(){
+	for (auto& finalizer : finalizers){
+		finalizer.func(this,finalizer.obj);
+	}
+	finalizers.clear();
 	frameIndex = 0;
 	envIndex = 0;
 	exprIndex = 0;
@@ -3739,6 +4863,9 @@ inline SlangToken SlangTokenizer::NextToken(){
 }
 
 SymbolName SlangParser::RegisterSymbol(const std::string& symbol){
+	if (nameDict.contains(symbol))
+		return nameDict.at(symbol);
+		
 	SymbolName name = currentName++;
 	
 	nameDict[symbol] = name;
@@ -3780,10 +4907,6 @@ inline void SlangParser::NextToken(){
 	while (token.type==SlangTokenType::Comment){
 		token = tokenizer->NextToken();
 	}
-		
-	/*if (token.type==SlangTokenType::Error){
-		PushError("Unexpected character in token: "+std::string(token.view));
-	}*/
 }
 
 inline void* SlangParser::CodeAlloc(size_t size){
@@ -3809,9 +4932,11 @@ inline SlangStr* SlangParser::CodeAllocStr(size_t size){
 	obj->header.type = SlangType::String;
 	obj->header.flags = 0;
 	obj->storage = storage;
+	storage->header.type = SlangType::Storage;
+	storage->header.flags = 0;
+	storage->header.elemSize = sizeof(uint8_t);
 	storage->size = size;
 	storage->capacity = qsize;
-	storage->header.elemSize = sizeof(uint8_t);
 	return obj;
 }
 
@@ -3937,10 +5062,7 @@ inline bool SlangParser::ParseObj(SlangHeader** res){
 		case SlangTokenType::Symbol: {
 			SymbolName s;
 			std::string copy = std::string(token.view);
-			if (!nameDict.contains(copy))
-				s = RegisterSymbol(copy);
-			else
-				s = nameDict.at(copy);
+			s = RegisterSymbol(copy);
 			NextToken();
 			SlangObj* sym = CodeAllocObj();
 			sym->header.type = SlangType::Symbol;
@@ -4064,6 +5186,31 @@ void SlangParser::TestSeqMacro(SlangList* list,size_t argCount){
 			next->right = (SlangHeader*)newHead;
 			return;
 		}
+		case SLANG_DEFINE: {
+			// (def (func arg1 arg2...) expr1 expr2...) ->
+			// (def func (& (arg1 arg2...) expr1 expr2...))
+			if (argCount<3) return;
+			SlangList* next = (SlangList*)list->right;
+			if (GetType(next->left)!=SlangType::List)
+				return;
+			
+			SlangList* args = (SlangList*)next->left;
+			SlangHeader* funcName = args->left;
+			SlangList* exprsStart = (SlangList*)next->right;
+			
+			SlangList* lambdaWrapper = WrapExprSplice(SLANG_LAMBDA,exprsStart);
+			SlangList* inbetween = CodeAllocList();
+			inbetween->right = lambdaWrapper->right;
+			lambdaWrapper->right = (SlangHeader*)inbetween;
+			inbetween->left = args->right;
+			next->left = funcName;
+			SlangList* lambdaList = CodeAllocList();
+			lambdaList->right = nullptr;
+			lambdaList->left = (SlangHeader*)lambdaWrapper;
+			next->right = (SlangHeader*)lambdaList;
+			TestSeqMacro(lambdaWrapper,GetArgCount(lambdaWrapper));
+			return;
+		}
 		default:
 			break;
 	}
@@ -4160,19 +5307,6 @@ inline SlangHeader* SlangParser::WrapProgram(const std::vector<SlangHeader*>& ex
 	
 	return (SlangHeader*)outer;
 }
-/*
-SlangObj* SlangParser::LoadIntoBuffer(SlangObj* prog){
-	size_t i = codeIndex++;
-	codeBuffer[i] = *prog;
-	
-	if (prog->type==SlangType::List){
-		prog->left = LoadIntoBuffer(prog->left);
-		prog->right = LoadIntoBuffer(prog->right);
-	}
-	
-	return &codeBuffer[i];
-}*/
-
 
 SlangHeader* SlangParser::Parse(){
 	gDebugParser = this;
@@ -4262,6 +5396,15 @@ std::ostream& operator<<(std::ostream& os,const SlangHeader& obj){
 		case SlangType::NullType:
 			os << "[NULL]";
 			break;
+		case SlangType::EndOfFile:
+			os << "#eof";
+			break;
+		case SlangType::InputStream:
+			os << "[istream]";
+			break;
+		case SlangType::OutputStream:
+			os << "[ostream]";
+			break;
 		case SlangType::Int:
 			os << ((SlangObj*)&obj)->integer;
 			break;
@@ -4283,18 +5426,22 @@ std::ostream& operator<<(std::ostream& os,const SlangHeader& obj){
 		case SlangType::Lambda: {
 			bool variadic = obj.flags&FLAG_VARIADIC;
 			SlangLambda* lam = (SlangLambda*)&obj;
+			bool printBracket = !variadic||lam->params->size>1;
 			os << "(& ";
-			if (!variadic)
+			if (printBracket)
 				os << "(";
 			
 			if (lam->params){
 				for (size_t i=0;i<lam->params->size;++i){
-					if (i!=0)
+					if (i==lam->params->size-1&&i!=0&&variadic)
+						os << " . ";
+					else if (i!=0)
 						os << ' ';
 					os << gDebugParser->GetSymbolString(lam->params->params[i]);
 				}
 			}
-			if (!variadic)
+			
+			if (printBracket)
 				os << ")";
 			os << " ";
 			if (lam->expr)

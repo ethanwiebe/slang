@@ -6,27 +6,57 @@
 
 using namespace slang;
 
+inline size_t BracketsAreComplete(const std::string& str){
+	ssize_t score = 0;
+	for (auto c : str){
+		if (c=='('||c=='['||c=='{')
+			++score;
+		else if (c==')'||c==']'||c=='}')
+			--score;
+	}
+	
+	if (score<0) score = 0;
+	return score;
+}
+
 void ReplLoop(SlangInterpreter* interp){
-	std::cout << "---REPL---\n";
+	std::cout << "====slang v0.0.0====\n";
 	std::string inputStr{};
+	std::string secondStr{};
 	SlangHeader* res;
 	SlangHeader* prog;
 	
-	std::string code;
 	while (true){
+		res = nullptr;
 		std::cout << "sl> ";
+		inputStr.clear();
 		std::getline(std::cin,inputStr);
-		prog = interp->Parse(inputStr);
-		interp->Run(prog,&res);
-		if (res)
-			std::cout << *res << '\n';
+		if (!inputStr.empty()){
+			size_t b = 0;
+			while ((b = BracketsAreComplete(inputStr))!=0){
+				inputStr += '\n';
+				for (size_t i=0;i<b;++i){
+					std::cout << "\t";
+				}
+				std::getline(std::cin,secondStr);
+				inputStr += secondStr;
+			}
+			
+			prog = interp->Parse(inputStr);
+			interp->Run(prog,&res);
+			if (res){
+				interp->SetGlobalSymbol("_",res);
+				std::cout << *res << '\n';
+			}
+		}
 	}
 }
 
 int main(int argc,char** argv){
-	std::cout << std::setprecision(19);
+	std::cout << std::setprecision(16);
 	bool showInfo = false;
 	bool cmdlineProg = false;
+	bool interactive = false;
 	
 	std::vector<std::string> argVec{};
 	for (ssize_t i=1;i<argc;++i){
@@ -39,6 +69,12 @@ int main(int argc,char** argv){
 			showInfo = true;
 		else if (argVec[i]=="-p"||argVec[i]=="--prog")
 			cmdlineProg = true;
+		else if (argVec[i]=="-i"||argVec[i]=="--interactive")
+			interactive = true;
+		else if (argVec[i].starts_with("-")){
+			std::cout << "Unknown command line arg " << argVec[i] << "\n";
+			return 1;
+		}
 		else
 			fileNames.push_back(argVec[i]);
 	}
@@ -73,13 +109,21 @@ int main(int argc,char** argv){
 		else
 			return 1;
 		
+		if (cmdlineProg&&interp.errors.empty())
+			std::cout << *res << '\n';
+			
 		if (showInfo)
 			PrintInfo();
+			
+		if (interactive){
+			if (res)
+				interp.SetGlobalSymbol("_",res);
+			ReplLoop(&interp);
+		}
+		
 		if (!interp.errors.empty())
 			return 1;
 			
-		if (cmdlineProg)
-			std::cout << *res << '\n';
 	}
 	
 	return 0;

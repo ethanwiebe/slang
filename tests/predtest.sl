@@ -44,6 +44,7 @@
 (assert !(errored? '(+ 3 4)))
 (assert (errored? '(+ 3 'hello)))
 (assert !(errored? '(set! t ())))
+(assert !(eof? ()))
 (assert (null? t))
 (assert (> 3 2))
 (assert !(> 3 3))

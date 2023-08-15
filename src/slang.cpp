@@ -139,7 +139,6 @@ inline size_t SlangHeader::GetSize() const {
 		case SlangType::Int:
 		case SlangType::Real:
 		case SlangType::Symbol:
-		case SlangType::Bool:
 		case SlangType::Maybe:
 			return sizeof(SlangObj);
 		case SlangType::Lambda:
@@ -147,6 +146,7 @@ inline size_t SlangHeader::GetSize() const {
 		case SlangType::List:
 			return sizeof(SlangList);
 		case SlangType::EndOfFile:
+		case SlangType::Bool:
 			return sizeof(SlangHeader);
 		case SlangType::NullType:
 			assert(false);
@@ -846,10 +846,11 @@ inline SlangObj* SlangInterpreter::MakeReal(double r){
 	return obj;
 }
 
-inline SlangObj* SlangInterpreter::MakeBool(bool b){
-	SlangObj* obj = AllocateSmallObj();
-	obj->header.type = SlangType::Bool;
-	obj->boolean = b;
+inline SlangHeader* SlangInterpreter::MakeBool(bool b){
+	SlangHeader* obj = (SlangHeader*)Allocate(sizeof(SlangHeader));
+	obj->type = SlangType::Bool;
+	obj->flags = 0;
+	obj->boolVal = b;
 	return obj;
 }
 
@@ -1711,7 +1712,7 @@ inline bool ConvertToBool(const SlangHeader* obj,bool& res){
 			res = false;
 			return true;
 		case SlangType::Bool:
-			res = ((SlangObj*)obj)->boolean;
+			res = obj->boolVal;
 			return true;
 		case SlangType::Int:
 			res = (bool)((SlangObj*)obj)->integer;
@@ -3439,12 +3440,13 @@ bool EqualObjs(const SlangHeader* a,const SlangHeader* b){
 				return EqualObjs(((SlangObj*)a)->maybe,((SlangObj*)b)->maybe);
 			case SlangType::Int:
 			case SlangType::Real:
-			case SlangType::Bool:
 			case SlangType::Symbol:
 				// union moment
 				return ((SlangObj*)a)->integer==((SlangObj*)b)->integer;
 			case SlangType::EndOfFile:
 				return true;
+			case SlangType::Bool:
+				return a->boolVal==b->boolVal;
 			case SlangType::InputStream:
 			case SlangType::OutputStream:
 				if (a->isFile!=b->isFile)
@@ -3524,12 +3526,13 @@ inline bool IdenticalObjs(const SlangHeader* l,const SlangHeader* r){
 			return ((SlangObj*)l)->maybe==((SlangObj*)r)->maybe;
 		case SlangType::Int:
 		case SlangType::Real:
-		case SlangType::Bool:
 		case SlangType::Symbol:
 			// union moment
 			return ((SlangObj*)l)->integer==((SlangObj*)r)->integer;
 		case SlangType::EndOfFile:
 			return true;
+		case SlangType::Bool:
+			return l->boolVal==r->boolVal;
 	}
 	
 	return false;
@@ -4925,6 +4928,12 @@ inline SlangObj* SlangParser::CodeAllocObj(){
 	return obj;
 }
 
+inline SlangHeader* SlangParser::CodeAllocHeader(){
+	SlangHeader* obj = (SlangHeader*)CodeAlloc(sizeof(SlangHeader));
+	obj->flags = 0;
+	return obj;
+}
+
 inline SlangStr* SlangParser::CodeAllocStr(size_t size){
 	size_t qsize = QuantizeSize(size);
 	SlangStorage* storage = (SlangStorage*)CodeAlloc(sizeof(SlangStorage)+sizeof(uint8_t)*qsize);
@@ -5085,20 +5094,20 @@ inline bool SlangParser::ParseObj(SlangHeader** res){
 		}
 		case SlangTokenType::True: {
 			NextToken();
-			SlangObj* boolObj = CodeAllocObj();
-			boolObj->header.type = SlangType::Bool;
-			boolObj->boolean = true;
-			codeMap[(SlangHeader*)boolObj] = loc;
-			*res = (SlangHeader*)boolObj;
+			SlangHeader* boolObj = CodeAllocHeader();
+			boolObj->type = SlangType::Bool;
+			boolObj->boolVal = true;
+			codeMap[boolObj] = loc;
+			*res = boolObj;
 			return true;
 		}
 		case SlangTokenType::False: {
 			NextToken();
-			SlangObj* boolObj = CodeAllocObj();
-			boolObj->header.type = SlangType::Bool;
-			boolObj->boolean = false;
-			codeMap[(SlangHeader*)boolObj] = loc;
-			*res = (SlangHeader*)boolObj;
+			SlangHeader* boolObj = CodeAllocHeader();
+			boolObj->type = SlangType::Bool;
+			boolObj->boolVal = false;
+			codeMap[boolObj] = loc;
+			*res = boolObj;
 			return true;
 		}
 		case SlangTokenType::Quote: {
@@ -5516,7 +5525,7 @@ std::ostream& operator<<(std::ostream& os,const SlangHeader& obj){
 			break;
 		}
 		case SlangType::Bool:
-			if (((SlangObj*)&obj)->boolean){
+			if (obj.boolVal){
 				os << "true";
 			} else {
 				os << "false";

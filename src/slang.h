@@ -44,8 +44,6 @@ namespace slang {
 	
 	enum SlangFlag {
 		FLAG_FORWARDED =          0b1,
-		FLAG_TENURED =           0b10,
-		FLAG_BOOL_VALUE =       0b100,
 		FLAG_VARIADIC =        0b1000,
 		FLAG_MAYBE_OCCUPIED = 0b10000
 	};
@@ -59,6 +57,7 @@ namespace slang {
 					uint16_t varCount;
 					uint16_t elemSize;
 					uint8_t isFile;
+					uint8_t boolVal;
 					uint8_t padding[6];
 				};
 			};
@@ -199,7 +198,6 @@ namespace slang {
 			SymbolName symbol;
 			int64_t integer;
 			double real;
-			bool boolean;
 			SlangHeader* maybe;
 		};
 	};
@@ -340,9 +338,6 @@ namespace slang {
 		uint8_t* codePointer = nullptr;
 		uint8_t* codeEnd = nullptr;
 		
-		size_t codeCount;
-		size_t codeIndex;
-		
 		std::unordered_map<const SlangHeader*,LocationData> codeMap;
 		
 		SlangParser();
@@ -355,6 +350,7 @@ namespace slang {
 		inline SlangList* WrapExprSplice(SymbolName func,SlangList* expr);
 		inline SlangHeader* WrapProgram(const std::vector<SlangHeader*>&);
 		inline void* CodeAlloc(size_t);
+		SlangHeader* CodeAllocHeader();
 		SlangObj* CodeAllocObj();
 		SlangStr* CodeAllocStr(size_t);
 		SlangList* CodeAllocList();
@@ -574,7 +570,7 @@ namespace slang {
 		inline SlangObj* MakeMaybe(SlangHeader*,bool);
 		inline SlangObj* MakeInt(int64_t);
 		inline SlangObj* MakeReal(double);
-		inline SlangObj* MakeBool(bool);
+		inline SlangHeader* MakeBool(bool);
 		inline SlangParams* MakeParams(const std::vector<SymbolName>&);
 		inline SlangLambda* MakeLambda(
 			SlangHeader* expr,

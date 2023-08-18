@@ -1,0 +1,16 @@
+; math test
+(assert (< (+ 2 3) (-- 10)))
+(assert (<= (+ 2 3) (-- 10)))
+(assert !(> (+ 2 3) (-- 10)))
+(assert !(>= (+ 2 3) (-- 10)))
+(assert (= (floor 3.2) 3))
+(assert (= (ceil 2.2) 3))
+(assert (= (floor -3.2) -4))
+(assert (= (ceil -30.2) -30))
+(assert (= (ceil -30) -30))
+(assert (= (floor 32) 32))
+(assert (= (floor 0.0) 0.0))
+(assert (= (ceil 0.0) 0.0))
+(assert (= (% (+ 100 2) 10) 2))
+
+(output "math passed\n")

@@ -454,9 +454,9 @@ namespace slang {
 		inline bool MulReals(SlangHeader** res,double curr);
 		bool GetLetParams(
 			std::vector<SymbolName>& params,
-			std::vector<SlangHeader*>& exprs,
 			SlangList* paramIt
 		);
+		inline bool GetTwoIntArgs(SlangObj** l,SlangObj** r);
 		
 		inline bool SlangFuncDefine(SlangHeader** res);
 		inline bool SlangFuncLambda(SlangHeader** res);
@@ -472,9 +472,19 @@ namespace slang {
 		inline bool SlangFuncSub(SlangHeader** res);
 		inline bool SlangFuncMul(SlangHeader** res);
 		inline bool SlangFuncDiv(SlangHeader** res);
+		inline bool SlangFuncFloorDiv(SlangHeader** res);
 		inline bool SlangFuncMod(SlangHeader** res);
 		inline bool SlangFuncPow(SlangHeader** res);
 		inline bool SlangFuncAbs(SlangHeader** res);
+		inline bool SlangFuncFloor(SlangHeader** res);
+		inline bool SlangFuncCeil(SlangHeader** res);
+		
+		inline bool SlangFuncBitAnd(SlangHeader** res);
+		inline bool SlangFuncBitOr(SlangHeader** res);
+		inline bool SlangFuncBitXor(SlangHeader** res);
+		inline bool SlangFuncBitNot(SlangHeader** res);
+		inline bool SlangFuncBitLeftShift(SlangHeader** res);
+		inline bool SlangFuncBitRightShift(SlangHeader** res);
 		
 		inline bool SlangFuncGT(SlangHeader** res);
 		inline bool SlangFuncLT(SlangHeader** res);

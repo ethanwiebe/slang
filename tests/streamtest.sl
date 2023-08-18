@@ -47,7 +47,8 @@
 (def numStr "My number: ")
 (def outS (make-str-ostream numStr))
 (output-to! outS 37 "test")
-(assert (= "My number: 37test" numStr))
+(output-to! outS 'testSym " " 'def)
+(assert (= "My number: 37testtestSym def" numStr))
 
 
 (output "stream passed\n")

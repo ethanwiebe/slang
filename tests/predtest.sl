@@ -51,4 +51,18 @@
 (assert (>= 3 3))
 (assert (> 3 2.99999))
 
+(assert (is (and true () false) ()))
+(assert (is (and 1 2 3 0 4) 0))
+(assert (is (and 1 2 3 4) 4))
+(assert (is (and) true))
+(assert (is (or) false))
+(assert (is (or 1 2 3) 1))
+(assert (is (or 0 false () 3 false) 3))
+(assert (is (or 0 false () 0) 0))
+(assert (= 1 (cond (true 1) (false 2))))
+(assert (= 2 (cond (false 1) (true 2))))
+(assert (= 3 (cond (false 1) (false 2) (else 3))))
+(assert (= 'yes (case (+ 1 2) ((1 2 4) 'no) (() 'hidden) ((5 3 6) 'yes))))
+(assert (= 'hello (case (+ 1 2) ((1 2 4) 'no) ((5 7 6) 'yes) (else 'hello))))
+
 (output "predicate passed\n")

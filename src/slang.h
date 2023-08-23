@@ -9,6 +9,7 @@
 #include <ostream>
 #include <memory>
 #include <assert.h>
+#include <functional>
 
 #define SMALL_SET_SIZE 32768
 #define LARGE_SET_SIZE SMALL_SET_SIZE*4
@@ -220,6 +221,29 @@ namespace slang {
 		return expr->type;
 	}
 	
+	inline bool IsConstant(const SlangHeader* o){
+		switch (GetType(o)){
+			case SlangType::NullType:
+			case SlangType::Int:
+			case SlangType::Real:
+			case SlangType::Env:
+			case SlangType::Params:
+			case SlangType::Lambda:
+			case SlangType::InputStream:
+			case SlangType::OutputStream:
+			case SlangType::EndOfFile:
+			case SlangType::Maybe:
+			case SlangType::Bool:
+			case SlangType::Vector:
+			case SlangType::String:
+			case SlangType::Storage:
+				return true;
+			case SlangType::List:
+			case SlangType::Symbol:
+				return false;
+		}
+		return false;
+	}
 	
 	inline bool IsNumeric(const SlangHeader* o){
 		return GetType(o)==SlangType::Int || GetType(o)==SlangType::Real;
@@ -270,6 +294,27 @@ namespace slang {
 			return obj>=&currSet[0] && 
 					obj<(&currSet[0]+memSize/2);
 		}
+	};
+	
+	typedef std::function<void*(size_t)> AllocFunc;
+	struct SlangAllocator {
+		AllocFunc alloc;
+		
+		inline SlangObj* AllocateObj(SlangType);
+		inline SlangLambda* AllocateLambda();
+		inline SlangList* AllocateList();
+		inline SlangParams* AllocateParams(size_t);
+		inline SlangEnv* AllocateEnv();
+		inline SlangStorage* AllocateStorage(size_t size,uint16_t elemSize);
+		inline SlangStr* AllocateStr(size_t);
+		inline SlangStream* AllocateStream(SlangType);
+		
+		inline SlangObj* MakeInt(int64_t);
+		inline SlangObj* MakeReal(double);
+		inline SlangObj* MakeSymbol(SymbolName);
+		inline SlangHeader* MakeBool(bool);
+		inline SlangParams* MakeParams(const std::vector<SymbolName>&);
+		inline SlangHeader* MakeEOF();
 	};
 	
 	typedef std::string_view::const_iterator StringIt;
@@ -333,7 +378,10 @@ namespace slang {
 		SymbolName currentName;
 		std::vector<ErrorData> errors;
 		
+		SlangAllocator alloc;
 		size_t codeSize = 0;
+		size_t totalAlloc = 0;
+		std::vector<uint8_t*> codeSets;
 		uint8_t* codeStart = nullptr;
 		uint8_t* codePointer = nullptr;
 		uint8_t* codeEnd = nullptr;
@@ -350,11 +398,7 @@ namespace slang {
 		inline SlangList* WrapExprSplice(SymbolName func,SlangList* expr);
 		inline SlangHeader* WrapProgram(const std::vector<SlangHeader*>&);
 		inline void* CodeAlloc(size_t);
-		SlangHeader* CodeAllocHeader();
-		SlangObj* CodeAllocObj();
-		SlangStr* CodeAllocStr(size_t);
-		SlangList* CodeAllocList();
-		
+		inline void CodeRealloc(size_t);
 		inline LocationData GetExprLocation(const SlangHeader*);
 		
 		std::string GetSymbolString(SymbolName name);
@@ -382,6 +426,7 @@ namespace slang {
 	struct SlangInterpreter {
 		SlangParser parser;
 		MemArena* arena;
+		SlangAllocator alloc;
 		size_t envIndex,exprIndex,argIndex,frameIndex;
 		
 		SymbolName genIndex;
@@ -456,11 +501,14 @@ namespace slang {
 			std::vector<SymbolName>& params,
 			SlangList* paramIt
 		);
+		inline bool PreprocessApplyArgs(SlangList*,SlangList**);
 		inline bool GetTwoIntArgs(SlangObj** l,SlangObj** r);
+		inline bool MapInnerLoop(size_t,size_t,size_t,size_t&);
 		
 		inline bool SlangFuncDefine(SlangHeader** res);
 		inline bool SlangFuncLambda(SlangHeader** res);
 		inline bool SlangFuncSet(SlangHeader** res);
+		inline bool SlangFuncMap(SlangHeader** res);
 		inline bool SlangFuncQuote(SlangHeader** res);
 		inline bool SlangFuncNot(SlangHeader** res);
 		inline bool SlangFuncNegate(SlangHeader** res);
@@ -557,15 +605,8 @@ namespace slang {
 		bool Run(SlangHeader* prog,SlangHeader** res);
 		
 		inline void* Allocate(size_t);
-		inline SlangObj* AllocateSmallObj();
-		inline SlangStorage* AllocateStorage(size_t,uint16_t,SlangHeader* fill=nullptr);
-		inline SlangVec* AllocateVec(size_t,SlangHeader* fill=nullptr);
-		inline SlangStr* AllocateStr(size_t);
-		inline SlangEnv* AllocateEnv(size_t);
-		inline SlangList* AllocateList();
-		inline SlangStream* AllocateStream(SlangType streamType);
-		inline SlangLambda* AllocateLambda();
-		inline SlangParams* AllocateParams(size_t);
+		inline SlangStorage* MakeStorage(size_t,uint16_t,SlangHeader* fill=nullptr);
+		inline SlangEnv* AllocateEnvs(size_t);
 		inline SlangStr* ReallocateStr(SlangStr*,size_t);
 		inline SlangStream* ReallocateStream(SlangStream*,size_t);
 		inline void ReallocSet(size_t newSize);
@@ -578,22 +619,17 @@ namespace slang {
 		inline SlangEnv* CreateEnv(size_t);
 		
 		inline SlangObj* MakeMaybe(SlangHeader*,bool);
-		inline SlangObj* MakeInt(int64_t);
-		inline SlangObj* MakeReal(double);
-		inline SlangHeader* MakeBool(bool);
-		inline SlangParams* MakeParams(const std::vector<SymbolName>&);
 		inline SlangLambda* MakeLambda(
 			SlangHeader* expr,
 			const std::vector<SymbolName>& args,
 			bool variadic,
 			bool extraSlot=false);
-		inline SlangObj* MakeSymbol(SymbolName);
-		inline SlangHeader* MakeEOF();
 		inline SlangStream* MakeStringInputStream(SlangStr*);
 		inline SlangStream* MakeStringOutputStream(SlangStr*);
 		inline SlangList* MakeList(const std::vector<SlangHeader*>&,size_t start=0,size_t end=-1ULL);
 		inline void ConcatLists(SlangList* a,SlangList* b) const;
-		inline SlangVec* MakeVec(const std::vector<SlangHeader*>&,size_t start=0,size_t end=-1ULL);
+		inline SlangVec* MakeVecFromVec(const std::vector<SlangHeader*>&,size_t start=0,size_t end=-1ULL);
+		inline SlangVec* MakeVec(size_t,SlangHeader*);
 	};
 	
 	extern SlangParser* gDebugParser;

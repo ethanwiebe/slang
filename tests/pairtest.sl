@@ -12,7 +12,7 @@
 ; testing setL
 (def testquote (& ()
 	(let (
-		(x (list '(1 2) '(3 4)))
+		(x (list (list 1 2) (list 3 4)))
 		(y (L x))
 		)
 		
@@ -39,5 +39,15 @@
 (set! v1 21)
 (assert (= v2 20))
 (assert (= v1 21))
+
+(assert (= '((1 2) 3 4) (apply pair '((1 2) (3 4)))))
+(assert (= '((1 2) 3 4) (apply pair '((1 2) (3 4)))))
+(assert (= '(a . b) (apply pair '(a b))))
+(assert (= '(a . b) (apply pair 'a '(b))))
+(assert (= '((1 . 3) (2 . 4)) (map pair (list 1 2) (list 3 4))))
+(assert (= '(((1 2) 3 4)) (map pair '((1 2)) '((3 4)))))
+(assert (= '((a . d) (b . e) (c . f)) (map pair '(a b c) '(d e f))))
+
+(def ptest (parse "'(1 2 (a b) 4 5)"))
 
 (output "pair passed\n")

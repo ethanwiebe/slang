@@ -8,8 +8,24 @@ using namespace slang;
 
 inline size_t BracketsAreComplete(const std::string& str){
 	ssize_t score = 0;
+	bool inStr = false;
+	bool escapeNext = false;
 	for (auto c : str){
-		if (c=='('||c=='['||c=='{')
+		if (inStr){
+			if (escapeNext){
+				escapeNext = false;
+				continue;
+			}
+			if (c=='"'){
+				inStr = false;
+			} else if (c=='\\'){
+				escapeNext = true;
+			}
+			
+			continue;
+		}
+		if (c=='"') inStr = true;
+		else if (c=='('||c=='['||c=='{')
 			++score;
 		else if (c==')'||c==']'||c=='}')
 			--score;

@@ -189,7 +189,7 @@
 (print var)
 (print var2)
 
-(def limited-use (& (func max)
+;-(def limited-use (& (func max)
 	(let ((count max))
 		(& args 
 		(print args)
@@ -209,7 +209,7 @@
 (print (limit-add 2 3))
 (print (limit-add 2 3))
 (print (limit-add 2 3))
-
+-;
 (print (parse "(+ 100 3"))
 
 (print (try abcd))

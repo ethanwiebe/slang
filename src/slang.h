@@ -427,10 +427,9 @@ namespace slang {
 		SlangParser parser;
 		MemArena* arena;
 		SlangAllocator alloc;
-		size_t envIndex,exprIndex,argIndex,frameIndex;
-		
 		SymbolName genIndex;
 		
+		size_t envIndex,exprIndex,argIndex,frameIndex;
 		std::vector<SlangHeader*> funcArgStack;
 		std::vector<SlangEnv*> envStack;
 		std::vector<SlangHeader*> exprStack;
@@ -541,6 +540,8 @@ namespace slang {
 		
 		inline bool SlangFuncUnwrap(SlangHeader** res);
 		inline bool SlangFuncList(SlangHeader** res);
+		inline bool SlangFuncListGet(SlangHeader** res);
+		inline bool SlangFuncListSet(SlangHeader** res);
 		inline bool SlangFuncVec(SlangHeader** res);
 		inline bool SlangFuncVecAlloc(SlangHeader** res);
 		inline bool SlangFuncVecSize(SlangHeader** res);

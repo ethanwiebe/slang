@@ -73,6 +73,8 @@ enum SlangGlobalSymbol {
 	SLANG_NOT,
 	SLANG_NEG,
 	SLANG_LIST,
+	SLANG_LIST_GET,
+	SLANG_LIST_SET,
 	SLANG_OUTPUT_TO,
 	SLANG_INPUT_FROM,
 	SLANG_VEC,
@@ -164,6 +166,8 @@ SymbolNameDict gDefaultNameDict = {
 	{"output-to!",SLANG_OUTPUT_TO},
 	{"input-from!",SLANG_INPUT_FROM},
 	{"list",SLANG_LIST},
+	{"list-get",SLANG_LIST_GET},
+	{"list-set!",SLANG_LIST_SET},
 	{"vec",SLANG_VEC},
 	{"vec-alloc",SLANG_VEC_ALLOC},
 	{"vec-get",SLANG_VEC_GET},
@@ -2167,6 +2171,92 @@ inline bool SlangInterpreter::SlangFuncList(SlangHeader** res){
 	SlangList* listObj = MakeList(funcArgStack,frameStart,frameIndex);
 	*res = (SlangHeader*)listObj;
 	frameIndex = frameStart;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncListGet(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	SlangHeader* listObj;
+	if (!WrappedEvalExpr(argIt->left,&listObj))
+		return false;
+	
+	if (!IsList(listObj)){
+		TypeError(GetCurrArg()->left,GetType(listObj),SlangType::List);
+		return false;
+	}
+	
+	StackAddArg(listObj);
+	
+	NEXT_ARG();
+	argIt = GetCurrArg();
+	SlangHeader* indexObj;
+	if (!WrappedEvalExpr(argIt->left,&indexObj))
+		return false;
+	
+	TYPE_CHECK_EXACT(indexObj,SlangType::Int);
+	
+	int64_t val = ((SlangObj*)indexObj)->integer;
+	int64_t originalVal = val;
+	SlangList* list = (SlangList*)funcArgStack[--frameIndex];
+	while (val){
+		if (GetType(list->right)!=SlangType::List) break;
+		list = (SlangList*)list->right;
+		--val;
+	}
+	
+	if (val!=0){
+		IndexError(GetCurrArg()->left,originalVal-val,originalVal);
+		return false;
+	}
+	
+	*res = list->left;
+	return true;
+}
+
+inline bool SlangInterpreter::SlangFuncListSet(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	SlangHeader* listObj;
+	if (!WrappedEvalExpr(argIt->left,&listObj))
+		return false;
+	
+	if (!IsList(listObj)){
+		TypeError(GetCurrArg()->left,GetType(listObj),SlangType::List);
+		return false;
+	}
+	
+	StackAddArg(listObj);
+	
+	NEXT_ARG();
+	argIt = GetCurrArg();
+	SlangHeader* indexObj;
+	if (!WrappedEvalExpr(argIt->left,&indexObj))
+		return false;
+	
+	TYPE_CHECK_EXACT(indexObj,SlangType::Int);
+	
+	int64_t val = ((SlangObj*)indexObj)->integer;
+	int64_t originalVal = val;
+	
+	NEXT_ARG();
+	argIt = GetCurrArg();
+	SlangHeader* placeObj;
+	if (!WrappedEvalExpr(argIt->left,&placeObj))
+		return false;
+	
+	SlangList* list = (SlangList*)funcArgStack[--frameIndex];
+	while (val){
+		if (GetType(list->right)!=SlangType::List) break;
+		list = (SlangList*)list->right;
+		--val;
+	}
+	
+	if (val!=0){
+		IndexError(GetCurrArg()->left,originalVal-val,originalVal);
+		return false;
+	}
+	
+	list->left = placeObj;
+	*res = placeObj;
 	return true;
 }
 
@@ -4855,6 +4945,14 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 						case SLANG_LIST:
 							success = SlangFuncList(res);
 							return success;
+						case SLANG_LIST_GET:
+							ARITY_EXACT_CHECK(2);
+							success = SlangFuncListGet(res);
+							return success;
+						case SLANG_LIST_SET:
+							ARITY_EXACT_CHECK(3);
+							success = SlangFuncListSet(res);
+							return success;
 						case SLANG_VEC:
 							success = SlangFuncVec(res);
 							return success;
@@ -5312,10 +5410,8 @@ void SlangInterpreter::ZeroDivisionError(const SlangHeader* head){
 void PrintInfo(){
 	std::cout << "Alloc balance: " << gAllocCount << '\n';
 	std::cout << "Alloc total: " << gAllocTotal << " (" << gAllocTotal/1024 << " KB)\n";
-	//std::cout << "Tenure count: " << gTenureCount << " (" << gTenureCount*sizeof(SlangObj)/1024 << " KB)\n";
-	//std::cout << "Tenure set count: " << tenureCount << '\n';
-	size_t codeSize = gDebugParser->codePointer-gDebugParser->codeStart;
-	std::cout << "Code alloc total: " << codeSize << " (" << codeSize/1024 << " KB)\n";
+	size_t totalAlloc = gDebugParser->totalAlloc;
+	std::cout << "Code alloc total: " << totalAlloc << " (" << totalAlloc/1024 << " KB)\n";
 	std::cout << "Eval count: " << gEvalCounter << '\n';
 	std::cout << "Non-eliminated eval count: " << gEvalRecurCounter << '\n';
 	std::cout << "Max stack height: " << gMaxStackHeight << '\n';

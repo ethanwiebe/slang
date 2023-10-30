@@ -17,7 +17,7 @@
 	)
 )
 
-(def (list-get l index)
+;-(def (list-get l index)
 	(let loop ((i 0) (curr l))
 		(if (= i index)
 			(L curr)
@@ -33,7 +33,7 @@
 			(loop (++ i) (R curr))
 		)
 	)
-)
+)-;
 
 (def (min x y)
 	(cond
@@ -49,15 +49,15 @@
 	)
 )
 
-;-(def (list-swap! l i1 i2)
+(def (list-swap! l i1 i2)
 	(let ((tmp (list-get l i1)))
 		(list-set! l i1 (list-get l i2))
 		(list-set! l i2 tmp)
 		l
 	)
-)-;
+)
 
-(def (list-swap-sub l lIt elem i2)
+;-(def (list-swap-sub l lIt elem i2)
 	(let loop ((it lIt) (j2 i2))
 		(if (= 0 j2)
 			(do
@@ -80,7 +80,7 @@
 		)
 	
 	)
-)
+)-;
 
 (def (list-rev l)
 	(let loop ((newL ()) (oldL l))
@@ -415,15 +415,15 @@
 	)
 )
 
-(def (test-algo-cycle algo)
+(def (test-alg-cycle algo)
 	(let ((c (make-cube)) (blank-c (make-cube)))
 		(let loop ((curr (apply-algorithm! c algo)) (i 1))
 			(if (= curr blank-c)
 				i
 				(do
 					(apply-algorithm! curr algo)
-					(output i "\n")
-					(display-cube c)
+					;(output i "\n")
+					;(display-cube c)
 					(loop curr (++ i))
 				)
 			)
@@ -435,7 +435,7 @@
 (def test-alg '(F2 L2 D2 U2 B L2 D2 F U2 F' U2 R' D L D B U L D2 L' U))
 (def t-perm '(R U R' U' R' F R2 U' R' U' R U R' F'))
 (def long-alg '(R U2 D' B D'))
-(apply-algorithm! c test-alg)
+;(apply-algorithm! c test-alg)
 ;(apply-algorithm! c (invert-algorithm test-alg))
 
 (def (output-alg alg)
@@ -447,6 +447,7 @@
 		)
 	)
 )
-(output-alg test-alg)
-(output "\n")
-(display-cube c)
+;(output-alg test-alg)
+;(output "\n")
+;(display-cube c)
+(test-alg-cycle long-alg)

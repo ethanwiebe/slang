@@ -158,7 +158,7 @@
 )
 
 (def (get-rand-year)
-	(rand-between! 0 3000)
+	(rand-between! 1 3001)
 )
 
 (def (get-rand-date)
@@ -211,7 +211,7 @@
 	)
 )
 
-; pb = 4:53.119s
+; pb = 3:49.219s
 (def (timed-day-trainer)
 	(output "---day trainer time challenge---\n")
 	(output "try and see how fast you can determine ten dates!\n")

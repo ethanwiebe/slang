@@ -118,12 +118,13 @@ int main(int argc,char** argv){
 			code = fileName;
 		}
 		SlangInterpreter interp = {};
+		interp.filenameStack[0] = fileName;
 		SlangHeader* res;
 		SlangHeader* program = interp.Parse(code);
-		if (program)
-			interp.Run(program,&res);
-		else
+		if (!program)
 			return 1;
+			
+		interp.Run(program,&res);
 		
 		if (cmdlineProg&&interp.errors.empty())
 			std::cout << *res << '\n';

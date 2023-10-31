@@ -4,6 +4,7 @@
 #include <iostream>
 #include <cstring>
 #include <sstream>
+#include <fstream>
 #include <math.h>
 #include <time.h>
 #include <chrono>
@@ -12,6 +13,7 @@
 
 #define GEN_FLAG (1ULL<<63)
 #define LET_SELF_SYM (GEN_FLAG)
+#define SLANG_FILE_EXT ".sl"
 
 namespace slang {
 
@@ -137,6 +139,8 @@ enum SlangGlobalSymbol {
 	SLANG_IS_MAYBE,
 	SLANG_IS_BOUND,
 	SLANG_IS_EOF,
+	SLANG_EXPORT,
+	SLANG_IMPORT,
 	GLOBAL_SYMBOL_COUNT
 };
 
@@ -227,15 +231,21 @@ SymbolNameDict gDefaultNameDict = {
 	{"vec?",SLANG_IS_VECTOR},
 	{"maybe?",SLANG_IS_MAYBE},
 	{"bound?",SLANG_IS_BOUND},
-	{"eof?",SLANG_IS_EOF}
+	{"eof?",SLANG_IS_EOF},
+	{"export",SLANG_EXPORT},
+	{"import",SLANG_IMPORT}
 };
-
 
 void PrintErrors(const std::vector<ErrorData>& errors){
 	for (auto it=errors.rbegin();it!=errors.rend();++it){
 		auto error = *it;
-		std::cout << "@" << error.loc.line+1 << ',' << error.loc.col+1 <<
-			":\n" << error.message << '\n';
+		if (error.loc.filename)
+			std::cout << error.loc.filename;
+		else
+			std::cout << "<eval>";
+		std::cout << ":" << 
+			error.loc.line+1 << ',' << error.loc.col+1 <<
+			"\n" << error.message << '\n';
 	}
 }
 
@@ -828,6 +838,10 @@ inline void SlangInterpreter::ReallocSet(size_t newSize){
 		SlangWalkRefs(obj,&ForwardObjWalker,nullptr);
 	}
 	
+	for (size_t i=0;i<=exportIndex;++i){
+		if (exportStack[i] && exportStack[i]->header.IsForwarded())
+			exportStack[i] = (SlangEnv*)exportStack[i]->header.GetForwardAddress();
+	}
 	for (size_t i=0;i<frameIndex;++i){
 		if (funcArgStack[i] && funcArgStack[i]->IsForwarded())
 			funcArgStack[i] = funcArgStack[i]->GetForwardAddress();
@@ -874,6 +888,10 @@ inline void SlangInterpreter::SmallGC(size_t allocAttempt){
 	for (size_t i=1;i<=exprIndex;++i){
 		EvacuateOrForward(&exprStack[i],&data);
 		EvacuateOrForward((SlangHeader**)&argStack[i],&data);
+	}
+	
+	for (size_t i=0;i<=exportIndex;++i){
+		EvacuateOrForward((SlangHeader**)&exportStack[i],&data);
 	}
 	
 	Scavenge(read,&data);
@@ -4128,13 +4146,6 @@ inline bool SlangInterpreter::SlangFuncIs(SlangHeader** res){
 	return true;
 }
 
-inline void SlangInterpreter::StackAddArg(SlangHeader* arg){
-	assert(frameIndex<funcArgStack.size());
-	
-	gMaxStackHeight = (gMaxStackHeight<frameIndex) ? frameIndex : gMaxStackHeight;
-	funcArgStack[frameIndex++] = arg;
-}
-
 inline void SlangInterpreter::PushEnv(SlangEnv* env){
 	if (envIndex>=envStack.size()-1){
 		envStack.resize(envStack.size()*3/2);
@@ -4145,6 +4156,32 @@ inline void SlangInterpreter::PushEnv(SlangEnv* env){
 inline void SlangInterpreter::PopEnv(){
 	assert(envIndex!=0);
 	--envIndex;
+}
+
+inline void SlangInterpreter::PushExportEnv(){
+	if (exportIndex>=exportStack.size()-1)
+		exportStack.resize(exportStack.size()*3/2);
+	
+	SlangEnv* e = AllocateEnvs(4);
+	e->parent = nullptr;
+	exportStack[++exportIndex] = e;
+}
+
+inline void SlangInterpreter::PopExportEnv(){
+	--exportIndex;
+	assert(exportIndex>0);
+}
+
+void SlangInterpreter::PushFilename(const std::string& name){
+	if (filenameIndex>=filenameStack.size()-1)
+		filenameStack.resize(filenameStack.size()*3/2);
+	
+	filenameStack[++filenameIndex] = name;
+}
+
+void SlangInterpreter::PopFilename(){
+	--filenameIndex;
+	assert(filenameIndex>=0);
 }
 
 inline void SlangInterpreter::PushArg(SlangList* list){
@@ -4184,6 +4221,123 @@ inline void SlangInterpreter::PopExpr(){
 	assert(exprIndex!=0);
 	PopArg();
 	--exprIndex;
+}
+
+inline bool SlangInterpreter::SlangFuncExport(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	SlangHeader* symObj = argIt->left;
+	TYPE_CHECK_EXACT(symObj,SlangType::Symbol);
+	SlangObj* sym = (SlangObj*)symObj;
+	SlangEnv* currEnv = GetCurrEnv();
+	SlangHeader* val;
+	if (!GetRecursiveSymbol(currEnv,sym->symbol,&val)){
+		UndefinedError(symObj);
+		return false;
+	}
+	
+	DefEnvSymbol(exportStack[exportIndex],sym->symbol,val);
+	*res = nullptr;
+	return true;
+}
+
+inline void SlangInterpreter::ImportEnv(SlangEnv* env){
+	SlangEnv* currEnv = GetCurrEnv();
+	while (true){
+		for (size_t i=0;i<env->header.varCount;++i){
+			if (!currEnv->SetSymbol(env->mappings[i].sym,env->mappings[i].obj)){
+				DefEnvSymbol(currEnv,env->mappings[i].sym,env->mappings[i].obj);
+			}
+		}
+		if (!env->next) break;
+		env = env->next;
+	}
+}
+
+inline bool IsValidPathPart(const std::string& s){
+	if (strncmp(s.c_str(),"..",3)==0) return true;
+	
+	for (char c : s){
+		if (c=='/'||c=='\\'||c==' '||c=='?'||c=='*'||
+			c=='|'||c=='!'||c=='#'||c=='%'||c=='^'||
+			c=='&'||c=='@'||c=='+'||c=='='||c=='`'||
+			c=='~'||c=='<'||c=='>'||c=='.')
+			return false;
+	}
+	return true;
+}
+
+inline bool SlangInterpreter::GetImportName(SlangList* nameList,std::string& path){
+	SlangObj* sym;
+	while (nameList){
+		TYPE_CHECK_EXACT((SlangHeader*)nameList,SlangType::List);
+		TYPE_CHECK_EXACT(nameList->left,SlangType::Symbol);
+		sym = (SlangObj*)nameList->left;
+		std::string symbolStr = parser.GetSymbolString(sym->symbol);
+		
+		if (!IsValidPathPart(symbolStr)){
+			ImportError(nameList->left,"Invalid import path symbol!");
+			return false;
+		}
+		
+		if (!path.empty())
+			path += '/';
+		path += symbolStr;
+		
+		nameList = (SlangList*)nameList->right;
+	}
+	
+	return true;
+}
+
+inline std::string GetBaseDir(const std::string& path){
+	size_t lastSlash = path.rfind('/');
+	if (lastSlash==std::string::npos) 
+		return {};
+	return path.substr(0,lastSlash);
+}
+
+inline bool SlangInterpreter::SlangFuncImport(SlangHeader** res){
+	SlangList* argIt = GetCurrArg();
+	std::string importName = GetBaseDir(filenameStack[filenameIndex]);
+	if (!GetImportName(argIt,importName))
+		return false;
+	importName += SLANG_FILE_EXT;
+	
+	std::ifstream f{importName,std::ios::ate};
+	if (!f){
+		FileError(argIt->left,"File does not exist!");
+		return false;
+	}
+	auto size = f.tellg();
+	f.seekg(0);
+	std::string code = std::string(size,'\0');
+	f.read(&code[0],size);
+	
+	PushFilename(importName);
+	SlangHeader* prog = Parse(code);
+	if (!prog){
+		PopFilename();
+		return false;
+	}
+	PushExportEnv();
+	SlangEnv* newEnv = AllocateEnvs(4);
+	newEnv->parent = nullptr;
+	PushEnv(newEnv);
+	WrappedEvalExpr(prog,res);
+	PopEnv();
+	PopFilename();
+	ImportEnv(exportStack[exportIndex]);
+	PopExportEnv();
+	if (!errors.empty()) return false;
+	
+	return true;
+}
+
+inline void SlangInterpreter::StackAddArg(SlangHeader* arg){
+	assert(frameIndex<funcArgStack.size());
+	
+	gMaxStackHeight = (gMaxStackHeight<frameIndex) ? frameIndex : gMaxStackHeight;
+	funcArgStack[frameIndex++] = arg;
 }
 
 inline bool SlangInterpreter::WrappedEvalExpr(SlangHeader* expr,SlangHeader** res){
@@ -5239,6 +5393,14 @@ bool SlangInterpreter::EvalExpr(SlangHeader** res){
 							*res = (SlangHeader*)alloc.MakeBool(b);
 							return true;
 						}
+						case SLANG_EXPORT:
+							ARITY_EXACT_CHECK(1);
+							success = SlangFuncExport(res);
+							return success;
+						case SLANG_IMPORT:
+							ARITY_AT_LEAST_CHECK(1);
+							success = SlangFuncImport(res);
+							return success;
 						default:
 							if (!extFuncs.contains(symbol)){
 								ProcError(head);
@@ -5296,6 +5458,12 @@ void SlangInterpreter::StreamError(const SlangHeader* expr,const std::string& m)
 void SlangInterpreter::FileError(const SlangHeader* expr,const std::string& m){
 	std::stringstream msg = {};
 	msg << "FileError:\n    " << m;
+	PushError(expr,msg.str());
+}
+
+void SlangInterpreter::ImportError(const SlangHeader* expr,const std::string& m){
+	std::stringstream msg = {};
+	msg << "ImportError:\n    " << m;
 	PushError(expr,msg.str());
 }
 
@@ -5546,12 +5714,15 @@ SlangInterpreter::SlangInterpreter() :
 	envStack.resize(16);
 	exprStack.resize(32);
 	argStack.resize(32);
+	exportStack.resize(16);
+	filenameStack.resize(16);
 	finalizers.clear();
 	finalizers.reserve(32);
 	frameIndex = 0;
 	envIndex = 0;
 	exprIndex = 0;
 	argIndex = 0;
+	filenameIndex = 0;
 	errors = {};
 	genIndex = 1;
 	SlangEnv* env = AllocateEnvs(4);
@@ -5559,6 +5730,9 @@ SlangInterpreter::SlangInterpreter() :
 	envStack[0] = env;
 	argStack[0] = nullptr;
 	exprStack[0] = nullptr;
+	SlangEnv* exportEnv = AllocateEnvs(4);
+	exportEnv->parent = nullptr;
+	exportStack[0] = exportEnv;
 }
 
 SlangInterpreter::~SlangInterpreter(){
@@ -5570,6 +5744,7 @@ SlangInterpreter::~SlangInterpreter(){
 	envIndex = 0;
 	exprIndex = 0;
 	argIndex = 0;
+	exportIndex = 0;
 	SmallGC(0);
 	
 	if (arena->memSet)
@@ -5578,6 +5753,7 @@ SlangInterpreter::~SlangInterpreter(){
 }
 
 SlangHeader* SlangInterpreter::Parse(const std::string& code){
+	parser.PushFilename(filenameStack[filenameIndex]);
 	SlangHeader* parsed = parser.ParseString(code);
 	if (!parser.errors.empty()){
 		PrintErrors(parser.errors);
@@ -5741,7 +5917,7 @@ std::string SlangParser::GetSymbolString(SymbolName symbol){
 void SlangParser::PushError(const std::string& msg){
 	std::stringstream ss{};
 	ss << "SyntaxError:\n    " << msg;
-	LocationData l = {token.line,token.col,0};
+	LocationData l = {token.line,token.col,currFilename};
 	errors.emplace_back(l,ss.str());
 }
 
@@ -5868,7 +6044,7 @@ inline std::string GetStringFromToken(std::string_view view){
 }
 
 inline bool SlangParser::ParseObj(SlangHeader** res){
-	LocationData loc = {token.line,token.col,0};
+	LocationData loc = {token.line,token.col,currFilename};
 	switch (token.type){
 		case SlangTokenType::Int: {
 			char* d;
@@ -6069,7 +6245,7 @@ bool SlangParser::ParseExpr(SlangHeader** res){
 			break;
 		}
 		if (token.type==SlangTokenType::EndOfFile){
-			PushError("Expected ')'! (From @"+std::to_string(line+1)+","+std::to_string(col+1)+")");
+			PushError("Expected ')'! (From "+std::to_string(line+1)+","+std::to_string(col+1)+")");
 			return false;
 		}
 		
@@ -6188,6 +6364,7 @@ SlangHeader* SlangInterpreter::ParseSlangString(const SlangStr& code){
 	std::string_view sv{(const char*)code.storage->data,code.storage->size};
 	
 	parser.tokenizer = std::make_unique<SlangTokenizer>(sv,&parser);
+	parser.currFilename = nullptr;
 	AllocFunc savedFunc = parser.alloc.alloc;
 	parser.alloc.alloc = alloc.alloc;
 	SlangHeader* res = parser.Parse();
@@ -6197,9 +6374,14 @@ SlangHeader* SlangInterpreter::ParseSlangString(const SlangStr& code){
 	return (SlangHeader*)MakeMaybe(res,true);
 }
 
+inline void SlangParser::PushFilename(const std::string& name){
+	filenameList.push_back(name);
+	currFilename = filenameList.back().c_str();
+}
+
 inline LocationData SlangParser::GetExprLocation(const SlangHeader* expr){
 	if (!codeMap.contains(expr))
-		return {-1U,-1U,-1U};
+		return {-1U,-1U,nullptr};
 	
 	return codeMap.at(expr);
 }

@@ -321,7 +321,7 @@ namespace slang {
 	
 	struct LocationData {
 		uint32_t line,col;
-		uint32_t fileIndex;
+		const char* filename;
 	};
 	
 	struct ErrorData {
@@ -378,6 +378,9 @@ namespace slang {
 		SymbolName currentName;
 		std::vector<ErrorData> errors;
 		
+		const char* currFilename;
+		std::list<std::string> filenameList;
+		
 		SlangAllocator alloc;
 		size_t codeSize = 0;
 		size_t totalAlloc = 0;
@@ -399,6 +402,7 @@ namespace slang {
 		inline SlangHeader* WrapProgram(const std::vector<SlangHeader*>&);
 		inline void* CodeAlloc(size_t);
 		inline void CodeRealloc(size_t);
+		inline void PushFilename(const std::string& name);
 		inline LocationData GetExprLocation(const SlangHeader*);
 		
 		std::string GetSymbolString(SymbolName name);
@@ -429,12 +433,16 @@ namespace slang {
 		SlangAllocator alloc;
 		SymbolName genIndex;
 		
-		size_t envIndex,exprIndex,argIndex,frameIndex;
+		size_t envIndex,exprIndex,argIndex,frameIndex,exportIndex;
 		std::vector<SlangHeader*> funcArgStack;
 		std::vector<SlangEnv*> envStack;
 		std::vector<SlangHeader*> exprStack;
 		std::vector<SlangList*> argStack;
 		std::vector<Finalizer> finalizers;
+		std::vector<SlangEnv*> exportStack;
+		
+		size_t filenameIndex;
+		std::vector<std::string> filenameStack;
 		
 		std::vector<ErrorData> errors;
 		std::map<SymbolName,ExternalFunc> extFuncs;
@@ -457,6 +465,12 @@ namespace slang {
 		
 		inline void PushEnv(SlangEnv* env);
 		inline void PopEnv();
+		
+		inline void PushExportEnv();
+		inline void PopExportEnv();
+		
+		void PushFilename(const std::string&);
+		void PopFilename();
 		
 		void SetGlobalSymbol(const std::string& name,SlangHeader* value);
 		bool GetGlobalSymbol(const std::string& name,SlangHeader** value);
@@ -577,6 +591,9 @@ namespace slang {
 		inline bool SlangFuncEq(SlangHeader** res);
 		inline bool SlangFuncIs(SlangHeader** res);
 		
+		inline bool SlangFuncExport(SlangHeader** res);
+		inline bool SlangFuncImport(SlangHeader** res);
+		
 		inline bool SlangOutputToFile(FILE* file,SlangHeader* obj);
 		inline SlangHeader* SlangInputFromFile(FILE* file);
 		inline bool SlangOutputToString(SlangStream* stream,SlangHeader* obj);
@@ -592,6 +609,7 @@ namespace slang {
 		void ValueError(const SlangHeader*,const std::string&);
 		void FileError(const SlangHeader*,const std::string&);
 		void StreamError(const SlangHeader*,const std::string&);
+		void ImportError(const SlangHeader*,const std::string&);
 		void UnwrapError(const SlangHeader*);
 		void IndexError(const SlangHeader*,size_t,ssize_t);
 		void UndefinedError(const SlangHeader*);
@@ -616,6 +634,8 @@ namespace slang {
 		inline SlangHeader* Copy(SlangHeader*);
 		
 		inline void DefEnvSymbol(SlangEnv* e,SymbolName name,SlangHeader* val);
+		inline void ImportEnv(SlangEnv* e);
+		inline bool GetImportName(SlangList* nameList,std::string& path);
 		inline SymbolName GenSym();
 		inline SlangEnv* CreateEnv(size_t);
 		

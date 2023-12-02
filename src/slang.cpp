@@ -6,14 +6,23 @@
 #include <fstream>
 #include <math.h>
 #include <time.h>
-#include <chrono>
 #include <set>
 #include <filesystem>
+#ifdef _WIN32
+#include <profileapi.h>
+#include <sys/timeb.h>
+#endif
 
 #define GEN_FLAG (1ULL<<63)
 #define LET_SELF_SYM GEN_FLAG
 #define EMPTY_NAME (-1ULL)
 #define SLANG_FILE_EXT ".sl"
+
+#ifdef _WIN32
+#define PATH_SEP '\\'
+#else
+#define PATH_SEP '/'
+#endif
 
 namespace slang {
 
@@ -236,22 +245,43 @@ struct SFCState {
 SFCState gRandState;
 
 inline double GetDoubleTime(){
+#ifdef _WIN32
+	struct _timeb timebuf;
+	_ftime(&timebuf);
+	return (double)timebuf.time+((double)timebuf.millitm)*1e-3;
+#else
 	struct timespec ts;
 	timespec_get(&ts,TIME_UTC);
 	return (double)ts.tv_sec + ((double)ts.tv_nsec)*1e-9;
+#endif
 }
 
 inline double GetDoublePerfTime(){
+#ifdef _WIN32
+	LARGE_INTEGER freq;
+	LARGE_INTEGER counts;
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&counts);
+	return (double)counts.QuadPart / (double)freq.QuadPart;
+#else
 	struct timespec ts;
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&ts);
 	return (double)ts.tv_sec + ((double)ts.tv_nsec)*1e-9;
+#endif
 }
 
 inline uint64_t GetSeedTime(){
+#ifdef _WIN32
+	struct _timeb timebuf;
+	_ftime(&timebuf);
+	uint64_t t = timebuf.time*1000+timebuf.millitm;
+	return t;
+#else
 	struct timespec ts;
 	timespec_get(&ts,TIME_UTC);
 	uint64_t t = ts.tv_sec*1000 + ts.tv_nsec/1000000;
 	return t;
+#endif
 }
 
 inline const char* TypeToString(SlangType type){
@@ -1377,7 +1407,7 @@ inline bool IsValidPathPart(std::string_view s){
 }
 
 inline std::string GetBaseDir(const std::string& path){
-	size_t lastSlash = path.rfind('/');
+	size_t lastSlash = path.rfind(PATH_SEP);
 	if (lastSlash==std::string::npos) 
 		return {};
 	return path.substr(0,lastSlash);
@@ -1419,7 +1449,7 @@ void PrintInfo(){
 }
 
 inline bool IsWhitespace(char c){
-	return c==' '||c=='\t'||c=='\n';
+	return c==' '||c=='\t'||c=='\n'||c=='\r';
 }
 
 inline bool IsNumber(char c){
@@ -5908,7 +5938,7 @@ inline bool CodeInterpreter::SlangOutputToFile(FILE* file,SlangHeader* obj){
 		}
 		case SlangType::Int: {
 			SlangObj* intObj = (SlangObj*)obj;
-			fprintf(file,"%ld",intObj->integer);
+			fprintf(file,"%lld",intObj->integer);
 			break;
 		}
 		case SlangType::Real: {
@@ -5978,7 +6008,7 @@ inline bool CodeInterpreter::SlangOutputToString(SlangStream* stream,SlangHeader
 		}
 		case SlangType::Int: {
 			SlangObj* intObj = (SlangObj*)obj;
-			ssize_t size = snprintf(tempStr,sizeof(tempStr),"%ld",intObj->integer);
+			ssize_t size = snprintf(tempStr,sizeof(tempStr),"%lld",intObj->integer);
 			assert(size!=-1);
 			stream = ReallocateStream(stream,size);
 			sstr = stream->str;
@@ -8873,13 +8903,13 @@ bool CodeFuncRealToInt(CodeInterpreter* c){
 void CFGetImportName(CodeInterpreter* c,SlangList* nameList,std::string& name){
 	assert(nameList);
 	if (!name.empty())
-		name.push_back('/');
+		name.push_back(PATH_SEP);
 	SymbolName sym = ((SlangObj*)nameList->left)->symbol;
 	name += c->parser.GetSymbolString(sym);
 	nameList = (SlangList*)nameList->right;
 	
 	while (nameList){
-		name.push_back('/');
+		name.push_back(PATH_SEP);
 		sym = ((SlangObj*)nameList->left)->symbol;
 		name += c->parser.GetSymbolString(sym);
 		nameList = (SlangList*)nameList->right;
@@ -8915,7 +8945,7 @@ bool CFHandleImport(CodeInterpreter* c,SlangList* nameList){
 		return true;
 	}
 	
-	std::ifstream f{importName,std::ios::ate};
+	std::ifstream f{importName,std::ios::ate|std::ios::binary};
 	if (!f){
 		if (CFHandleSpecialImport(c,nameList))
 			return true;
@@ -9551,8 +9581,7 @@ bool CodeInterpreter::LoadModule(ModuleName name,const std::string& code,size_t&
 }
 
 bool CodeInterpreter::Run(){
-	struct timespec tstart,tend;
-	clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&tstart);
+	double start = GetDoublePerfTime();
 	
 	halted = false;
 	//while (InlineStep()){}
@@ -9568,9 +9597,8 @@ bool CodeInterpreter::Run(){
 		LoadTry();
 	}
 	
-	clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&tend);
-	gRunTime = (tend.tv_sec+1e-9*tend.tv_nsec)-
-				(tstart.tv_sec+1e-9*tstart.tv_nsec);
+	double end = GetDoublePerfTime();
+	gRunTime = end-start;
 	
 	if (!success){
 		while (funcStack.size>1){

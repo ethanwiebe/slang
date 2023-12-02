@@ -263,7 +263,7 @@ int main(int argc,char** argv){
 		for (const auto& filename : filenames){
 			std::string code;
 			{
-				std::ifstream f(filename,std::ios::ate);
+				std::ifstream f(filename,std::ios::ate|std::ios::binary);
 				if (!f){
 					std::cout << "slang: cannot open file " << filename << "\n";
 					return false;

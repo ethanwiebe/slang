@@ -64,6 +64,20 @@
 			"preCmds":[
 				["bin/slang","tests/*.sl"]
 			]
+		},
+		"profile":{
+			"compileFlags":[
+				"%compileFlags",
+				"-DNDEBUG",
+				"-O3",
+				"-g",
+				"-pg",
+				"-march=native"
+			],
+			"linkFlags":[
+				"%linkFlags",
+				"-pg"
+			]
 		}
 	}
 }

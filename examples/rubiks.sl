@@ -35,20 +35,6 @@
 	)
 )-;
 
-(def (min x y)
-	(cond
-		((< x y) x)
-		(else y)
-	)
-)
-
-(def (max x y)
-	(cond
-		((< x y) y)
-		(else x)
-	)
-)
-
 (def (list-swap! l i1 i2)
 	(let ((tmp (list-get l i1)))
 		(list-set! l i1 (list-get l i2))
@@ -450,4 +436,10 @@
 ;(output-alg test-alg)
 ;(output "\n")
 ;(display-cube c)
+(import (slang time))
+
+(def start-t (perf-time))
+(print start-t)
 (test-alg-cycle long-alg)
+(print (* 1000 (- (perf-time) start-t)))
+(print (perf-time))

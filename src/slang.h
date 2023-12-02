@@ -9,16 +9,355 @@
 #include <ostream>
 #include <memory>
 #include <assert.h>
-#include <functional>
+#include <cstring>
+#include <iostream>
 
 #define SMALL_SET_SIZE 32768
-#define LARGE_SET_SIZE SMALL_SET_SIZE*4
 #define FORWARD_MASK (~7ULL)
+#define DICT_UNOCCUPIED_VAL UINT64_MAX
 #define SLANG_ENV_BLOCK_SIZE 4
+#define SL_ARR_LEN(x) (sizeof(x)/sizeof(x[0]))
+
+#define SLANG_VERSION "0.1.0"
 
 namespace slang {
+	extern size_t gNameCollisions;
 	typedef uint64_t SymbolName;
-	typedef std::unordered_map<std::string,SymbolName> SymbolNameDict;
+	typedef uint64_t ModuleName;
+	typedef std::unordered_map<std::string,ModuleName> ModuleNameDict;
+	
+	inline size_t QuantizeToPowerOfTwo(uint64_t v){
+		return (1ULL << (64-__builtin_clzll(v-1)));
+	}
+	
+	inline uint64_t rotleft(uint64_t v,uint64_t s){
+		return (v<<s) | (v>>(64-s));
+	}
+	
+	inline uint64_t rotright(uint64_t v,uint64_t s){
+		return (v>>s) | (v<<(64-s));
+	}
+	
+	template <typename T>
+	struct Vector {
+		T* data;
+		size_t size;
+		size_t cap;
+		
+		Vector(){
+			data = nullptr;
+			size = 0;
+			cap = 0;
+		}
+		
+		~Vector(){
+			if (data){
+				free(data);
+			}
+		}
+		
+		Vector(const Vector<T>& v){
+			data = (T*)malloc(v.size*sizeof(T));
+			memcpy(data,v.data,v.size*sizeof(T));
+			cap = v.size;
+			size = v.size;
+		}
+		
+		Vector(Vector<T>&& v){
+			data = v.data;
+			size = v.size;
+			cap = v.cap;
+			v.data = nullptr;
+		}
+		
+		Vector<T>& operator=(const Vector<T>& v){
+			data = (T*)malloc(v.size*sizeof(T));
+			memcpy(data,v.data,v.size*sizeof(T));
+			cap = v.size;
+			size = v.size;
+			return *this;
+		}
+		
+		Vector<T>& operator=(Vector<T>&& v){
+			data = v.data;
+			size = v.size;
+			cap = v.cap;
+			v.data = nullptr;
+			return *this;
+		}
+		
+		inline void Reserve(size_t d){
+			if (cap>d) return;
+			cap = d;
+			data = (T*)realloc(data,cap*sizeof(T));
+		}
+		
+		inline void Resize(size_t d){
+			if (d<=cap){
+				size = d;
+				return;
+			}
+			
+			cap = d;
+			data = (T*)realloc(data,cap*sizeof(T));
+		}
+		
+		inline void AddSize(size_t s){
+			if (size+s<=cap){
+				size += s;
+				return;
+			}
+			
+			cap = (size+s)*3/2;
+			size += s;
+			data = (T*)realloc(data,cap*sizeof(T));
+		}
+		
+		inline void Clear(){
+			size = 0;
+		}
+		
+		inline void PushBack(const T& val){
+			if (size==cap){
+				Resize(cap*3/2+1);
+			}
+			data[size++] = val;
+		}
+		
+		inline T& PlaceBack(){
+			if (size==cap){
+				Resize(cap*3/2+1);
+			}
+			
+			return data[size++];
+		}
+		
+		inline void PopBack(){
+			--size;
+		}
+		
+		inline T& Front() const {
+			return data[0];
+		}
+		
+		inline T& Back() const {
+			return data[size-1];
+		}
+		
+		inline bool Empty() const {
+			return size==0;
+		}
+	};
+	
+	inline uint64_t HashSymbolNameFromSV(std::string_view sv){
+		uint64_t hash = 0;
+		
+		for (size_t i=0;i<sv.size();++i){
+			hash = rotleft(hash,1);
+			hash ^= sv[i];
+		}
+		hash ^= sv.size();
+		return hash;
+	}
+	
+	struct StringLocation {
+		size_t start;
+		size_t count;
+	};
+	
+	struct SymbolNamePair {
+		StringLocation loc;
+		SymbolName symbol;
+	};
+	
+	inline std::string_view StringViewFromLocation(const Vector<uint8_t>& arr,StringLocation loc){
+		const char* arrStr = (const char*)(arr.data+loc.start);
+		return {arrStr,loc.count};
+	}
+	
+	inline uint64_t HashSymbolNameFromLoc(const Vector<uint8_t>& arr,StringLocation loc){
+		std::string_view view = StringViewFromLocation(arr,loc);
+		return HashSymbolNameFromSV(view);
+	}
+	
+	inline bool StringLocAndViewMatch(const Vector<uint8_t>& arr,StringLocation loc,std::string_view sv){
+		if (loc.count!=sv.size())
+			return false;
+		const char* arrStr = (const char*)(arr.data+loc.start);
+		for (size_t i=0;i<loc.count;++i){
+			if (arrStr[i]!=sv[i])
+				return false;
+		}
+		return true;
+	}
+	
+	struct SymbolNameDict {
+		size_t size;
+		size_t cap;
+		SymbolNamePair* data;
+		const Vector<uint8_t>& strArray;
+		
+		SymbolNameDict(const Vector<uint8_t>& arr) : strArray(arr){
+			size = 0;
+			cap = 0;
+			data = nullptr;
+		}
+		
+		~SymbolNameDict(){
+			if (data){
+				free(data);
+			}
+		}
+		
+		SymbolNameDict(const SymbolNameDict&) = delete;
+		SymbolNameDict(SymbolNameDict&&) = delete;
+		SymbolNameDict& operator=(const SymbolNameDict&) = delete;
+		SymbolNameDict& operator=(SymbolNameDict&&) = delete;
+		
+		inline void Reserve(size_t s){
+			assert(size==0);
+			size_t realSize = QuantizeToPowerOfTwo(s);
+			data = (SymbolNamePair*)malloc(sizeof(SymbolNamePair)*realSize);
+			memset(data,0xFF,sizeof(SymbolNamePair)*realSize);
+			cap = realSize;
+		}
+		
+		inline SymbolName Find(std::string_view sv) const {
+			uint64_t hash = HashSymbolNameFromSV(sv);
+			
+			const SymbolNamePair* end = data+cap;
+			const SymbolNamePair* it = data+(hash & (cap-1));
+			
+			while (true){
+				if (it->loc.start==DICT_UNOCCUPIED_VAL)
+					return -1ULL;
+					
+				if (StringLocAndViewMatch(strArray,it->loc,sv)){
+					return it->symbol;
+				}
+				
+				++it;
+				if (it==end)
+					it = data;
+			}
+		}
+		
+		inline void DoubleTable(){
+			size_t newCap = cap*2;
+			SymbolNamePair* oldData = data;
+			data = (SymbolNamePair*)malloc(newCap*sizeof(SymbolNamePair));
+			memset(data,0xFF,newCap*sizeof(SymbolNamePair));
+			
+			const SymbolNamePair* it = oldData;
+			const SymbolNamePair* end = oldData+cap;
+			size = 0;
+			cap = newCap;
+			gNameCollisions = 0;
+			
+			while (it!=end){
+				if (it->loc.start!=DICT_UNOCCUPIED_VAL)
+					Insert(it->loc,it->symbol);
+				
+				++it;
+			}
+			
+			free(oldData);
+		}
+		
+		inline void Insert(StringLocation loc,SymbolName sym){
+			uint64_t hash = HashSymbolNameFromLoc(strArray,loc);
+			
+			const SymbolNamePair* end = data+cap;
+			SymbolNamePair* it = data+(hash & (cap-1));
+			
+			if (it->loc.start!=DICT_UNOCCUPIED_VAL)
+				++gNameCollisions;
+			
+			while (true){
+				if (it->loc.start==DICT_UNOCCUPIED_VAL){
+					it->loc = loc;
+					it->symbol = sym;
+					++size;
+					break;
+				}
+				
+				++it;
+				if (it==end)
+					it = data;
+			}
+			
+			if (size*2>cap){
+				DoubleTable();
+			}
+		}
+	};
+	
+	struct MemLink {
+		uint8_t* data;
+		uint8_t* write;
+		size_t size;
+	};
+	
+	struct MemChain {
+		Vector<MemLink> links;
+		MemLink* currLink = nullptr;
+		size_t startSize;
+		
+		MemChain(size_t initSize){
+			startSize = initSize;
+			links.Reserve(8);
+			MemLink& first = links.PlaceBack();
+			first.size = initSize;
+			first.data = (uint8_t*)malloc(initSize);
+			first.write = first.data;
+			currLink = &first;
+		}
+		
+		~MemChain(){
+			for (size_t i=0;i<links.size;++i){
+				free(links.data[i].data);
+			}
+		}
+		
+		MemChain(const MemChain&) = delete;
+		MemChain(MemChain&&) = delete;
+		MemChain& operator=(const MemChain&) = delete;
+		MemChain& operator=(MemChain&&) = delete;
+		
+		inline void* Allocate(size_t size){
+			if (currLink->write+size<=currLink->data+currLink->size){
+				void* d = currLink->write;
+				currLink->write += size;
+				return d;
+			}
+			
+			size_t newSize = currLink->size*2;
+			if (newSize<size*2){
+				newSize = size*2;
+			}
+			MemLink& newLink = links.PlaceBack();
+			newLink.data = (uint8_t*)malloc(newSize);
+			newLink.size = newSize;
+			newLink.write = newLink.data+size;
+			currLink = &newLink;
+			return newLink.data;
+		}
+		
+		void Reset(){
+			size_t endSize = currLink->size;
+			for (size_t i=1;i<links.size;++i){
+				free(links.data[i].data);
+			}
+			links.size = 1;
+			size_t newSize = endSize;
+			//if (endSize>newSize)
+				//newSize = endSize;
+			currLink = links.data;
+			currLink->data = (uint8_t*)realloc(currLink->data,newSize);
+			currLink->size = newSize;
+			currLink->write = currLink->data;
+		}
+	};
 	
 	void PrintInfo();
 	
@@ -33,6 +372,7 @@ namespace slang {
 		Real,
 		Vector,
 		String,
+		Dict,
 		InputStream,
 		OutputStream,
 		EndOfFile,
@@ -41,12 +381,15 @@ namespace slang {
 		Env,
 		Params,
 		Storage,
+		DictTable,
 	};
 	
 	enum SlangFlag {
 		FLAG_FORWARDED =          0b1,
 		FLAG_VARIADIC =        0b1000,
-		FLAG_MAYBE_OCCUPIED = 0b10000
+		FLAG_MAYBE_OCCUPIED = 0b10000,
+		FLAG_CLOSURE =       0b100000,
+		FLAG_EXTERNAL =     0b1000000,
 	};
 	
 	struct SlangHeader {
@@ -59,6 +402,7 @@ namespace slang {
 					uint16_t elemSize;
 					uint8_t isFile;
 					uint8_t boolVal;
+					uint8_t dictScale;
 					uint8_t padding[6];
 				};
 			};
@@ -83,14 +427,14 @@ namespace slang {
 	
 	static_assert(sizeof(SlangHeader)==8);
 	
-	struct SlangMapping {
-		SymbolName sym;
-		SlangHeader* obj;
+	struct SlangDictElement {
+		uint64_t hash;
+		SlangHeader* key;
+		SlangHeader* val;
 	};
 	
 	struct SlangStorage {
 		SlangHeader header;
-		// measured in bytes
 		size_t size;
 		size_t capacity;
 		union {
@@ -99,6 +443,9 @@ namespace slang {
 			};
 			struct {
 				SlangHeader* objs[];
+			};
+			struct {
+				SlangDictElement elements[];
 			};
 		};
 	};
@@ -145,6 +492,150 @@ namespace slang {
 		}
 	};
 	
+	struct SlangList {
+		SlangHeader header;
+		SlangHeader* left;
+		SlangHeader* right;
+	};
+	
+	uint64_t SlangHashObj(const SlangHeader* obj);
+	bool EqualObjs(const SlangHeader* a,const SlangHeader* b);
+	
+	struct SlangDictTable {
+		SlangHeader header;
+		size_t size;
+		size_t capacity;
+		size_t elementOffsets[];
+	};
+	
+	struct SlangDict {
+		SlangHeader header;
+		SlangDictTable* table;
+		SlangStorage* storage;
+		
+		inline bool LookupKey(SlangHeader* key,SlangHeader** val) const {
+			// if storage exists, table will exist
+			if (!storage||storage->size==0) return false;
+			
+			uint64_t hashVal = SlangHashObj(key);
+			const size_t* offset = table->elementOffsets+(hashVal & (table->capacity-1));
+			const size_t* end = table->elementOffsets+table->capacity;
+			SlangDictElement* obj;
+			
+			while (true){
+				if ((uint64_t)*offset == DICT_UNOCCUPIED_VAL)
+					return false;
+					
+				obj = &storage->elements[*offset];
+				if (obj->hash==hashVal && EqualObjs(key,obj->key)){
+					*val = obj->val;
+					return true;
+				}
+				
+				++offset;
+				if (offset==end)
+					offset = table->elementOffsets;
+			}
+			
+			return true;
+		}
+		
+		inline bool LookupKeyWithHash(
+				SlangHeader* key,
+				uint64_t hash,
+				SlangHeader** val) const {
+			// if storage exists, table will exist
+			if (!storage||storage->size==0) return false;
+			
+			const size_t* offset = table->elementOffsets+(hash & (table->capacity-1));
+			const size_t* end = table->elementOffsets+table->capacity;
+			SlangDictElement* obj;
+			
+			while (true){
+				if ((uint64_t)*offset == DICT_UNOCCUPIED_VAL)
+					return false;
+					
+				obj = &storage->elements[*offset];
+				if (obj->hash==hash && EqualObjs(key,obj->key)){
+					*val = obj->val;
+					return true;
+				}
+				
+				++offset;
+				if (offset==end)
+					offset = table->elementOffsets;
+			}
+			
+			return true;
+		}
+		
+		inline bool PopKey(SlangHeader* key,SlangHeader** val){
+			if (!storage||storage->size==0) return false;
+			
+			uint64_t hashVal = SlangHashObj(key);
+			size_t* offset = table->elementOffsets+(hashVal & (table->capacity-1));
+			const size_t* end = table->elementOffsets+table->capacity;
+			SlangDictElement* obj;
+			
+			while (true){
+				if ((uint64_t)*offset == DICT_UNOCCUPIED_VAL)
+					return false;
+					
+				obj = &storage->elements[*offset];
+				if (obj->hash==hashVal && EqualObjs(key,obj->key)){
+					break;
+				}
+				
+				++offset;
+				if (offset==end)
+					offset = table->elementOffsets;
+			}
+			
+			*val = obj->val;
+			if (*offset==storage->size)
+				--storage->size;
+			else
+				memset(obj,0xFF,sizeof(SlangDictElement));
+				
+			*offset = DICT_UNOCCUPIED_VAL;
+			--table->size;
+			
+			size_t* j = offset;
+			const size_t* kDesiredLoc;
+			while (true){
+				++j;
+				if (j==end)
+					j = table->elementOffsets;
+				
+				if ((uint64_t)*j == DICT_UNOCCUPIED_VAL)
+					break;
+				
+				kDesiredLoc = 
+					table->elementOffsets +
+					(storage->elements[*j].hash & (table->capacity-1));
+				
+				if (offset<=j){
+					if (offset<kDesiredLoc && kDesiredLoc<=j)
+						continue;
+				} else {
+					if (offset<kDesiredLoc || kDesiredLoc<=j)
+						continue;
+				}
+				
+				*offset = *j;
+				*j = DICT_UNOCCUPIED_VAL;
+				
+				offset = j;
+			}
+			
+			return true;
+		}
+		
+		inline bool ShouldGrow() const {
+			return (table->size*3)/2+1 >= table->capacity;
+		}
+	};
+	
 	struct SlangStream {
 		SlangHeader header;
 		size_t pos;
@@ -162,6 +653,11 @@ namespace slang {
 		}
 	};
 	
+	struct SlangMapping {
+		SymbolName sym;
+		SlangHeader* obj;
+	};
+	
 	struct SlangEnv {
 		SlangHeader header;
 		SlangEnv* parent;
@@ -169,15 +665,23 @@ namespace slang {
 		SlangMapping mappings[SLANG_ENV_BLOCK_SIZE];
 		
 		inline bool GetSymbol(SymbolName,SlangHeader**) const;
+		inline bool HasSymbol(SymbolName) const;
 		inline bool DefSymbol(SymbolName,SlangHeader*);
 		inline bool SetSymbol(SymbolName,SlangHeader*);
+		
+		inline SlangHeader* GetIndexed(uint16_t idx) const {
+			if (idx>=SLANG_ENV_BLOCK_SIZE)
+				return next->GetIndexed(idx-SLANG_ENV_BLOCK_SIZE);
+			return mappings[idx].obj;
+		}
+		
+		inline void SetIndexed(uint16_t idx,SlangHeader* obj){
+			if (idx>=SLANG_ENV_BLOCK_SIZE)
+				return next->SetIndexed(idx-SLANG_ENV_BLOCK_SIZE,obj);
+			mappings[idx].obj = obj;
+		}
+		
 		inline void AddBlock(SlangEnv*);
-	};
-	
-	struct SlangList {
-		SlangHeader header;
-		SlangHeader* left;
-		SlangHeader* right;
 	};
 	
 	struct SlangParams {
@@ -186,10 +690,15 @@ namespace slang {
 		SymbolName params[];
 	};
 	
+	struct ExternalFuncData;
+	
 	struct SlangLambda {
 		SlangHeader header;
-		SlangHeader* expr;
-		SlangParams* params;
+		union {
+			SlangHeader* expr;
+			const ExternalFuncData* extFunc;
+			size_t funcIndex;
+		};
 		SlangEnv* env;
 	};
 	
@@ -204,17 +713,17 @@ namespace slang {
 	};
 	
 	static_assert(sizeof(SlangObj)==16);
-	struct SlangInterpreter;
-	typedef bool(*SlangFunc)(SlangInterpreter* s,SlangHeader** res);
+	struct CodeInterpreter;
 	
-	#define VARIADIC_ARG_COUNT -1ULL
+	// max number of args
+	#define VARIADIC_ARG_COUNT 65535
 	
-	struct ExternalFunc {
+	/*struct ExternalFunc {
 		const char* name;
 		SlangFunc func;
 		size_t minArgs = 0;
 		size_t maxArgs = 0;
-	};
+	};*/
 	
 	inline SlangType GetType(const SlangHeader* expr){
 		if (!expr) return SlangType::NullType;
@@ -236,7 +745,9 @@ namespace slang {
 			case SlangType::Bool:
 			case SlangType::Vector:
 			case SlangType::String:
+			case SlangType::Dict:
 			case SlangType::Storage:
+			case SlangType::DictTable:
 				return true;
 			case SlangType::List:
 			case SlangType::Symbol:
@@ -246,7 +757,13 @@ namespace slang {
 	}
 	
 	inline bool IsNumeric(const SlangHeader* o){
-		return GetType(o)==SlangType::Int || GetType(o)==SlangType::Real;
+		SlangType t = GetType(o);
+		return t==SlangType::Int || t==SlangType::Real;
+	}
+	
+	inline bool IsStream(const SlangHeader* o){
+		SlangType t = GetType(o);
+		return t==SlangType::InputStream || t==SlangType::OutputStream;
 	}
 	
 	inline bool IsList(const SlangHeader* o){
@@ -296,16 +813,22 @@ namespace slang {
 		}
 	};
 	
-	typedef std::function<void*(size_t)> AllocFunc;
+	typedef void*(*AllocFunc)(void*,size_t);
 	struct SlangAllocator {
+		void* user;
 		AllocFunc alloc;
 		
+		inline uint8_t* Allocate(size_t);
 		inline SlangObj* AllocateObj(SlangType);
 		inline SlangLambda* AllocateLambda();
 		inline SlangList* AllocateList();
 		inline SlangParams* AllocateParams(size_t);
 		inline SlangEnv* AllocateEnv();
 		inline SlangStorage* AllocateStorage(size_t size,uint16_t elemSize);
+		inline SlangDict* AllocateDict();
+		inline SlangStorage* AllocateDictStorage(size_t size);
+		inline SlangDictTable* AllocateDictTable(size_t size);
+		inline SlangVec* AllocateVec(size_t);
 		inline SlangStr* AllocateStr(size_t);
 		inline SlangStream* AllocateStream(SlangType);
 		
@@ -321,11 +844,12 @@ namespace slang {
 	
 	struct LocationData {
 		uint32_t line,col;
-		const char* filename;
+		uint32_t moduleName;
 	};
 	
 	struct ErrorData {
 		LocationData loc;
+		std::string type;
 		std::string message;
 	};
 	
@@ -334,11 +858,16 @@ namespace slang {
 		Int,
 		Real,
 		String,
+		VectorMarker,
 		LeftBracket,
 		RightBracket,
 		Quote,
+		Quasiquote,
+		Unquote,
+		UnquoteSplicing,
 		Not,
 		Negation,
+		Invert,
 		Dot,
 		Comment,
 		True,
@@ -367,6 +896,9 @@ namespace slang {
 			line = 0;
 			col = 0;
 		}
+		
+		inline void TokenizeIdentifier(SlangToken&);
+		inline void TokenizeNumber(SlangToken&);
 		SlangToken NextToken();
 	};
 	
@@ -374,287 +906,491 @@ namespace slang {
 		std::unique_ptr<SlangTokenizer> tokenizer;
 		SlangToken token;
 		
+		Vector<uint8_t> nameStringStorage;
 		SymbolNameDict nameDict;
+		Vector<StringLocation> symbolToStringArray;
 		SymbolName currentName;
+		
 		std::vector<ErrorData> errors;
 		
-		const char* currFilename;
-		std::list<std::string> filenameList;
+		uint32_t currModule;
 		
 		SlangAllocator alloc;
-		size_t codeSize = 0;
-		size_t totalAlloc = 0;
-		std::vector<uint8_t*> codeSets;
-		uint8_t* codeStart = nullptr;
-		uint8_t* codePointer = nullptr;
-		uint8_t* codeEnd = nullptr;
+		size_t maxCodeSize;
+		MemChain memChain;
 		
 		std::unordered_map<const SlangHeader*,LocationData> codeMap;
 		
 		SlangParser();
-		~SlangParser();
 		
 		SlangParser(const SlangParser&) = delete;
 		SlangParser& operator=(const SlangParser&) = delete;
+		SlangParser(SlangParser&&) = delete;
+		SlangParser& operator=(SlangParser&&) = delete;
 		
 		inline SlangList* WrapExprIn(SymbolName func,SlangHeader* expr);
 		inline SlangList* WrapExprSplice(SymbolName func,SlangList* expr);
-		inline SlangHeader* WrapProgram(const std::vector<SlangHeader*>&);
-		inline void* CodeAlloc(size_t);
-		inline void CodeRealloc(size_t);
-		inline void PushFilename(const std::string& name);
 		inline LocationData GetExprLocation(const SlangHeader*);
 		
-		std::string GetSymbolString(SymbolName name);
-		SymbolName RegisterSymbol(const std::string& name);
+		std::string_view GetSymbolString(SymbolName name);
+		SymbolName RegisterSymbol(std::string_view name);
 		
 		void PushError(const std::string& msg);
 		
 		inline void NextToken();
+		bool ParseLine(SlangHeader**);
 		bool ParseExpr(SlangHeader**);
 		bool ParseObj(SlangHeader**);
-		SlangHeader* LoadIntoBuffer(SlangHeader* prog);
+		bool ParseVec(SlangHeader**);
 		void TestSeqMacro(SlangList* list,size_t argCount);
 		
-		SlangHeader* ParseString(const std::string& code);
-		SlangHeader* Parse();
+		void SetCodeString(std::string_view code);
 	};
 	
-	typedef void(*FinalizerFunc)(SlangInterpreter* s,SlangHeader* obj);
+	struct CodeLocationPair {
+		uint32_t codeIndex;
+		uint32_t line;
+		uint32_t col;
+	};
 	
+	typedef Vector<SymbolName> ParamData;
+	struct CodeBlock {
+		size_t size;
+		SymbolName name;
+		ParamData params;
+		Vector<CodeLocationPair> locData;
+		uint32_t moduleIndex;
+		uint8_t isVariadic;
+		uint8_t isClosure;
+		uint8_t isPure;
+		uint8_t* start;
+		uint8_t* write;
+	};
+	
+	struct LambdaData {
+		SymbolName funcName;
+        ParamData params;
+		bool isVariadic = false;
+		bool isClosure = false;
+		bool isStar = false;
+		bool isLetRec = false;
+		uint16_t currLetInit = 0;
+	};
+	
+	struct CaseDictElement {
+		const SlangHeader* key;
+		size_t offset;
+	};
+	
+	struct CaseDict {
+		size_t capacity;
+		size_t elemsStart;
+		size_t elseOffset;
+	};
+	
+	struct CodeWriter {
+		SlangParser& parser;
+		SlangAllocator alloc;
+		MemChain memChain;
+		
+		std::vector<LambdaData> lambdaStack;
+		
+		std::vector<CodeBlock> lambdaCodes;
+		std::vector<std::map<SymbolName,size_t>> knownLambdaStack;
+		Vector<CaseDict> caseDicts;
+		Vector<CaseDictElement> caseDictElements;
+		
+		CodeBlock* curr;
+		uint8_t* lastInst;
+		SymbolName currDefName;
+		SymbolName currSetName;
+		
+		uint32_t currModuleIndex;
+		
+		SlangHeader* constTrueObj;
+		SlangHeader* constFalseObj;
+		SlangHeader* constZeroObj;
+		SlangHeader* constOneObj;
+		SlangHeader* constEOFObj;
+		SlangHeader* constElseObj;
+		
+		bool optimize;
+		
+		size_t totalAlloc;
+		size_t evalFuncIndex = -1ULL;
+		
+		std::vector<ErrorData> errors;
+		
+		SlangHeader* Copy(const SlangHeader* obj);
+		size_t AllocNewBlock(size_t initSize);
+		void ReallocCurrBlock(size_t newSize);
+		void WriteOpCode(uint8_t op);
+		void WritePointer(const void* ptr);
+		void WriteInt16(uint16_t i);
+		void WriteSInt32(int32_t i);
+		void WriteInt32(uint32_t i);
+		void WriteInt64(uint64_t i);
+		void WriteSymbolName(SymbolName sym);
+		size_t WriteStartJump();
+		void FinishJump(size_t);
+		size_t WriteStartCJump(bool jumpOn);
+		size_t WriteStartCJumpPop(bool jumpOn);
+		void FinishCJump(size_t);
+		
+		size_t StartTryOp();
+		void FinishTryOp(size_t);
+		
+		bool SymbolInStarParams(SymbolName,uint16_t&) const;
+		bool SymbolInParams(SymbolName,uint16_t&) const;
+		bool SymbolNotInAnyParams(SymbolName) const;
+		bool ParamIsInited(uint16_t) const;
+		void AddClosureParam(SymbolName);
+		
+		inline bool IsPure(const SlangHeader*) const;
+		
+		CodeWriter(SlangParser&);
+		~CodeWriter();
+		CodeWriter(const CodeWriter&) = delete;
+		CodeWriter& operator=(const CodeWriter&) = delete;
+		CodeWriter(CodeWriter&&) = delete;
+		CodeWriter& operator=(CodeWriter&&) = delete;
+		
+		void CaseDictAlloc(CaseDict& dict,size_t elems);
+		bool CaseDictSet(const CaseDict& dict,const SlangHeader* key,size_t offset);
+		inline size_t CaseDictGet(const CaseDict& dict,const SlangHeader* key) const;
+		
+		SlangHeader* MakeIntConst(int64_t i);
+		SlangHeader* MakeSymbolConst(SymbolName sym);
+		
+		bool CompileData(const SlangHeader* obj);
+		bool CompileCode(const std::string& code);
+		bool CompileModule(ModuleName name,const std::string& code,size_t& funcIndex);
+		
+		bool CompileExpr(const SlangHeader*,bool terminating=false);
+		bool CompileConst(const SlangHeader*);
+		bool CompileLambdaBody(
+			const SlangHeader*,
+			const std::vector<SlangHeader*>*,
+			size_t& lambdaIndex
+		);
+		
+		bool CompileDefine(const SlangHeader*);
+		bool CompileLambda(const SlangHeader*);
+		bool CompileDo(const SlangHeader*,bool terminating=false);
+		bool CompileLet(const SlangHeader*,bool terminating=false);
+		bool CompileLetRec(const SlangHeader*,bool terminating=false);
+		bool CompileIf(const SlangHeader*,bool terminating=false);
+		bool CompileCond(const SlangHeader*,bool terminating=false);
+		bool CompileCase(const SlangHeader*,bool terminating=false);
+		bool CompileApply(const SlangHeader*,bool terminating=false);
+		bool CompileAnd(const SlangHeader*,bool terminating=false);
+		bool CompileOr(const SlangHeader*,bool terminating=false);
+		bool CompileMap(const SlangHeader*);
+		bool CompileTry(const SlangHeader*);
+		bool CompileUnwrap(const SlangHeader*);
+		bool CompileQuote(const SlangHeader*);
+		bool CompileUnquote(const SlangHeader*);
+		bool CompileUnquoteSplicing(const SlangHeader*);
+		bool QuasiquoteList(const SlangList*,size_t);
+		bool QuasiquoteVector(const SlangVec*,size_t);
+		bool CompileQuasiquote(const SlangHeader*);
+		bool CompileNot(const SlangHeader*);
+		bool CompileInc(const SlangHeader*);
+		bool CompileDec(const SlangHeader*);
+		bool CompileAdd(const SlangHeader*);
+		bool CompileSub(const SlangHeader*);
+		bool CompileMul(const SlangHeader*);
+		bool CompileDiv(const SlangHeader*);
+		bool CompileEq(const SlangHeader*);
+		bool CompilePair(const SlangHeader*);
+		bool CompileLeft(const SlangHeader*);
+		bool CompileRight(const SlangHeader*);
+		bool CompileSetLeft(const SlangHeader*);
+		bool CompileSetRight(const SlangHeader*);
+		bool CompileVec(const SlangHeader*);
+		bool CompileIsPure(const SlangHeader*);
+		bool CompileExport(const SlangHeader*);
+		bool CompileImport(const SlangHeader*);
+		
+		void Optimize(CodeBlock& block);
+		
+		void Reset();
+		void MakeDefaultObjs();
+		
+		void AddCodeLocation(const SlangHeader* expr);
+		LocationData FindCodeLocation(size_t funcIndex,size_t offset) const;
+		size_t GetCodeLocationsSize() const;
+		
+		void PushError(const SlangHeader*,const std::string&,const std::string&);
+		void TypeError(const SlangHeader*,SlangType found,SlangType expected);
+		void DefError(const SlangHeader*);
+		void ReservedError(const SlangHeader*,SymbolName);
+		void RedefinedError(const SlangHeader*,SymbolName);
+		void FuncRedefinedError(const SlangHeader*,SymbolName);
+		void LetRecError(const SlangHeader*,SymbolName);
+		void ArityError(const SlangHeader* head,size_t found,size_t expectMin,size_t expectMax);
+		void DotError(const SlangHeader*);
+	};
+	
+	struct StackData {
+		size_t base;
+	};
+	
+	struct FuncData {
+		size_t funcIndex;
+		size_t argsFrame;
+		SlangEnv* env;
+		SlangEnv* globalEnv;
+		const uint8_t* retAddr;
+	};
+	
+	struct TryData {
+		const uint8_t* gotoAddr;
+		size_t stackSize;
+		size_t argStackSize;
+		size_t funcStackSize;
+		size_t globalStackSize;
+	};
+	
+	struct ModuleData {
+		SlangEnv* globalEnv;
+		SlangEnv* exportEnv;
+	};
+	
+	typedef void(*FinalizerFunc)(CodeInterpreter* s,SlangHeader* obj);
 	struct Finalizer {
 		SlangHeader* obj;
 		FinalizerFunc func;
 	};
 	
-	struct SlangInterpreter {
+	struct CodeInterpreter {
 		SlangParser parser;
+		CodeWriter codeWriter;
 		MemArena* arena;
 		SlangAllocator alloc;
-		SymbolName genIndex;
 		
-		size_t envIndex,exprIndex,argIndex,frameIndex,exportIndex;
-		std::vector<SlangHeader*> funcArgStack;
-		std::vector<SlangEnv*> envStack;
-		std::vector<SlangHeader*> exprStack;
-		std::vector<SlangList*> argStack;
-		std::vector<Finalizer> finalizers;
-		std::vector<SlangEnv*> exportStack;
+		MemChain memChain;
+		SlangAllocator constAlloc;
+		MemChain evalMemChain;
+		SlangAllocator evalAlloc;
 		
-		size_t filenameIndex;
-		std::vector<std::string> filenameStack;
+		bool halted;
+		size_t stepCount;
+		const uint8_t* pc;
+		Vector<StackData> stack;
+		Vector<SlangHeader*> argStack;
+		Vector<FuncData> funcStack;
+		Vector<TryData> tryStack;
+		
+		Vector<ModuleData> modules;
+		ModuleName currModuleName;
+		ModuleNameDict moduleNameDict;
+		
+		std::unordered_map<SymbolName,SlangEnv*> builtinModulesMap;
 		
 		std::vector<ErrorData> errors;
-		std::map<SymbolName,ExternalFunc> extFuncs;
+		Vector<Finalizer> finalizers;
+		SlangEnv* lamEnv;
 		
-		SlangInterpreter();
-		~SlangInterpreter();
+		inline ModuleName RegisterModuleName(const std::string& name){
+			if (moduleNameDict.contains(name)){
+				return moduleNameDict.at(name);
+			}
+			
+			ModuleName mn = currModuleName++;
+			moduleNameDict[name] = mn;
+			return mn;
+		}
 		
-		SlangInterpreter(const SlangInterpreter&) = delete;
-		SlangInterpreter& operator=(const SlangInterpreter&) = delete;
-		SlangInterpreter(SlangInterpreter&&) = delete;
-		SlangInterpreter& operator=(SlangInterpreter&&) = delete;
+		inline std::string GetModuleString(ModuleName name) const {
+			for (auto& [k,v] : moduleNameDict){
+				if (name==v)
+					return k;
+			}
+			return "INVALID MODULE";
+		}
 		
-		void AddExternalFunction(const ExternalFunc&);
+		inline SlangHeader* GetArg(size_t i) const {
+			return argStack.data[stack.Back().base+i];
+		}
 		
-		SlangHeader* ParseSlangString(const SlangStr&);
+		inline void SetArg(size_t i,SlangHeader* arg){
+			argStack.data[stack.Back().base+i] = arg;
+		}
+		
+		inline size_t GetArgCount() const {
+			return argStack.size-stack.Back().base;
+		}
+		
+		inline void PushArg(SlangHeader* arg){
+			argStack.data[argStack.size++] = arg;
+		}
+		
+		inline SlangHeader* PopArg(){
+			assert(!argStack.Empty());
+			SlangHeader* e = argStack.Back();
+			argStack.PopBack();
+			return e;
+		}
+		
+		inline SlangHeader* PeekArg(){
+			assert(!argStack.Empty());
+			SlangHeader* e = argStack.Back();
+			return e;
+		}
+		
+		inline SlangHeader* GetLocalArg(uint16_t index){
+			size_t base = stack.data[funcStack.Back().argsFrame].base;
+			return argStack.data[base+index];
+		}
+		
+		inline void PushLocal(uint16_t index){
+			size_t base = stack.data[funcStack.Back().argsFrame].base;
+			argStack.data[argStack.size++] = argStack.data[base+index];
+		}
+		
+		inline void PushRecLocal(uint16_t index){
+			size_t base = stack.Back().base;
+			argStack.data[argStack.size++] = argStack.data[base+index];
+		}
+		
+		inline void SetLocalArg(uint16_t index,SlangHeader* val){
+			size_t argsFrame = funcStack.Back().argsFrame;
+			SlangEnv* e = funcStack.Back().env;
+			size_t base = stack.data[argsFrame].base;
+			argStack.data[base+index] = val;
+			if (codeWriter.lambdaCodes[funcStack.Back().funcIndex].isClosure)
+				e->SetIndexed(index,val);
+		}
+		
+		inline void SetRecLocalArg(uint16_t index,SlangHeader* val){
+			size_t base = stack.Back().base;
+			argStack.data[base+index] = val;
+		}
+		
+		inline void PushFrame(){
+			StackData& d = stack.data[stack.size++];
+			d.base = argStack.size;
+		}
+		
+		inline void PopFrame(){
+			assert(stack.size>1);
+			assert(argStack.size>=stack.Back().base);
+			argStack.size = stack.Back().base;
+			stack.PopBack();
+		}
 		
 		inline SlangEnv* GetCurrEnv() const {
-			return envStack[envIndex];
+			return funcStack.Back().env;
 		}
 		
-		inline void PushEnv(SlangEnv* env);
-		inline void PopEnv();
+		inline void PushTry();
+		inline void LoadTry();
 		
-		inline void PushExportEnv();
-		inline void PopExportEnv();
+		inline void Call(size_t funcIndex,SlangEnv* env);
+		inline void RetCall(size_t funcIndex,SlangEnv* env);
+		inline void Recurse();
+		inline void Return(SlangHeader* val);
 		
-		void PushFilename(const std::string&);
-		void PopFilename();
-		
-		void SetGlobalSymbol(const std::string& name,SlangHeader* value);
-		bool GetGlobalSymbol(const std::string& name,SlangHeader** value);
-		bool CallLambda(
-			const SlangLambda* lam,
-			const std::vector<SlangHeader*>& args,
-			SlangHeader** res
-		);
-		
-		inline SlangList* GetCurrArg() const {
-			return argStack[argIndex];
+		inline void RetCallBuiltin(){
+			StackData& d = stack.Back();
+			FuncData& f = funcStack.Back();
+			size_t argCount = GetArgCount();
+			size_t lowerBase = stack.data[f.argsFrame].base;
+			size_t upperBase = d.base;
+			// copy args down
+			for (size_t i=0;i<argCount;++i){
+				argStack.data[lowerBase+i] = argStack.data[upperBase+i];
+			}
+			// manual pop frame
+			stack.PopBack();
+			argStack.size = lowerBase+argCount;
 		}
 		
-		inline SlangHeader* GetCurrExpr() const {
-			return exprStack[exprIndex];
-		}
-		inline void PushArg(SlangList* expr);
-		inline void PopArg();
-		inline void PushExpr(SlangHeader* expr);
-		inline void SetExpr(SlangHeader* expr);
-		inline void PopExpr();
+		size_t GetPCOffset() const;
+		
+		inline SlangEnv* AllocateEnvs(size_t);
+		inline void DefEnvSymbol(SlangEnv* e,SymbolName name,SlangHeader* val);
+		inline void DefCurrEnvSymbol(SymbolName name,SlangHeader* val);
+		inline bool SetRecursiveSymbol(SymbolName name,SlangHeader* val);
+		inline SlangLambda* CreateLambda(size_t index);
+		inline SlangList* MakeVariadicList(size_t start,size_t end);
+		inline SlangVec* MakeVecFromArgs(size_t start,size_t end);
+		inline SlangHeader* Copy(SlangHeader*);
+		inline SlangList* CopyList(SlangList*);
+		inline void RehashDict(SlangDict* dict);
+		inline SlangDict* ReallocDict(SlangDict* dict);
+		inline void RawDictInsertStorage(SlangDict* dict,uint64_t hash,SlangHeader* key,SlangHeader* val);
+		inline void RawDictInsert(SlangDict* dict,SlangHeader* key,SlangHeader* val);
+		inline void DictInsert(SlangDict* dict,SlangHeader* key,SlangHeader* val);
+		inline SlangStr* ReallocateStr(SlangStr*,size_t);
+		inline SlangStream* ReallocateStream(SlangStream*,size_t);
+		inline SlangStream* MakeStringInputStream(SlangStr* str);
+		inline SlangStream* MakeStringOutputStream(SlangStr* str);
+		inline void ImportEnv(const SlangEnv* env);
+		
+		void SetGlobalSymbol(const std::string& name,SlangHeader* val);
+		bool ParseSlangString(const SlangStr&,SlangHeader**);
+		
+		void InitBuiltinModules();
+		bool ImportBuiltinModule(SymbolName name);
 		
 		inline void AddFinalizer(const Finalizer&);
 		inline void RemoveFinalizer(SlangHeader*);
-		
-		inline bool NextArg(){
-			SlangList* currArg = GetCurrArg();
-			if (GetType(currArg->right)!=SlangType::List&&currArg->right!=nullptr){
-				TypeError((SlangHeader*)currArg,GetType((SlangHeader*)currArg),SlangType::List);
-				return false;
-			}
-			argStack[argIndex] = (SlangList*)currArg->right;
-			return true;
-		}
-		
-		inline bool SetRecursiveSymbol(SlangEnv*,SymbolName,SlangHeader*);
-		
-		inline bool AddReals(SlangHeader** res,double curr);
-		inline bool MulReals(SlangHeader** res,double curr);
-		bool GetLetParams(
-			std::vector<SymbolName>& params,
-			SlangList* paramIt
-		);
-		inline bool PreprocessApplyArgs(SlangList*,SlangList**);
-		inline bool GetTwoIntArgs(SlangObj** l,SlangObj** r);
-		inline bool MapInnerLoop(size_t,size_t,size_t,size_t&);
-		
-		inline bool SlangFuncDefine(SlangHeader** res);
-		inline bool SlangFuncLambda(SlangHeader** res);
-		inline bool SlangFuncSet(SlangHeader** res);
-		inline bool SlangFuncMap(SlangHeader** res);
-		inline bool SlangFuncQuote(SlangHeader** res);
-		inline bool SlangFuncNot(SlangHeader** res);
-		inline bool SlangFuncNegate(SlangHeader** res);
-		inline bool SlangFuncLen(SlangHeader** res);
-		
-		inline bool SlangFuncInc(SlangHeader** res);
-		inline bool SlangFuncDec(SlangHeader** res);
-		inline bool SlangFuncAdd(SlangHeader** res);
-		inline bool SlangFuncSub(SlangHeader** res);
-		inline bool SlangFuncMul(SlangHeader** res);
-		inline bool SlangFuncDiv(SlangHeader** res);
-		inline bool SlangFuncFloorDiv(SlangHeader** res);
-		inline bool SlangFuncMod(SlangHeader** res);
-		inline bool SlangFuncPow(SlangHeader** res);
-		inline bool SlangFuncAbs(SlangHeader** res);
-		inline bool SlangFuncFloor(SlangHeader** res);
-		inline bool SlangFuncCeil(SlangHeader** res);
-		
-		inline bool SlangFuncBitAnd(SlangHeader** res);
-		inline bool SlangFuncBitOr(SlangHeader** res);
-		inline bool SlangFuncBitXor(SlangHeader** res);
-		inline bool SlangFuncBitNot(SlangHeader** res);
-		inline bool SlangFuncBitLeftShift(SlangHeader** res);
-		inline bool SlangFuncBitRightShift(SlangHeader** res);
-		
-		inline bool SlangFuncGT(SlangHeader** res);
-		inline bool SlangFuncLT(SlangHeader** res);
-		inline bool SlangFuncGTE(SlangHeader** res);
-		inline bool SlangFuncLTE(SlangHeader** res);
-		
-		inline bool SlangFuncUnwrap(SlangHeader** res);
-		inline bool SlangFuncList(SlangHeader** res);
-		inline bool SlangFuncListGet(SlangHeader** res);
-		inline bool SlangFuncListSet(SlangHeader** res);
-		inline bool SlangFuncVec(SlangHeader** res);
-		inline bool SlangFuncVecAlloc(SlangHeader** res);
-		inline bool SlangFuncVecSize(SlangHeader** res);
-		inline bool SlangFuncVecGet(SlangHeader** res);
-		inline bool SlangFuncVecSet(SlangHeader** res);
-		inline bool SlangFuncVecAppend(SlangHeader** res);
-		inline bool SlangFuncVecPop(SlangHeader** res);
-		inline bool SlangFuncStrGet(SlangHeader** res);
-		inline bool SlangFuncStrSet(SlangHeader** res);
-		inline bool SlangFuncMakeStrIStream(SlangHeader** res);
-		inline bool SlangFuncMakeStrOStream(SlangHeader** res);
-		inline bool SlangFuncStreamGetStr(SlangHeader** res);
-		inline bool SlangFuncStreamWrite(SlangHeader** res);
-		inline bool SlangFuncStreamRead(SlangHeader** res);
-		inline bool SlangFuncStreamWriteByte(SlangHeader** res);
-		inline bool SlangFuncStreamReadByte(SlangHeader** res);
-		inline bool SlangFuncStreamSeekPrefix(SlangStream** stream,ssize_t* offset);
-		inline bool SlangFuncStreamSeekBegin(SlangHeader** res);
-		inline bool SlangFuncStreamSeekEnd(SlangHeader** res);
-		inline bool SlangFuncStreamSeekOffset(SlangHeader** res);
-		inline bool SlangFuncStreamTell(SlangHeader** res);
-		
-		inline bool SlangFuncOutputTo(SlangHeader** res);
-		inline bool SlangFuncInputFrom(SlangHeader** res);
-		
-		inline bool SlangFuncPair(SlangHeader** res);
-		inline bool SlangFuncLeft(SlangHeader** res);
-		inline bool SlangFuncRight(SlangHeader** res);
-		inline bool SlangFuncSetLeft(SlangHeader** res);
-		inline bool SlangFuncSetRight(SlangHeader** res);
-		inline bool SlangFuncPrint(SlangHeader** res);
-		inline bool SlangFuncAssert(SlangHeader** res);
-		inline bool SlangFuncEq(SlangHeader** res);
-		inline bool SlangFuncIs(SlangHeader** res);
-		
-		inline bool SlangFuncExport(SlangHeader** res);
-		inline bool SlangFuncImport(SlangHeader** res);
 		
 		inline bool SlangOutputToFile(FILE* file,SlangHeader* obj);
 		inline SlangHeader* SlangInputFromFile(FILE* file);
 		inline bool SlangOutputToString(SlangStream* stream,SlangHeader* obj);
 		inline SlangHeader* SlangInputFromString(SlangStream* stream);
 		
-		inline bool WrappedEvalExpr(SlangHeader* expr,SlangHeader** res);
-		bool EvalExpr(SlangHeader** res);
-		
-		inline void StackAddArg(SlangHeader*);
-		
-		void PushError(const SlangHeader*,const std::string&);
-		void EvalError(const SlangHeader*);
-		void ValueError(const SlangHeader*,const std::string&);
-		void FileError(const SlangHeader*,const std::string&);
-		void StreamError(const SlangHeader*,const std::string&);
-		void ImportError(const SlangHeader*,const std::string&);
-		void UnwrapError(const SlangHeader*);
-		void IndexError(const SlangHeader*,size_t,ssize_t);
-		void UndefinedError(const SlangHeader*);
-		void RedefinedError(const SlangHeader*,SymbolName);
-		void ProcError(const SlangHeader*);
-		void TypeError(const SlangHeader*,SlangType found,SlangType expected,size_t index=-1ULL);
-		void AssertError(const SlangHeader*);
-		void ArityError(const SlangHeader* head,size_t found,size_t expectMin,size_t expectMax);
-		void ZeroDivisionError(const SlangHeader*);
-		
-		SlangHeader* Parse(const std::string& code);
-		bool Run(SlangHeader* prog,SlangHeader** res);
-		
-		inline void* Allocate(size_t);
-		inline SlangStorage* MakeStorage(size_t,uint16_t,SlangHeader* fill=nullptr);
-		inline SlangEnv* AllocateEnvs(size_t);
-		inline SlangStr* ReallocateStr(SlangStr*,size_t);
-		inline SlangStream* ReallocateStream(SlangStream*,size_t);
 		inline void ReallocSet(size_t newSize);
 		inline void SmallGC(size_t);
 		
-		inline SlangHeader* Copy(SlangHeader*);
+		CodeInterpreter();
+		~CodeInterpreter();
 		
-		inline void DefEnvSymbol(SlangEnv* e,SymbolName name,SlangHeader* val);
-		inline void ImportEnv(SlangEnv* e);
-		inline bool GetImportName(SlangList* nameList,std::string& path);
-		inline SymbolName GenSym();
-		inline SlangEnv* CreateEnv(size_t);
+		CodeInterpreter(const CodeInterpreter&) = delete;
+		CodeInterpreter& operator=(const CodeInterpreter&) = delete;
+		CodeInterpreter(CodeInterpreter&&) = delete;
+		CodeInterpreter& operator=(CodeInterpreter&&) = delete;
 		
-		inline SlangObj* MakeMaybe(SlangHeader*,bool);
-		inline SlangLambda* MakeLambda(
-			SlangHeader* expr,
-			const std::vector<SymbolName>& args,
-			bool variadic,
-			bool extraSlot=false);
-		inline SlangStream* MakeStringInputStream(SlangStr*);
-		inline SlangStream* MakeStringOutputStream(SlangStr*);
-		inline SlangList* MakeList(const std::vector<SlangHeader*>&,size_t start=0,size_t end=-1ULL);
-		inline void ConcatLists(SlangList* a,SlangList* b) const;
-		inline SlangVec* MakeVecFromVec(const std::vector<SlangHeader*>&,size_t start=0,size_t end=-1ULL);
-		inline SlangVec* MakeVec(size_t,SlangHeader*);
+		SlangHeader* Parse(const std::string& prog);
+		bool CompileInto(SlangHeader* prog,size_t);
+		bool Compile(SlangHeader* prog,size_t&);
+		inline bool InlineStep();
+		bool Step();
+		
+		void ResetState();
+		void SetupDefaultModule(const std::string& name);
+		bool LoadProgram(const std::string& filename,const std::string& code);
+		bool LoadModule(ModuleName name,const std::string& code,size_t& funcIndex);
+		bool LoadExpr(const std::string& code);
+		bool Run();
+		
+		bool EvalCall(SlangHeader*);
+		
+		void DisplayErrors() const;
+		
+		void PushError(const std::string&,const std::string&);
+		void EvalError();
+		void UndefinedError(SymbolName);
+		void RedefinedError(SymbolName);
+		void TypeError(SlangType found,SlangType expected);
+		void TypeError2(SlangType found,SlangType expected1,SlangType expected2);
+		void AssertError();
+		void UnwrapError();
+		void ArityError(size_t found,size_t expectMin,size_t expectMax);
+		void IndexError(ssize_t desired,size_t len);
+		void ListIndexError(ssize_t desired);
+		void FileError(const std::string&);
+		void StreamError(const std::string&);
+		void ExportError(SymbolName sym);
+		void DotError();
+		void ZeroDivisionError();
 	};
 	
-	extern SlangParser* gDebugParser;
-	extern SlangInterpreter* gDebugInterpreter;
+	void PrintCode(const uint8_t* code,const uint8_t* end,const uint8_t* pc=nullptr);
+	void PrintErrors(const std::vector<ErrorData>& errors);
 	
 	std::ostream& operator<<(std::ostream&,const SlangHeader&);
 }

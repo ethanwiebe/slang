@@ -3,10 +3,10 @@
 (def abc 13)
 (+ abc 1)
 12
-(def func 
-	(& (y) 
-				(def x 1)
-				(+ x y)))
+;(def func 
+	;(& (y) 
+		;(def x 1)
+		;(+ x y)))
 
 
 
@@ -72,6 +72,7 @@
 			(print count)
 			(& () 
 				(set! count (+ count 1))
+				count
 			)
 		)
 	)
@@ -171,6 +172,7 @@
 (print va)
 (vec-set! va 2 10)
 (vec-app! va 'hello)
+(import (slang gc))
 (output "Vec size: " (gc-size va) "\n")
 (print va)
 (print (vec-pop! va))
@@ -189,7 +191,7 @@
 (print var)
 (print var2)
 
-;-(def limited-use (& (func max)
+(def limited-use (& (func max)
 	(let ((count max))
 		(& args 
 		(print args)
@@ -209,8 +211,8 @@
 (print (limit-add 2 3))
 (print (limit-add 2 3))
 (print (limit-add 2 3))
--;
-(print (parse "(+ 100 3"))
+
+(print (try (parse "(+ 100 3")))
 
 (print (try abcd))
 (print (unwrap (try 3)))

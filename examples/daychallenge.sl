@@ -1,4 +1,6 @@
 ; day challenge
+(import (slang random))
+(import (slang time))
 
 (def (make-date year mon day) (list year mon day))
 (def (get-year date) (L date))
@@ -12,43 +14,43 @@
 )
 
 (def (int->str i)
-	(let ((ss (make-str-ostream)))
+	(let ((ss (make-ostream)))
 		(output-to! ss i)
-		(stream-get-str ss)
+		(stream->str ss)
 	)
 )
 
 (def (sym->str sym)
-	(let ((ss (make-str-ostream)))
+	(let ((ss (make-ostream)))
 		(output-to! ss sym)
-		(stream-get-str ss)
+		(stream->str ss)
 	)
 )
 
 (def (date->str date)
-	(let ((ss (make-str-ostream)))
+	(let ((ss (make-ostream)))
 		(output-to! ss 
 			(get-year date) "/"
 			(zpad2-int (get-month date)) "/"
 			(zpad2-int (get-day date))
 		)
-		(stream-get-str ss)
+		(stream->str ss)
 	)
 )
 
 ; int -> str
 (def (zpad2-int i)
-	(let ((ss (make-str-ostream)))
+	(let ((ss (make-ostream)))
 		(if (< i 10)
 			(write! ss "0")
 		)
 		(output-to! ss i)
-		(stream-get-str ss)
+		(stream->str ss)
 	)
 )
 
 (def (zpad3-int i)
-	(let ((ss (make-str-ostream)))
+	(let ((ss (make-ostream)))
 		(if (< i 10)
 			(write! ss "0")
 		)
@@ -56,7 +58,7 @@
 			(write! ss "0")
 		)
 		(output-to! ss i)
-		(stream-get-str ss)
+		(stream->str ss)
 	)
 )
 
@@ -83,7 +85,7 @@
 	(let ((base-year (get-base-year (-- year))))
 		;(if (< base-year 0)
 			;0
-			(+ (div base-year 4) -(div base-year 100) (div (+ 300 base-year) 400))
+			(+ (/ base-year 4) -(/ base-year 100) (/ (+ 300 base-year) 400))
 		;)
 	)
 )
@@ -198,7 +200,7 @@
 
 (def (get-time-str seconds)
 	(let (
-			(ss (make-str-ostream))
+			(ss (make-ostream))
 			(m (floor (/ seconds 60)))
 			(s (% (floor seconds) 60))
 			(millis (% (floor (+ 0.5 (* 1000.0 seconds))) 1000))
@@ -207,7 +209,7 @@
 			(output-to! ss m ":" (zpad2-int s) "." (zpad3-int millis))
 			(output-to! ss s "." (zpad3-int millis))
 		)
-		(stream-get-str ss)
+		(stream->str ss)
 	)
 )
 
@@ -219,7 +221,7 @@
 	(input)
 	(let ((start-time
 		(let outer (
-			    (start-time (perftime!))
+			    (start-time (time))
 			    (index 0)
 				(date (get-rand-date))
 			 )
@@ -231,7 +233,7 @@
 				(else (outer (- start-time 15.0) index (get-rand-date)))
 			)
 		))
-		(end-time (perftime!))
+		(end-time (time))
 		(time-diff (- end-time start-time))
 		)
 		

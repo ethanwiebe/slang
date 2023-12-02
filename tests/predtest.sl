@@ -2,6 +2,22 @@
 	(empty? (try (eval expr)))
 ))
 
+
+(def (secondtest x y) (+ x y))
+(def testf (& ()
+	(empty? (try (secondtest 3 4)))
+))
+
+(def (assert-eq x . args)
+	(if (apply = x args)
+		true
+		(do
+			(print x '!= args)
+			(assert false)
+		)
+	)
+)
+
 (assert (null? ()))
 (assert !(null? 2))
 (assert (pair? '(1 2)))
@@ -41,15 +57,48 @@
 (assert (empty? (try)))
 (assert !(empty? (try 3)))
 (assert (empty? (try (+ 3 'hello))))
+(assert (empty? ""))
+(assert (empty? ()))
+(assert (empty? #()))
+(assert (empty? (dict)))
+
+(assert !(testf))
+(assert !(errored? '(testf)))
 (assert !(errored? '(+ 3 4)))
 (assert (errored? '(+ 3 'hello)))
-(assert !(errored? '(set! t ())))
+(set! t ())
 (assert !(eof? ()))
 (assert (null? t))
-(assert (> 3 2))
-(assert !(> 3 3))
-(assert (>= 3 3))
+(assert (> 3 2 1 0 -1))
+(assert !(> 3 2 1 0 0))
+(assert !(> 3 3 3 3 3))
+(assert (>= 3 3 3 3 3))
 (assert (> 3 2.99999))
+
+(assert-eq 
+	-1 
+	(/ -1 2)
+	(/ 1 -2)
+	(floor (/ 1.0 -2.0))
+)
+
+(assert-eq 
+	1 
+	(^ 0 0)
+	(^ 0 0.0)
+	(^ 0.0 0)
+	(^ 0.0 0.0)
+)
+
+(assert-eq 0.25 (% 1.25 1.0))
+(assert-eq 0.75 (% -1.25 1.0))
+(assert-eq -0.75 (% 1.25 -1.0))
+(assert-eq -0.25 (% -1.25 -1.0))
+
+(assert-eq 1 (% 103 17))
+(assert-eq 16 (% -103 17))
+(assert-eq -16 (% 103 -17))
+(assert-eq -1 (% -103 -17))
 
 (assert (is (and true () false) ()))
 (assert (is (and 1 2 3 0 4) 0))
@@ -59,10 +108,19 @@
 (assert (is (or 1 2 3) 1))
 (assert (is (or 0 false () 3 false) 3))
 (assert (is (or 0 false () 0) 0))
-(assert (= 1 (cond (true 1) (false 2))))
-(assert (= 2 (cond (false 1) (true 2))))
-(assert (= 3 (cond (false 1) (false 2) (else 3))))
-(assert (= 'yes (case (+ 1 2) ((1 2 4) 'no) (() 'hidden) ((5 3 6) 'yes))))
-(assert (= 'hello (case (+ 1 2) ((1 2 4) 'no) ((5 7 6) 'yes) (else 'hello))))
+(assert-eq 1 (cond (true 1) (false 2)))
+(assert-eq 2 (cond (false 1) (true 2)))
+(assert-eq 3 (cond (false 1) (false 2) (else 3)))
+(assert-eq '(1 2 3) `(1 ,(+ 1 1) ,(++ 2)))
+(assert-eq '(1 2 3) `(1 @(list 2 3)))
+
+(assert-eq 'yes 
+	(case (+ 1 2)
+		((5 3 6) 'yes)
+		((10 2 4) 'no)
+		(() 'hidden)
+	)
+)
+(assert-eq 'hello (case (+ 1 2) ((1 2 4) 'abc) ((5 7 6) 'yes) (else 'hello)))
 
 (output "predicate passed\n")

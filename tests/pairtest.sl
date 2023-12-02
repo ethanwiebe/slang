@@ -12,8 +12,8 @@
 ; testing setL
 (def testquote (& ()
 	(let (
-		(x (list (list 1 2) (list 3 4)))
-		(y (L x))
+			(x (list (list 1 2) (list 3 4)))
+			(y (L x))
 		)
 		
 		(set-L! (L x) 12)

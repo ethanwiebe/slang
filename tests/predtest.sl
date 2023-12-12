@@ -123,4 +123,26 @@
 )
 (assert-eq 'hello (case (+ 1 2) ((1 2 4) 'abc) ((5 7 6) 'yes) (else 'hello)))
 
+(def a 3)
+(def (f x)
+	(def y (++ x))
+	(def z (* 2 y))
+	(def (g x) (* x x))
+	(def w (+ y z a))
+	(def t (g w))
+	(++ t)
+)
+
+(def (f2 x)
+	(def y (++ x))
+	(def z (* 2 y))
+	(def (g x) (* x z))
+	(def w (+ y z a))
+	(def t (g w))
+	(++ t)
+)
+
+(assert-eq (f 3) 226)
+(assert-eq (f2 3) 121)
+
 (output "predicate passed\n")

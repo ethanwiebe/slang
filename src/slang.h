@@ -12,7 +12,7 @@
 #include <cstring>
 #include <iostream>
 
-#define SMALL_SET_SIZE 32768
+#define SMALL_SET_SIZE 65536
 #define FORWARD_MASK (~7ULL)
 #define DICT_UNOCCUPIED_VAL UINT64_MAX
 #define SLANG_ENV_BLOCK_SIZE 4
@@ -22,6 +22,9 @@
 
 namespace slang {
 	extern size_t gNameCollisions;
+#ifndef NDEBUG
+	extern size_t gMaxArgHeight;
+#endif
 	typedef uint64_t SymbolName;
 	typedef uint64_t ModuleName;
 	typedef std::unordered_map<std::string,ModuleName> ModuleNameDict;
@@ -350,10 +353,10 @@ namespace slang {
 			}
 			links.size = 1;
 			size_t newSize = endSize;
-			//if (endSize>newSize)
-				//newSize = endSize;
+			
 			currLink = links.data;
-			currLink->data = (uint8_t*)realloc(currLink->data,newSize);
+			if (newSize!=currLink->size)
+				currLink->data = (uint8_t*)realloc(currLink->data,newSize);
 			currLink->size = newSize;
 			currLink->write = currLink->data;
 		}
@@ -379,7 +382,6 @@ namespace slang {
 		Maybe,
 		// inaccessible
 		Env,
-		Params,
 		Storage,
 		DictTable,
 	};
@@ -518,13 +520,15 @@ namespace slang {
 			if (!storage||storage->size==0) return false;
 			
 			uint64_t hashVal = SlangHashObj(key);
+			//std::cout << *key << ',' << hashVal << '\n';
 			const size_t* offset = table->elementOffsets+(hashVal & (table->capacity-1));
 			const size_t* end = table->elementOffsets+table->capacity;
 			SlangDictElement* obj;
 			
 			while (true){
-				if ((uint64_t)*offset == DICT_UNOCCUPIED_VAL)
+				if ((uint64_t)*offset == DICT_UNOCCUPIED_VAL){
 					return false;
+				}
 					
 				obj = &storage->elements[*offset];
 				if (obj->hash==hashVal && EqualObjs(key,obj->key)){
@@ -684,12 +688,6 @@ namespace slang {
 		inline void AddBlock(SlangEnv*);
 	};
 	
-	struct SlangParams {
-		SlangHeader header;
-		size_t size;
-		SymbolName params[];
-	};
-	
 	struct ExternalFuncData;
 	
 	struct SlangLambda {
@@ -736,7 +734,6 @@ namespace slang {
 			case SlangType::Int:
 			case SlangType::Real:
 			case SlangType::Env:
-			case SlangType::Params:
 			case SlangType::Lambda:
 			case SlangType::InputStream:
 			case SlangType::OutputStream:
@@ -822,7 +819,6 @@ namespace slang {
 		inline SlangObj* AllocateObj(SlangType);
 		inline SlangLambda* AllocateLambda();
 		inline SlangList* AllocateList();
-		inline SlangParams* AllocateParams(size_t);
 		inline SlangEnv* AllocateEnv();
 		inline SlangStorage* AllocateStorage(size_t size,uint16_t elemSize);
 		inline SlangDict* AllocateDict();
@@ -836,7 +832,6 @@ namespace slang {
 		inline SlangObj* MakeReal(double);
 		inline SlangObj* MakeSymbol(SymbolName);
 		inline SlangHeader* MakeBool(bool);
-		inline SlangParams* MakeParams(const std::vector<SymbolName>&);
 		inline SlangHeader* MakeEOF();
 	};
 	
@@ -958,6 +953,7 @@ namespace slang {
 		size_t size;
 		SymbolName name;
 		ParamData params;
+		ParamData defs;
 		Vector<CodeLocationPair> locData;
 		uint32_t moduleIndex;
 		uint8_t isVariadic;
@@ -970,11 +966,15 @@ namespace slang {
 	struct LambdaData {
 		SymbolName funcName;
         ParamData params;
+		ParamData defs;
+		Vector<size_t> paramHeights;
+		size_t defHeightsStart = 0;
 		bool isVariadic = false;
 		bool isClosure = false;
 		bool isStar = false;
 		bool isLetRec = false;
 		uint16_t currLetInit = 0;
+		uint32_t currInternalDef = 0;
 	};
 	
 	struct CaseDictElement {
@@ -997,6 +997,9 @@ namespace slang {
 		
 		std::vector<CodeBlock> lambdaCodes;
 		std::vector<std::map<SymbolName,size_t>> knownLambdaStack;
+		Vector<size_t> currHeights;
+		Vector<size_t> currFrames;
+		
 		Vector<CaseDict> caseDicts;
 		Vector<CaseDictElement> caseDictElements;
 		
@@ -1037,16 +1040,36 @@ namespace slang {
 		size_t WriteStartCJumpPop(bool jumpOn);
 		void FinishCJump(size_t);
 		
+		void WritePushFrame();
+		void WriteCall(bool terminating=false);
+		void WriteCallSym(SymbolName sym,bool terminating=false);
+		void WriteRet();
+		void WriteUnpack();
+		void WritePop();
+		void WriteNull();
+		void WriteTrue();
+		void WriteFalse();
+		void WriteZero();
+		void WriteOne();
+		void WriteLoadPtr(const void* ptr);
+		void WriteMakeLambda(uint64_t);
+		void WriteMakePair();
+		void WriteMakeVec();
+		
 		size_t StartTryOp();
 		void FinishTryOp(size_t);
 		
-		bool SymbolInStarParams(SymbolName,uint16_t&) const;
+		bool SymbolInStarParams(SymbolName,uint32_t&) const;
+		bool SymbolInInternalDefs(SymbolName,uint32_t&) const;
 		bool SymbolInParams(SymbolName,uint16_t&) const;
 		bool SymbolNotInAnyParams(SymbolName) const;
 		bool ParamIsInited(uint16_t) const;
 		void AddClosureParam(SymbolName);
 		
+		inline bool IsFuncPure(SymbolName) const;
+		inline bool IsLambdaPure(const SlangList*) const;
 		inline bool IsPure(const SlangHeader*) const;
+		inline bool KnownLambdaArityCheck(const SlangHeader* expr,SymbolName funcName,size_t argCount);
 		
 		CodeWriter(SlangParser&);
 		~CodeWriter();
@@ -1062,6 +1085,8 @@ namespace slang {
 		SlangHeader* MakeIntConst(int64_t i);
 		SlangHeader* MakeSymbolConst(SymbolName sym);
 		
+		void InitCompile();
+		
 		bool CompileData(const SlangHeader* obj);
 		bool CompileCode(const std::string& code);
 		bool CompileModule(ModuleName name,const std::string& code,size_t& funcIndex);
@@ -1069,8 +1094,9 @@ namespace slang {
 		bool CompileExpr(const SlangHeader*,bool terminating=false);
 		bool CompileConst(const SlangHeader*);
 		bool CompileLambdaBody(
-			const SlangHeader*,
-			const std::vector<SlangHeader*>*,
+			const SlangList* exprs,
+			const std::vector<SlangHeader*>* initExprs,
+			const std::vector<SlangHeader*>* internalDefs,
 			size_t& lambdaIndex
 		);
 		
@@ -1086,6 +1112,9 @@ namespace slang {
 		bool CompileAnd(const SlangHeader*,bool terminating=false);
 		bool CompileOr(const SlangHeader*,bool terminating=false);
 		bool CompileMap(const SlangHeader*);
+		bool CompileForeach(const SlangHeader*);
+		bool CompileFilter(const SlangHeader*);
+		bool CompileFold(const SlangHeader*);
 		bool CompileTry(const SlangHeader*);
 		bool CompileUnwrap(const SlangHeader*);
 		bool CompileQuote(const SlangHeader*);
@@ -1210,6 +1239,12 @@ namespace slang {
 			return "INVALID MODULE";
 		}
 		
+		inline void InternalDef(size_t index,SlangHeader* obj){
+			SlangEnv* env = GetCurrEnv();
+			SymbolName sym = codeWriter.lambdaCodes[funcStack.Back().funcIndex].defs.data[index];
+			DefOrSetEnvSymbol(env,sym,obj);
+		}
+		
 		inline SlangHeader* GetArg(size_t i) const {
 			return argStack.data[stack.Back().base+i];
 		}
@@ -1223,7 +1258,15 @@ namespace slang {
 		}
 		
 		inline void PushArg(SlangHeader* arg){
+			if (argStack.size>=argStack.cap){
+				argStack.data = (SlangHeader**)realloc(argStack.data,argStack.cap*2*sizeof(SlangHeader*));
+				argStack.cap *= 2;
+			}
 			argStack.data[argStack.size++] = arg;
+#ifndef NDEBUG
+			if (argStack.size>gMaxArgHeight)
+				gMaxArgHeight = argStack.size;
+#endif
 		}
 		
 		inline SlangHeader* PopArg(){
@@ -1246,12 +1289,20 @@ namespace slang {
 		
 		inline void PushLocal(uint16_t index){
 			size_t base = stack.data[funcStack.Back().argsFrame].base;
+			if (argStack.size>=argStack.cap){
+				argStack.data = (SlangHeader**)realloc(argStack.data,argStack.cap*2*sizeof(SlangHeader*));
+				argStack.cap *= 2;
+			}
 			argStack.data[argStack.size++] = argStack.data[base+index];
 		}
 		
-		inline void PushRecLocal(uint16_t index){
-			size_t base = stack.Back().base;
-			argStack.data[argStack.size++] = argStack.data[base+index];
+		inline void PushRecLocal(uint32_t index){
+			size_t base = argStack.size-index;
+			if (argStack.size>=argStack.cap){
+				argStack.data = (SlangHeader**)realloc(argStack.data,argStack.cap*2*sizeof(SlangHeader*));
+				argStack.cap *= 2;
+			}
+			argStack.data[argStack.size++] = argStack.data[base];
 		}
 		
 		inline void SetLocalArg(uint16_t index,SlangHeader* val){
@@ -1263,13 +1314,16 @@ namespace slang {
 				e->SetIndexed(index,val);
 		}
 		
-		inline void SetRecLocalArg(uint16_t index,SlangHeader* val){
-			size_t base = stack.Back().base;
-			argStack.data[base+index] = val;
+		inline void SetRecLocalArg(uint32_t index,SlangHeader* val){
+			argStack.data[argStack.size-index+1] = val;
 		}
 		
 		inline void PushFrame(){
-			StackData& d = stack.data[stack.size++];
+			if (stack.size>=stack.cap){
+				stack.data = (StackData*)realloc(stack.data,stack.cap*2*sizeof(StackData));
+				stack.cap *= 2;
+			}
+			StackData& d = stack.PlaceBack();
 			d.base = argStack.size;
 		}
 		
@@ -1311,12 +1365,13 @@ namespace slang {
 		
 		inline SlangEnv* AllocateEnvs(size_t);
 		inline void DefEnvSymbol(SlangEnv* e,SymbolName name,SlangHeader* val);
+		void DefOrSetEnvSymbol(SlangEnv* e,SymbolName name,SlangHeader* val);
 		inline void DefCurrEnvSymbol(SymbolName name,SlangHeader* val);
 		inline bool SetRecursiveSymbol(SymbolName name,SlangHeader* val);
 		inline SlangLambda* CreateLambda(size_t index);
 		inline SlangList* MakeVariadicList(size_t start,size_t end);
 		inline SlangVec* MakeVecFromArgs(size_t start,size_t end);
-		inline SlangHeader* Copy(SlangHeader*);
+		SlangHeader* Copy(SlangHeader*);
 		inline SlangList* CopyList(SlangList*);
 		inline void RehashDict(SlangDict* dict);
 		inline SlangDict* ReallocDict(SlangDict* dict);
@@ -1377,6 +1432,7 @@ namespace slang {
 		void RedefinedError(SymbolName);
 		void TypeError(SlangType found,SlangType expected);
 		void TypeError2(SlangType found,SlangType expected1,SlangType expected2);
+		void CharTypeError();
 		void AssertError();
 		void UnwrapError();
 		void ArityError(size_t found,size_t expectMin,size_t expectMax);

@@ -28,10 +28,11 @@ namespace slang {
 
 #ifndef NDEBUG
 size_t gAllocTotal = 0;
+size_t gMaxArgHeight = 0;
+size_t gMaxStackHeight = 0;
 #endif
 size_t gNameCollisions = 0;
 size_t gHeapAllocTotal = 0;
-size_t gMaxStackHeight = 0;
 size_t gSmallGCs = 0;
 size_t gReallocCount = 0;
 size_t gMaxArenaSize = 0;
@@ -308,8 +309,6 @@ inline const char* TypeToString(SlangType type){
 			return "Proc";
 		case SlangType::Env:
 			return "Env";
-		case SlangType::Params:
-			return "Params";
 		case SlangType::Storage:
 			return "Storage";
 		case SlangType::DictTable:
@@ -351,10 +350,6 @@ inline size_t SlangHeader::GetSize() const {
 		case SlangType::Env: {
 			return sizeof(SlangEnv);
 		}
-		case SlangType::Params: {
-			SlangParams* params = (SlangParams*)this;
-			return sizeof(SlangParams)+params->size*sizeof(SymbolName);
-		}
 		case SlangType::InputStream:
 		case SlangType::OutputStream:
 			return sizeof(SlangStream);
@@ -395,7 +390,6 @@ bool IsHashable(const SlangHeader* obj){
 	
 		case SlangType::NullType:
 		case SlangType::Dict:
-		case SlangType::Params:
 		case SlangType::Env:
 		case SlangType::Storage:
 		case SlangType::DictTable:
@@ -456,7 +450,6 @@ uint64_t SlangHashObj(const SlangHeader* obj){
 		}
 		
 		case SlangType::NullType:
-		case SlangType::Params:
 		case SlangType::Dict:
 		case SlangType::Env:
 		case SlangType::Storage:
@@ -549,7 +542,6 @@ inline void SlangWalkRefs(SlangHeader* obj,WalkFunc func,void* data){
 			return;
 		}
 		
-		case SlangType::Params:
 		case SlangType::Int:
 		case SlangType::Real:
 		case SlangType::Bool:
@@ -764,32 +756,23 @@ inline uint8_t* SlangAllocator::Allocate(size_t size){
 
 inline SlangObj* SlangAllocator::AllocateObj(SlangType type){
 	SlangObj* p = (SlangObj*)alloc(user,sizeof(SlangHeader)+sizeof(uint64_t));
+	memset(p,0,sizeof(SlangObj));
 	p->header.type = type;
-	p->header.flags = 0;
 	return p;
 }
 
 inline SlangLambda* SlangAllocator::AllocateLambda(){
 	SlangLambda* lam = (SlangLambda*)alloc(user,sizeof(SlangLambda));
+	memset(lam,0,sizeof(SlangLambda));
 	lam->header.type = SlangType::Lambda;
-	lam->header.flags = 0;
-	lam->env = nullptr;
 	return lam;
 }
 
 inline SlangList* SlangAllocator::AllocateList(){
 	SlangList* p = (SlangList*)alloc(user,sizeof(SlangList));
+	memset(p,0,sizeof(SlangList));
 	p->header.type = SlangType::List;
-	p->header.flags = 0;
 	return p;
-}
-
-inline SlangParams* SlangAllocator::AllocateParams(size_t size){
-	SlangParams* obj = (SlangParams*)alloc(user,sizeof(SlangParams)+sizeof(SymbolName)*size);
-	obj->header.type = SlangType::Params;
-	obj->header.flags = 0;
-	obj->size = size;
-	return obj;
 }
 
 inline SlangStorage* SlangAllocator::AllocateStorage(size_t size,uint16_t elemSize){
@@ -933,16 +916,6 @@ inline SlangHeader* SlangAllocator::MakeEOF(){
 	return obj;
 }
 
-// delete this
-inline SlangParams* SlangAllocator::MakeParams(const std::vector<SymbolName>& args){
-	SlangParams* params = AllocateParams(args.size());
-	size_t i=0;
-	for (const auto& arg : args){
-		params->params[i++] = arg;
-	}
-	return params;
-}
-
 inline void SlangEnv::AddBlock(SlangEnv* newEnv){
 	newEnv->parent = nullptr;
 	SlangEnv* curr = this;
@@ -1022,7 +995,6 @@ size_t GetRecursiveSize(SlangHeader* obj){
 		case SlangType::Real:
 		case SlangType::Bool:
 		case SlangType::Symbol:
-		case SlangType::Params:
 		case SlangType::Storage:
 		case SlangType::DictTable:
 		case SlangType::EndOfFile:
@@ -1177,8 +1149,6 @@ inline bool ConvertToBool(const SlangHeader* obj){
 		}
 		case SlangType::OutputStream:
 			return true;
-		case SlangType::Params:
-			return ((SlangParams*)obj)->size!=0;
 		case SlangType::Env:
 		case SlangType::Lambda:
 		case SlangType::List:
@@ -1250,7 +1220,6 @@ bool EqualObjs(const SlangHeader* a,const SlangHeader* b){
 			case SlangType::DictTable:
 			case SlangType::Lambda:
 			case SlangType::Env:
-			case SlangType::Params:
 				return false;
 			case SlangType::List:
 				return ListEquality((SlangList*)a,(SlangList*)b);
@@ -1367,7 +1336,6 @@ inline bool IdenticalObjs(const SlangHeader* l,const SlangHeader* r){
 		case SlangType::List:
 		case SlangType::NullType:
 		case SlangType::Env:
-		case SlangType::Params:
 		case SlangType::Lambda:
 		case SlangType::Storage:
 		case SlangType::DictTable:
@@ -1407,9 +1375,12 @@ inline bool IsValidPathPart(std::string_view s){
 }
 
 inline std::string GetBaseDir(const std::string& path){
-	size_t lastSlash = path.rfind(PATH_SEP);
-	if (lastSlash==std::string::npos) 
-		return {};
+	size_t lastSlash = path.rfind('/');
+	if (lastSlash==std::string::npos){
+		lastSlash = path.rfind('\\');
+		if (lastSlash==std::string::npos) 
+			return {};
+	}
 	return path.substr(0,lastSlash);
 }
 
@@ -1426,7 +1397,10 @@ void PrintInfo(){
 	std::cout << "Code alloc: " << codeAlloc << " (" << codeAlloc/1024 << " KB)\n";
 	size_t locSize = gDebugInterpreter->codeWriter.GetCodeLocationsSize();
 	std::cout << "Code location mem: " << locSize << " (" << locSize/1024 << " KB)\n";
+#ifndef NDEBUG
 	std::cout << "Max stack height: " << gMaxStackHeight << '\n';
+	std::cout << "Max arg height: " << gMaxArgHeight << '\n';
+#endif
 	std::cout << "Small GCs: " << gSmallGCs << '\n';
 	std::cout << "Realloc count: " << gReallocCount << '\n';
 	std::cout << "Max arena size: " << gMaxArenaSize/1024 << " KB\n";
@@ -1740,7 +1714,6 @@ inline SlangList* SlangParser::WrapExprIn(SymbolName func,SlangHeader* expr){
 	list->left = (SlangHeader*)q;
 	SlangList* listright = alloc.AllocateList();
 	listright->left = expr;
-	listright->right = nullptr;
 	list->right = (SlangHeader*)listright;
 
 	return list;
@@ -1873,10 +1846,19 @@ inline bool SlangParser::ParseVec(SlangHeader** res){
 
 inline bool SlangParser::ParseObj(SlangHeader** res){
 	LocationData loc = {token.line,token.col,currModule};
+	static char copyArr[32];
 	switch (token.type){
 		case SlangTokenType::Int: {
+			size_t size = token.view.size();
+			if (size>sizeof(copyArr)-1){
+				assert(false);
+				size = sizeof(copyArr)-1;
+			}
+			memcpy(copyArr,token.view.begin(),size);
+			copyArr[size] = 0;
+			
 			char* d;
-			int64_t i = strtoll(token.view.begin(),&d,10);
+			int64_t i = strtoll(copyArr,&d,10);
 			NextToken();
 			SlangObj* intObj = alloc.MakeInt(i);
 			codeMap[(SlangHeader*)intObj] = loc;
@@ -1884,9 +1866,17 @@ inline bool SlangParser::ParseObj(SlangHeader** res){
 			return true;
 		}
 		case SlangTokenType::Real: {
+			size_t size = token.view.size();
+			if (size>sizeof(copyArr)-1){
+				assert(false);
+				size = sizeof(copyArr)-1;
+			}
+			memcpy(copyArr,token.view.begin(),size);
+			copyArr[size] = 0;
+			
 			char* end;
 			errno = 0;
-			double r = strtod(token.view.begin(),&end);
+			double r = strtod(copyArr,&end);
 			NextToken();
 			if (errno==ERANGE){
 				PushError("Could not parse real: "+std::string(token.view));
@@ -2027,38 +2017,6 @@ void SlangParser::TestSeqMacro(SlangList* list,size_t argCount){
 	
 	SlangObj* obj = (SlangObj*)list->left;
 	switch (obj->symbol){
-		case SLANG_LET: {
-			if (argCount<=3) return;
-			// is named?
-			SlangList* next = (SlangList*)list->right;
-			if (GetType(next->left)==SlangType::Symbol){
-				if (argCount<=4) return;
-				SlangList* nextnext = (SlangList*)next->right;
-				SlangList* doWrapper = WrapExprSplice(SLANG_DO,(SlangList*)nextnext->right);
-				SlangList* newHead = alloc.AllocateList();
-				newHead->left = (SlangHeader*)doWrapper;
-				newHead->right = nullptr;
-				nextnext->right = (SlangHeader*)newHead;
-			} else {
-				// (let (()) b1 b2...)
-				SlangList* doWrapper = WrapExprSplice(SLANG_DO,(SlangList*)next->right);
-				SlangList* newHead = alloc.AllocateList();
-				newHead->left = (SlangHeader*)doWrapper;
-				newHead->right = nullptr;
-				next->right = (SlangHeader*)newHead;
-			}
-			return;
-		}
-		case SLANG_LAMBDA: {
-			if (argCount<=3) return;
-			SlangList* next = (SlangList*)list->right;
-			SlangList* doWrapper = WrapExprSplice(SLANG_DO,(SlangList*)next->right);
-			SlangList* newHead = alloc.AllocateList();
-			newHead->left = (SlangHeader*)doWrapper;
-			newHead->right = nullptr;
-			next->right = (SlangHeader*)newHead;
-			return;
-		}
 		case SLANG_DEFINE: {
 			// (def (func arg1 arg2...) expr1 expr2...) ->
 			// (def func (& (arg1 arg2...) (do expr1 expr2...)))
@@ -2078,10 +2036,8 @@ void SlangParser::TestSeqMacro(SlangList* list,size_t argCount){
 			inbetween->left = args->right;
 			next->left = funcName;
 			SlangList* lambdaList = alloc.AllocateList();
-			lambdaList->right = nullptr;
 			lambdaList->left = (SlangHeader*)lambdaWrapper;
 			next->right = (SlangHeader*)lambdaList;
-			TestSeqMacro(lambdaWrapper,GetArgCount(lambdaWrapper));
 			return;
 		}
 		default:
@@ -2289,7 +2245,7 @@ void CodeWriter::LetRecError(const SlangHeader* expr,SymbolName sym){
 
 void CodeWriter::DefError(const SlangHeader* expr){
 	std::stringstream msg = {};
-	msg << "Can only use 'def' in the global scope";
+	msg << "Can only use 'def' in the global scope or at the start of a function";
 		
 	PushError(expr,"DefError",msg.str());
 }
@@ -2319,9 +2275,7 @@ void CodeWriter::ArityError(const SlangHeader* head,size_t found,size_t expectMi
 }
 
 void CodeWriter::DotError(const SlangHeader* expr){
-	std::stringstream msg = {};
-	msg << "Expected List instead of DottedList";
-	PushError(expr,"TypeError",msg.str());
+	PushError(expr,"TypeError","Expected type List instead of DottedList");
 }
 
 inline void* CodeWriterObjAlloc(void* data,size_t s){
@@ -2472,12 +2426,13 @@ enum SlangOpCodes {
 	SLANG_OP_GET_GLOBAL,
 	SLANG_OP_SET_GLOBAL,
 	SLANG_OP_DEF_GLOBAL,
-	SLANG_OP_GET_REC,
-	SLANG_OP_SET_REC,
+	SLANG_OP_GET_STACK,
+	SLANG_OP_SET_STACK,
 	
 	// arg manip
 	SLANG_OP_PUSH_FRAME,
 	SLANG_OP_POP_ARG,
+	SLANG_OP_INTERNAL_DEF,
 	SLANG_OP_UNPACK,
 	SLANG_OP_COPY,
 	// functions calls
@@ -2500,6 +2455,9 @@ enum SlangOpCodes {
 	SLANG_OP_MAYBE_UNWRAP,
 	
 	SLANG_OP_MAP_STEP,
+	SLANG_OP_FOREACH_STEP,
+	SLANG_OP_FILTER_STEP,
+	SLANG_OP_FOLD_STEP,
 	
 	SLANG_OP_NOT,
 	// simple math
@@ -2551,10 +2509,11 @@ static const size_t SlangOpSizes[] = {
 	OPCODE_SIZE+8,  // SLANG_OP_GET_GLOBAL
 	OPCODE_SIZE+8,  // SLANG_OP_SET_GLOBAL
 	OPCODE_SIZE+8,  // SLANG_OP_DEF_GLOBAL
-	OPCODE_SIZE+2,  // SLANG_OP_GET_REC
-	OPCODE_SIZE+2,  // SLANG_OP_SET_REC
+	OPCODE_SIZE+4,  // SLANG_OP_GET_STACK
+	OPCODE_SIZE+4,  // SLANG_OP_SET_STACK
 	OPCODE_SIZE,    // SLANG_OP_PUSH_FRAME
 	OPCODE_SIZE,    // SLANG_OP_POP_ARG
+	OPCODE_SIZE+4,  // SLANG_OP_INTERNAL_DEF
 	OPCODE_SIZE,    // SLANG_OP_UNPACK
 	OPCODE_SIZE,    // SLANG_OP_COPY
 	OPCODE_SIZE,    // SLANG_OP_CALL
@@ -2574,6 +2533,9 @@ static const size_t SlangOpSizes[] = {
 	OPCODE_SIZE,    // SLANG_OP_MAYBE_WRAP
 	OPCODE_SIZE,    // SLANG_OP_MAYBE_UNWRAP
 	OPCODE_SIZE+2,  // SLANG_OP_MAP_STEP
+	OPCODE_SIZE+2,  // SLANG_OP_FOREACH_STEP
+	OPCODE_SIZE,    // SLANG_OP_FILTER_STEP
+	OPCODE_SIZE,    // SLANG_OP_FOLD_STEP
 	OPCODE_SIZE,    // SLANG_OP_NOT
 	OPCODE_SIZE,    // SLANG_OP_INC
 	OPCODE_SIZE,    // SLANG_OP_DEC
@@ -2598,10 +2560,97 @@ static const size_t SlangOpSizes[] = {
 };
 static_assert(SL_ARR_LEN(SlangOpSizes)==SLANG_OP_COUNT);	
 
-inline void CodeWriter::WriteOpCode(uint8_t op){
+void CodeWriter::WriteOpCode(uint8_t op){
 	CODE_REALLOC_BLOCK(uint8_t);
 	lastInst = curr->write;
 	*curr->write++ = op;
+}
+
+void CodeWriter::WritePushFrame(){
+	WriteOpCode(SLANG_OP_PUSH_FRAME);
+	currFrames.PushBack(currHeights.Back());
+}
+
+void CodeWriter::WriteCall(bool terminating){
+	assert(currFrames.size);
+	if (terminating){
+		WriteOpCode(SLANG_OP_RETCALL);
+		currFrames.PopBack();
+	} else {
+		WriteOpCode(SLANG_OP_CALL);
+		currHeights.Back() = currFrames.Back()+1;
+		currFrames.PopBack();
+	}
+}
+
+void CodeWriter::WriteCallSym(SymbolName sym,bool terminating){
+	assert(currFrames.size);
+	if (terminating){
+		WriteOpCode(SLANG_OP_RETCALLSYM);
+		currFrames.PopBack();
+	} else {
+		WriteOpCode(SLANG_OP_CALLSYM);
+		currHeights.Back() = currFrames.Back()+1;
+		currFrames.PopBack();
+	}
+	
+	WriteInt16(sym);
+}
+
+void CodeWriter::WriteRet(){
+	WriteOpCode(SLANG_OP_RET);
+}
+
+void CodeWriter::WriteUnpack(){
+	WriteOpCode(SLANG_OP_UNPACK);
+}
+
+void CodeWriter::WritePop(){
+	WriteOpCode(SLANG_OP_POP_ARG);
+	--currHeights.Back();
+}
+
+void CodeWriter::WriteNull(){
+	WriteOpCode(SLANG_OP_NULL);
+	++currHeights.Back();
+}
+
+void CodeWriter::WriteTrue(){
+	WriteOpCode(SLANG_OP_BOOL_TRUE);
+	++currHeights.Back();
+}
+
+void CodeWriter::WriteFalse(){
+	WriteOpCode(SLANG_OP_BOOL_FALSE);
+	++currHeights.Back();
+}
+
+void CodeWriter::WriteZero(){
+	WriteOpCode(SLANG_OP_ZERO);
+	++currHeights.Back();
+}
+
+void CodeWriter::WriteOne(){
+	WriteOpCode(SLANG_OP_ONE);
+	++currHeights.Back();
+}
+
+void CodeWriter::WriteMakeVec(){
+	WriteOpCode(SLANG_OP_MAKE_VEC);
+	currHeights.Back() = currFrames.Back();
+	assert(currFrames.size);
+	currFrames.PopBack();
+}
+
+void CodeWriter::WriteMakePair(){
+	WriteOpCode(SLANG_OP_PAIR);
+	--currHeights.Back();
+}
+
+void CodeWriter::WriteMakeLambda(uint64_t lambdaIndex){
+	WriteOpCode(SLANG_OP_PUSH_LAMBDA);
+	WriteInt64(lambdaIndex);
+	++currHeights.Back();
 }
 
 inline void CodeWriter::WriteInt16(uint16_t i){
@@ -2691,6 +2740,12 @@ inline void CodeWriter::WriteSymbolName(SymbolName sym){
 	*curr->write++ = sym&0xFF;
 }
 
+void CodeWriter::WriteLoadPtr(const void* ptr){
+	WriteOpCode(SLANG_OP_LOAD_PTR);
+	WritePointer(ptr);
+	++currHeights.Back();
+}
+
 inline size_t CodeWriter::WriteStartJump(){
 	size_t offset = curr->write-curr->start;
 	assert(offset<INT32_MAX);
@@ -2736,6 +2791,7 @@ inline size_t CodeWriter::WriteStartCJumpPop(bool jumpOn){
 	}
 	// 4 NOOPs
 	WriteSInt32(0);
+	--currHeights.Back();
 	return offset;
 }
 
@@ -2786,6 +2842,49 @@ inline bool IsDotted(SlangList* argIt){
 	return false;
 }
 
+inline bool CodeWriter::IsFuncPure(SymbolName funcName) const {
+	if (funcName<GLOBAL_SYMBOL_COUNT){
+		uint8_t purityLevel = gGlobalPurityArray[funcName];
+		if (purityLevel==SLANG_IMPURE) return false;
+		return true;
+	}
+	if (!knownLambdaStack.back().contains(funcName))
+		return false;
+		
+	size_t funcIndex = knownLambdaStack.back().at(funcName);
+	if (!lambdaCodes[funcIndex].isPure)
+		return false;
+	return true;
+}
+
+inline bool CodeWriter::IsLambdaPure(const SlangList* argIt) const {
+	if (GetType((SlangHeader*)argIt)!=SlangType::List)
+		return false;
+	
+	argIt = (SlangList*)argIt->right;
+	if (GetType((SlangHeader*)argIt)!=SlangType::List)
+		return false;
+	
+	argIt = (SlangList*)argIt->right;
+	while (argIt){
+		if (!IsList((SlangHeader*)argIt))
+			return false;
+		
+		if (!IsPure(argIt->left))
+			return false;
+		argIt = (SlangList*)argIt->right;
+	}
+	
+	return true;
+}
+
+inline bool IsLambda(const SlangList* ls){
+	if (GetType(ls->left)!=SlangType::Symbol)
+		return false;
+	SymbolName sym = ((SlangObj*)ls->left)->symbol;
+	return sym==SLANG_LAMBDA;
+}
+
 inline bool CodeWriter::IsPure(const SlangHeader* expr) const {
 	if (GetType(expr)!=SlangType::List)
 		return true;
@@ -2794,8 +2893,11 @@ inline bool CodeWriter::IsPure(const SlangHeader* expr) const {
 	SlangHeader* head = list->left;
 	SlangType headType = GetType(head);
 	if (headType==SlangType::List){
-		if (!IsPure(head))
+		if (IsLambda((SlangList*)head)){
+			return IsLambdaPure((SlangList*)head);
+		} else {
 			return false;
+		}
 	} else if (headType!=SlangType::Symbol) 
 		return true;
 	SymbolName sym = ((SlangObj*)head)->symbol;
@@ -2805,6 +2907,27 @@ inline bool CodeWriter::IsPure(const SlangHeader* expr) const {
 		if (purityLevel==SLANG_IMPURE) return false;
 		
 		SlangList* argIt = (SlangList*)list->right;
+		switch (sym){
+			case SLANG_MAP:
+			case SLANG_FOREACH:
+			case SLANG_FILTER:
+			case SLANG_FOLD: {
+				SlangHeader* arrFunc = argIt->left;
+				if (GetType(arrFunc)==SlangType::Symbol){
+					SymbolName s = ((SlangObj*)arrFunc)->symbol;
+					if (!IsFuncPure(s))
+						return false;
+				} else {
+					if (IsLambda(argIt)){
+						if (!IsLambdaPure(argIt))
+							return false;
+					} else {
+						return false;
+					}
+				}
+				break;
+			}
+		}
 		if (!IsList((SlangHeader*)argIt)) return false;
 		while (argIt){
 			if (!IsPure(argIt->left))
@@ -2816,11 +2939,7 @@ inline bool CodeWriter::IsPure(const SlangHeader* expr) const {
 		return true;
 	}
 	
-	if (!knownLambdaStack.back().contains(sym))
-		return false;
-		
-	size_t funcIndex = knownLambdaStack.back().at(sym);
-	if (!lambdaCodes[funcIndex].isPure)
+	if (!IsFuncPure(sym))
 		return false;
 	
 	SlangList* argIt = (SlangList*)list->right;
@@ -2836,18 +2955,45 @@ inline bool CodeWriter::IsPure(const SlangHeader* expr) const {
 	return true;
 }
 
-bool CodeWriter::SymbolInStarParams(SymbolName sym,uint16_t& into) const {
+bool CodeWriter::SymbolInStarParams(SymbolName sym,uint32_t& height) const {
+	if (lambdaStack.empty()) return false;
+	size_t stackIdx = lambdaStack.size()-1;
+	//size_t accHeight = 0;
+	while (true){
+		const LambdaData& lam = lambdaStack[stackIdx];
+		if (!lam.isStar)
+			return false;
+		for (size_t i=0;i<lam.params.size;++i){
+			SymbolName s = lam.params.data[i];
+			if (sym==s){
+				height = currHeights.Back()-lam.paramHeights.data[i]+1;
+				return true;
+			}
+		}
+		if (stackIdx==0)
+			break;
+		--stackIdx;
+		//accHeight += currHeights.Back();
+	}
+	return false;
+}
+
+bool CodeWriter::SymbolInInternalDefs(SymbolName sym,uint32_t& height) const {
 	if (lambdaStack.empty()) return false;
 	const LambdaData& lam = lambdaStack.back();
-	if (!lam.isStar)
-		return false;
-	for (size_t i=0;i<lam.params.size;++i){
-		SymbolName s = lam.params.data[i];
+	
+	for (size_t i=0;i<lam.defs.size;++i){
+		// if not defined yet
+		if (i>=lam.currInternalDef){
+			return false;
+		}
+		SymbolName s = lam.defs.data[i];
 		if (sym==s){
-			into = i;
+			height = currHeights.Back()-(lam.defHeightsStart+i);
 			return true;
 		}
 	}
+	
 	return false;
 }
 
@@ -2875,8 +3021,17 @@ bool CodeWriter::SymbolNotInAnyParams(SymbolName sym) const {
 	size_t stackIdx = lambdaStack.size()-1;
 	while (true){
 		const LambdaData& lam = lambdaStack[stackIdx];
+		if (lam.funcName==sym)
+			return false;
+		
 		for (size_t i=0;i<lam.params.size;++i){
 			SymbolName s = lam.params.data[i];
+			if (sym==s){
+				return false;
+			}
+		}
+		for (size_t i=0;i<lam.defs.size;++i){
+			SymbolName s = lam.defs.data[i];
 			if (sym==s){
 				return false;
 			}
@@ -2907,6 +3062,13 @@ void CodeWriter::AddClosureParam(SymbolName sym){
 				return;
 			}
 		}
+		for (size_t i=0;i<lam.defs.size;++i){
+			auto s = lam.defs.data[i];
+			if (sym==s){
+				lam.isClosure = true;
+				return;
+			}
+		}
 		if (stackIdx==0)
 			break;
 		--stackIdx;
@@ -2922,6 +3084,14 @@ SlangHeader* CodeWriter::MakeSymbolConst(SymbolName sym){
 	return (SlangHeader*)alloc.MakeSymbol(sym);
 }
 
+void CodeWriter::InitCompile(){
+	currHeights.Clear();
+	currHeights.PushBack(0);
+	currFrames.Clear();
+	lambdaStack.clear();
+}
+
+// used for evals
 bool CodeWriter::CompileData(const SlangHeader* obj){
 	if (evalFuncIndex==-1ULL){
 		evalFuncIndex = lambdaCodes.size();
@@ -2932,6 +3102,7 @@ bool CodeWriter::CompileData(const SlangHeader* obj){
 		curr->isPure = true;
 	}
 	curr->moduleIndex = currModuleIndex;
+	InitCompile();
 	
 	if (!CompileExpr(obj))
 		return false;
@@ -2948,6 +3119,7 @@ bool CodeWriter::CompileCode(const std::string& code){
 	curr->write = curr->start;
 	curr->isPure = false;
 	curr->moduleIndex = 0;
+	InitCompile();
 	
 	parser.SetCodeString(code);
 	SlangHeader* expr;
@@ -2955,7 +3127,7 @@ bool CodeWriter::CompileCode(const std::string& code){
 		if (!CompileExpr(expr))
 			return false;
 		if (parser.token.type!=SlangTokenType::EndOfFile){
-			WriteOpCode(SLANG_OP_POP_ARG);
+			WritePop();
 		} else {
 			break;
 		}
@@ -2978,6 +3150,7 @@ bool CodeWriter::CompileModule(ModuleName name,const std::string& code,size_t& f
 	knownLambdaStack.emplace_back();
 	curr->write = curr->start;
 	curr->isPure = true;
+	InitCompile();
 	
 	parser.SetCodeString(code);
 	SlangHeader* expr;
@@ -2985,7 +3158,7 @@ bool CodeWriter::CompileModule(ModuleName name,const std::string& code,size_t& f
 		if (!CompileExpr(expr))
 			return false;
 		if (parser.token.type!=SlangTokenType::EndOfFile){
-			WriteOpCode(SLANG_OP_POP_ARG);
+			WritePop();
 		} else {
 			break;
 		}
@@ -3037,28 +3210,36 @@ bool CodeWriter::CompileDefine(const SlangHeader* head){
 	
 	if (defType==SLANG_SET){
 		uint16_t p;
-		if (SymbolInStarParams(sym,p)){
-			WriteOpCode(SLANG_OP_SET_REC);
-			WriteInt16(p);
+		uint32_t height;
+		if (SymbolInStarParams(sym,height)){
+			WriteOpCode(SLANG_OP_SET_STACK);
+			WriteInt32(height);
+			--currHeights.Back();
+		} else if (SymbolInInternalDefs(sym,height)){
+			PushError(head,"SetError","Cannot set internal definition!");
+			return false;
 		} else if (SymbolInParams(sym,p)){
 			WriteOpCode(SLANG_OP_SET_LOCAL);
 			WriteInt16(p);
+			--currHeights.Back();
 		} else if (SymbolNotInAnyParams(sym)){
 			WriteOpCode(SLANG_OP_SET_GLOBAL);
 			WriteSymbolName(sym);
+			--currHeights.Back();
 		} else {
 			// closure set
 			WriteOpCode(SLANG_OP_SET);
 			WriteSymbolName(sym);
 			AddClosureParam(sym);
+			--currHeights.Back();
 		}
 	} else {
 		WriteOpCode(SLANG_OP_DEF_GLOBAL);
 		WriteSymbolName(sym);
+		--currHeights.Back();
 	}
 	
-	WriteOpCode(SLANG_OP_NULL);
-	
+	WriteNull();
 	return true;
 }
 
@@ -3070,7 +3251,7 @@ bool CodeWriter::CompileMap(const SlangHeader* expr){
 		return false;
 	}
 	
-	WriteOpCode(SLANG_OP_PUSH_FRAME);
+	WritePushFrame();
 	
 	if (func->type==SlangType::Symbol){
 		SymbolName sym = ((SlangObj*)func)->symbol;
@@ -3093,8 +3274,7 @@ bool CodeWriter::CompileMap(const SlangHeader* expr){
 				return false;
 			}
 			
-			WriteOpCode(SLANG_OP_CALLSYM);
-			WriteInt16(SLANG_MAP);
+			WriteCallSym(SLANG_MAP);
 			return true;
 		}
 	}
@@ -3108,16 +3288,185 @@ bool CodeWriter::CompileMap(const SlangHeader* expr){
 		++argCount;
 	}
 	
-		
 	if (!CompileExpr(func))
 		return false;
 	
 	// where return list will be stored
-	WriteOpCode(SLANG_OP_NULL);
-	WriteOpCode(SLANG_OP_NULL);
+	WriteNull();
+	WriteNull();
 	
 	WriteOpCode(SLANG_OP_MAP_STEP);
 	WriteInt16(argCount);
+	currHeights.Back() = currFrames.Back()+1;
+	currFrames.PopBack();
+	AddCodeLocation(expr);
+	
+	return true;
+}
+
+bool CodeWriter::CompileForeach(const SlangHeader* expr){
+	SlangList* argIt = (SlangList*)((SlangList*)expr)->right;
+	SlangHeader* func = argIt->left;
+	if (GetType(func)!=SlangType::Symbol&&GetType(func)!=SlangType::List){
+		TypeError(expr,GetType(func),SlangType::Lambda);
+		return false;
+	}
+	
+	WritePushFrame();
+	
+	if (func->type==SlangType::Symbol){
+		SymbolName sym = ((SlangObj*)func)->symbol;
+		
+		if (sym<GLOBAL_SYMBOL_COUNT){
+			if (!CompileConst(func))
+				return false;
+			
+			argIt = (SlangList*)argIt->right;
+			size_t argCount = 0;
+			while (argIt){
+				if (!CompileExpr(argIt->left))
+					return false;
+				argIt = (SlangList*)argIt->right;
+				++argCount;
+			}
+			
+			if (!GoodArity(sym,argCount)){
+				ArityError(func,argCount,gGlobalArityArray[sym].min,gGlobalArityArray[sym].max);
+				return false;
+			}
+			
+			WriteCallSym(SLANG_FOREACH);
+			return true;
+		}
+	}
+		
+	argIt = (SlangList*)argIt->right;
+	size_t argCount = 0;
+	while (argIt){
+		if (!CompileExpr(argIt->left))
+			return false;
+		argIt = (SlangList*)argIt->right;
+		++argCount;
+	}
+	
+	if (!CompileExpr(func))
+		return false;
+	
+	WriteOpCode(SLANG_OP_FOREACH_STEP);
+	WriteInt16(argCount);
+	currHeights.Back() = currFrames.Back()+1;
+	currFrames.PopBack();
+	AddCodeLocation(expr);
+	
+	return true;
+}
+
+bool CodeWriter::CompileFilter(const SlangHeader* expr){
+	SlangList* argIt = (SlangList*)((SlangList*)expr)->right;
+	SlangHeader* func = argIt->left;
+	if (GetType(func)!=SlangType::Symbol&&GetType(func)!=SlangType::List){
+		TypeError(expr,GetType(func),SlangType::Lambda);
+		return false;
+	}
+	
+	WritePushFrame();
+	
+	if (func->type==SlangType::Symbol){
+		SymbolName sym = ((SlangObj*)func)->symbol;
+		
+		if (sym<GLOBAL_SYMBOL_COUNT){
+			if (!CompileConst(func))
+				return false;
+			
+			argIt = (SlangList*)argIt->right;
+			
+			if (!CompileExpr(argIt->left))
+				return false;
+			argIt = (SlangList*)argIt->right;
+			
+			if (!GoodArity(sym,1)){
+				ArityError(func,1,gGlobalArityArray[sym].min,gGlobalArityArray[sym].max);
+				return false;
+			}
+			
+			WriteCallSym(SLANG_FILTER);
+			return true;
+		}
+	}
+		
+	argIt = (SlangList*)argIt->right;
+	
+	if (!CompileExpr(argIt->left))
+		return false;
+	
+	if (!CompileExpr(func))
+		return false;
+	
+	// where return list will be stored
+	WriteNull();
+	WriteNull();
+	
+	WriteOpCode(SLANG_OP_FILTER_STEP);
+	currHeights.Back() = currFrames.Back()+1;
+	currFrames.PopBack();
+	AddCodeLocation(expr);
+	
+	return true;
+}
+
+bool CodeWriter::CompileFold(const SlangHeader* expr){
+	SlangList* argIt = (SlangList*)((SlangList*)expr)->right;
+	SlangHeader* func = argIt->left;
+	if (GetType(func)!=SlangType::Symbol&&GetType(func)!=SlangType::List){
+		TypeError(expr,GetType(func),SlangType::Lambda);
+		return false;
+	}
+	
+	argIt = (SlangList*)argIt->right;
+	WritePushFrame();
+	
+	if (func->type==SlangType::Symbol){
+		SymbolName sym = ((SlangObj*)func)->symbol;
+		
+		if (sym<GLOBAL_SYMBOL_COUNT){
+			if (!CompileConst(func))
+				return false;
+			
+			// compile init val
+			if (!CompileExpr(argIt->left))
+				return false;
+			argIt = (SlangList*)argIt->right;
+			
+			// compile list arg
+			if (!CompileExpr(argIt->left))
+				return false;
+			
+			if (!GoodArity(sym,2)){
+				ArityError(func,2,gGlobalArityArray[sym].min,gGlobalArityArray[sym].max);
+				return false;
+			}
+			
+			WriteCallSym(SLANG_FOLD);
+			return true;
+		}
+	}
+	
+	// compile init val
+	if (!CompileExpr(argIt->left))
+		return false;
+	argIt = (SlangList*)argIt->right;
+	
+	// compile list arg
+	if (!CompileExpr(argIt->left))
+		return false;
+	
+	if (!CompileExpr(func))
+		return false;
+	
+	WriteOpCode(SLANG_OP_FOLD_STEP);
+	currHeights.Back() = currFrames.Back()+1;
+	currFrames.PopBack();
+	AddCodeLocation(expr);
 	
 	return true;
 }
@@ -3126,6 +3475,7 @@ bool CodeWriter::CompileTry(const SlangHeader* expr){
 	SlangList* argIt = (SlangList*)((SlangList*)expr)->right;
 	if (!argIt){
 		WriteOpCode(SLANG_OP_MAYBE_NULL);
+		++currHeights.Back();
 		return true;
 	}
 	size_t tryOffset = StartTryOp();
@@ -3150,31 +3500,35 @@ bool CodeWriter::CompileUnwrap(const SlangHeader* expr){
 }
 
 bool CodeWriter::CompileLambdaBody(
-		const SlangHeader* head,
+		const SlangList* exprs,
 		const std::vector<SlangHeader*>* initExprs,
+		const std::vector<SlangHeader*>* internalDefs,
 		size_t& lambdaIndex){
 	size_t savedCurrOffset = curr-&lambdaCodes.front();
 	uint8_t* savedLastInst = lastInst;
 	SymbolName funcName = lambdaStack.back().funcName;
 	lambdaIndex = lambdaCodes.size();
+	size_t framesHeight = currFrames.size;
+	currHeights.PushBack(0);
 	
 	if (funcName!=LET_SELF_SYM&&funcName!=EMPTY_NAME){
 		// second def with this funcName
 		if (knownLambdaStack.back().contains(funcName)){
-			FuncRedefinedError(head,funcName);
+			FuncRedefinedError(exprs->left,funcName);
 			return false;
 		}
 		knownLambdaStack.back()[funcName] = lambdaIndex;
 	} else if (funcName==EMPTY_NAME&&currSetName!=EMPTY_NAME){
 		// trying to set! a known lambda
 		if (knownLambdaStack.back().contains(currSetName)){
-			FuncRedefinedError(head,currSetName);
+			FuncRedefinedError(exprs->left,currSetName);
 			return false;
 		}
 	}
 	
 	curr = &lambdaCodes[AllocNewBlock(32)];
 	curr->params = lambdaStack.back().params;
+	curr->defs = lambdaStack.back().defs;
 	curr->isVariadic = lambdaStack.back().isVariadic;
 	curr->name = funcName;
 	
@@ -3191,18 +3545,61 @@ bool CodeWriter::CompileLambdaBody(
 			currDefName = param;
 			if (!CompileExpr(expr))
 				return false;
-			currDefName = EMPTY_NAME;
+			//currDefName = EMPTY_NAME;
 			WriteOpCode(SLANG_OP_SET_LOCAL);
 			WriteInt16(argIndex++);
+			--currHeights.Back();
 		}
 		currDefName = oldDefName;
 		lambdaStack.back().currLetInit = argIndex;
 	}
 	
-	if (!IsPure(head))
-		curr->isPure = false;
-	if (!CompileExpr(head,true)){
-		return false;
+	if (internalDefs){
+		size_t oldDefName = currDefName;
+		size_t argIndex = 0;
+		lambdaStack.back().defHeightsStart = currHeights.Back();
+		for (const auto* expr : *internalDefs){
+			SymbolName internalDefName = lambdaStack.back().defs.data[argIndex];
+			lambdaStack.back().currInternalDef = argIndex;
+			if (!IsPure(expr))
+				curr->isPure = false;
+			currDefName = internalDefName;
+			if (!CompileExpr(expr))
+				return false;
+			WriteOpCode(SLANG_OP_INTERNAL_DEF);
+			WriteInt32(argIndex++);
+			//currDefName = EMPTY_NAME;
+		}
+		currDefName = oldDefName;
+		lambdaStack.back().currInternalDef = argIndex;
+	}
+	
+	const SlangList* argIt = exprs;
+	if (!argIt){
+		WriteNull();
+		WriteRet();
+	} else {
+		while (argIt->right){
+			if (!IsPure(argIt->left)){
+				curr->isPure = false;
+			} else if (optimize){
+				argIt = (SlangList*)argIt->right;
+				continue;
+			}
+			
+			if (!CompileExpr(argIt->left)){
+				return false;
+			}
+			WritePop();
+			
+			argIt = (SlangList*)argIt->right;
+		}
+		if (!IsPure(argIt->left)){
+			curr->isPure = false;
+		}
+		if (!CompileExpr(argIt->left,true)){
+			return false;
+		}
 	}
 	
 	curr->isClosure = lambdaStack.back().isClosure;
@@ -3210,7 +3607,25 @@ bool CodeWriter::CompileLambdaBody(
 	curr = &lambdaCodes[savedCurrOffset];
 	lastInst = savedLastInst;
 	knownLambdaStack.pop_back();
+	if (framesHeight!=currFrames.size){
+		std::cout << parser.GetSymbolString(funcName) << '\n';
+		std::cout << framesHeight << "," << currFrames.size << '\n';
+	}
+	assert(framesHeight==currFrames.size);
+	currHeights.PopBack();
+	
 	return true;
+}
+
+bool IsInternalDef(const SlangHeader* expr){
+	SlangType t = GetType(expr);
+	if (t!=SlangType::List)
+		return false;
+	
+	SlangHeader* funcObj = ((SlangList*)expr)->left;
+	if (GetType(funcObj)!=SlangType::Symbol)
+		return false;
+	return ((SlangObj*)funcObj)->symbol==SLANG_DEFINE;
 }
 
 bool CodeWriter::CompileLambda(const SlangHeader* head){
@@ -3222,7 +3637,7 @@ bool CodeWriter::CompileLambda(const SlangHeader* head){
 	SlangList* argIt = (SlangList*)args;
 	
 	if (!IsList(argIt->left)&&GetType(argIt->left)!=SlangType::Symbol){
-		TypeError(argIt->left,GetType(argIt->left),SlangType::Params);
+		TypeError(argIt->left,GetType(argIt->left),SlangType::Symbol);
 		return false;
 	}
 	
@@ -3264,25 +3679,60 @@ bool CodeWriter::CompileLambda(const SlangHeader* head){
 
 	uint64_t lambdaIndex;
 	{
-		LambdaData dat{currDefName,params};
+		LambdaData dat{currDefName,params,{},{}};
 		dat.isVariadic = variadic;
 		lambdaStack.push_back(dat);
 	}
 	currDefName = EMPTY_NAME;
-	if (!CompileLambdaBody(argIt->left,nullptr,lambdaIndex))
+	
+	Vector<SymbolName> defNames{};
+	std::vector<SlangHeader*> internalDefs{};
+	internalDefs.reserve(4);
+	while (IsInternalDef(argIt->left)){
+		SlangList* defExpr = (SlangList*)argIt->left;
+		size_t defArgCount = GetArgCount(defExpr);
+		if (defArgCount!=3){
+			ArityError(argIt->left,defArgCount,3,3);
+			return false;
+		}
+		SlangHeader* symbolObj = ((SlangList*)defExpr->right)->left;
+		if (GetType(symbolObj)!=SlangType::Symbol){
+			TypeError(argIt->left,GetType(symbolObj),SlangType::Symbol);
+			return false;
+		}
+		SymbolName sym = ((SlangObj*)symbolObj)->symbol;
+		SlangList* defBodyIt = (SlangList*)((SlangList*)defExpr->right)->right;
+		
+		if (seen.contains(sym)){
+			RedefinedError(argIt->left,sym);
+			return false;
+		}
+		
+		defNames.PushBack(sym);
+		seen.insert(sym);
+		internalDefs.push_back(defBodyIt->left);
+		
+		argIt = (SlangList*)argIt->right;
+		if (!argIt)
+			break;
+	}
+	if (!internalDefs.empty()){
+		lambdaStack.back().defs = defNames;
+	}
+	
+	if (!CompileLambdaBody(argIt,nullptr,&internalDefs,lambdaIndex))
 		return false;
 	lambdaStack.pop_back();
-	WriteOpCode(SLANG_OP_PUSH_LAMBDA);
-	WriteInt64(lambdaIndex);
+	WriteMakeLambda(lambdaIndex);
 	return true;
 }
 
 bool CodeWriter::CompileDo(const SlangHeader* head,bool terminating){
 	SlangList* argIt = (SlangList*)((SlangList*)head)->right;
 	if (!argIt){
-		WriteOpCode(SLANG_OP_NULL);
+		WriteNull();
 		if (terminating)
-			WriteOpCode(SLANG_OP_RET);
+			WriteRet();
 		return true;
 	}
 	
@@ -3294,7 +3744,7 @@ bool CodeWriter::CompileDo(const SlangHeader* head,bool terminating){
 		
 		if (!CompileExpr(argIt->left))
 			return false;
-		WriteOpCode(SLANG_OP_POP_ARG);
+		WritePop();
 		
 		argIt = (SlangList*)argIt->right;
 	}
@@ -3310,6 +3760,8 @@ bool CodeWriter::CompileIf(const SlangHeader* head,bool terminating){
 	
 	size_t start = WriteStartCJumpPop(false);
 	
+	size_t falseHeight = currHeights.Back();
+	
 	argIt = ((SlangList*)argIt)->right;
 	SlangHeader* truePath = ((SlangList*)argIt)->left;
 	if (!CompileExpr(truePath,terminating))
@@ -3319,18 +3771,19 @@ bool CodeWriter::CompileIf(const SlangHeader* head,bool terminating){
 	if (!argIt){
 		if (terminating){
 			FinishCJump(start);
-			WriteOpCode(SLANG_OP_NULL);
-			WriteOpCode(SLANG_OP_RET);
+			WriteNull();
+			WriteRet();
 			return true;
 		} else {
 			size_t falseJump = WriteStartJump();
 			FinishCJump(start);
-			WriteOpCode(SLANG_OP_NULL);
+			WriteNull();
 			FinishJump(falseJump);
 			return true;
 		}
 	}
 	
+	currHeights.Back() = falseHeight;
 	if (terminating){
 		FinishCJump(start);
 		SlangHeader* falsePath = ((SlangList*)argIt)->left;
@@ -3354,11 +3807,8 @@ bool ObjIsFalse(const SlangHeader* expr){
 	return expr->boolVal==false;
 }
 
-bool ObjIsElseOrTrue(const SlangHeader* expr){
-	if (GetType(expr)==SlangType::Bool){
-		if (expr->boolVal)
-			return true;
-	} else if (GetType(expr)==SlangType::Symbol){
+bool ObjIsElse(const SlangHeader* expr){
+	if (GetType(expr)==SlangType::Symbol){
 		if (((SlangObj*)expr)->symbol==SLANG_ELSE)
 			return true;
 	}
@@ -3428,6 +3878,9 @@ bool CodeWriter::CompileCase(const SlangHeader* expr,bool terminating){
 	size_t caseJumpStart = curr->write-curr->start;
 	WriteOpCode(SLANG_OP_CASE_JUMP);
 	WriteInt32(caseDictIndex);
+	--currHeights.Back();
+	
+	size_t caseDefaultHeight = currHeights.Back();
 	
 	Vector<CaseDictElement> cases;
 	Vector<size_t> jumpToEnds;
@@ -3445,6 +3898,8 @@ bool CodeWriter::CompileCase(const SlangHeader* expr,bool terminating){
 			argIt = (SlangList*)argIt->right;
 			continue;
 		}
+		
+		currHeights.Back() = caseDefaultHeight;
 		
 		// first the params
 		// if is an else?
@@ -3482,9 +3937,9 @@ bool CodeWriter::CompileCase(const SlangHeader* expr,bool terminating){
 		// onto the exprs
 		exprIt = (SlangList*)exprIt->right;
 		if (!exprIt){
-			WriteOpCode(SLANG_OP_NULL);
+			WriteNull();
 			if (terminating){
-				WriteOpCode(SLANG_OP_RET);
+				WriteRet();
 			} else {
 				jumpToEnds.PushBack(WriteStartJump());
 			}
@@ -3500,7 +3955,7 @@ bool CodeWriter::CompileCase(const SlangHeader* expr,bool terminating){
 			if (!CompileExpr(exprIt->left))
 				return false;
 				
-			WriteOpCode(SLANG_OP_POP_ARG);
+			WritePop();
 		
 			exprIt = (SlangList*)exprIt->right;
 			if (!IsList((SlangHeader*)exprIt)){
@@ -3540,9 +3995,9 @@ bool CodeWriter::CompileCase(const SlangHeader* expr,bool terminating){
 		}
 	}
 	
-	WriteOpCode(SLANG_OP_NULL);
+	WriteNull();
 	if (terminating){
-		WriteOpCode(SLANG_OP_RET);
+		WriteRet();
 	} else {
 		for (size_t i=0;i<jumpToEnds.size;++i){
 			FinishJump(jumpToEnds.data[i]);
@@ -3555,9 +4010,11 @@ bool CodeWriter::CompileCase(const SlangHeader* expr,bool terminating){
 bool CodeWriter::CompileCond(const SlangHeader* expr,bool terminating){
 	SlangList* argIt = (SlangList*)((SlangList*)expr)->right;
 	
+	size_t condDefaultHeight = currHeights.Back();
 	Vector<size_t> jumpToEnds;
 	jumpToEnds.Reserve(8);
 	while (argIt){
+		currHeights.Back() = condDefaultHeight;
 		if (GetType((SlangHeader*)argIt)!=SlangType::List){
 			DotError(expr);
 			return false;
@@ -3575,7 +4032,7 @@ bool CodeWriter::CompileCond(const SlangHeader* expr,bool terminating){
 			continue;
 		}
 		
-		if (ObjIsElseOrTrue(cond)){
+		if (ObjIsElse(cond)){
 			paramIt = (SlangList*)paramIt->right;
 			if (GetType((SlangHeader*)paramIt)!=SlangType::List){
 				TypeError(params,GetType((SlangHeader*)paramIt),SlangType::List);
@@ -3593,7 +4050,7 @@ bool CodeWriter::CompileCond(const SlangHeader* expr,bool terminating){
 				
 				if (!CompileExpr(paramIt->left))
 					return false;
-				WriteOpCode(SLANG_OP_POP_ARG);
+				WritePop();
 				
                 paramIt = (SlangList*)paramIt->right;
 				if (GetType((SlangHeader*)paramIt)!=SlangType::List){
@@ -3616,45 +4073,57 @@ bool CodeWriter::CompileCond(const SlangHeader* expr,bool terminating){
 		
 		if (!CompileExpr(cond))
 			return false;
-		size_t jumpOver = WriteStartCJumpPop(false);
 		paramIt = (SlangList*)paramIt->right;
-		if (GetType((SlangHeader*)paramIt)!=SlangType::List){
+		if (!IsList((SlangHeader*)paramIt)){
 			DotError(params);
 			return false;
 		}
-		while (paramIt->right){
-			if (optimize&&IsPure(paramIt->left)){
-                paramIt = (SlangList*)paramIt->right;
+		size_t jumpOver;
+		bool shouldPopAfter = false;
+		if (!paramIt){
+			jumpOver = WriteStartCJump(false);
+			shouldPopAfter = true;
+			if (terminating){
+				WriteRet();
+			}
+		} else {
+			jumpOver = WriteStartCJumpPop(false);
+		
+			while (paramIt->right){
+				if (optimize&&IsPure(paramIt->left)){
+					paramIt = (SlangList*)paramIt->right;
+					if (GetType((SlangHeader*)paramIt)!=SlangType::List){
+						DotError(params);
+						return false;
+					}
+					continue;
+				}
+			
+				if (!CompileExpr(paramIt->left))
+					return false;
+				WritePop();
+				
+				paramIt = (SlangList*)paramIt->right;
 				if (GetType((SlangHeader*)paramIt)!=SlangType::List){
 					DotError(params);
 					return false;
 				}
-				continue;
 			}
-		
-			if (!CompileExpr(paramIt->left))
-				return false;
-			WriteOpCode(SLANG_OP_POP_ARG);
 			
-            paramIt = (SlangList*)paramIt->right;
-			if (GetType((SlangHeader*)paramIt)!=SlangType::List){
-				DotError(params);
+			if (!CompileExpr(paramIt->left,terminating))
 				return false;
-			}
 		}
-		
-		if (!CompileExpr(paramIt->left,terminating))
-			return false;
-		
 		if (!terminating){
 			jumpToEnds.PushBack(WriteStartJump());
 		}
 		FinishCJump(jumpOver);
+		if (shouldPopAfter)
+			WritePop();
 		argIt = (SlangList*)argIt->right;
 	}
-	WriteOpCode(SLANG_OP_NULL);
+	WriteNull();
 	if (terminating){
-		WriteOpCode(SLANG_OP_RET);
+		WriteRet();
 	} else {
 		for (size_t i=0;i<jumpToEnds.size;++i){
 			FinishJump(jumpToEnds.data[i]);
@@ -3679,13 +4148,13 @@ bool CodeWriter::CompileLetRec(const SlangHeader* expr,bool terminating){
 	std::vector<SlangHeader*> initExprs{};
 	initExprs.reserve(4);
 	{
-		LambdaData dat{letName,p};
+		LambdaData dat{letName,p,{},{}};
 		dat.isLetRec = true;
 		lambdaStack.push_back(dat);
 	}
 	std::set<SymbolName> seen{};
 	
-	WriteOpCode(SLANG_OP_PUSH_FRAME);
+	WritePushFrame();
 	while (paramIt){
 		SlangHeader* pairH = paramIt->left;
 		if (!IsList(pairH)){
@@ -3710,9 +4179,10 @@ bool CodeWriter::CompileLetRec(const SlangHeader* expr,bool terminating){
 		pair = (SlangList*)pair->right;
 		SlangHeader* val = pair->left;
 		initExprs.push_back(val);
-		WriteOpCode(SLANG_OP_NULL);
+		WriteNull();
 		
 		lambdaStack.back().params.PushBack(sym);
+		lambdaStack.back().paramHeights.PushBack(currHeights.Back());
 		seen.insert(sym);
 		
 		paramIt = (SlangList*)paramIt->right;
@@ -3723,33 +4193,20 @@ bool CodeWriter::CompileLetRec(const SlangHeader* expr,bool terminating){
 	}
 	
 	argIt = ((SlangList*)argIt)->right;
-	SlangHeader* body = ((SlangList*)argIt)->left;
 	size_t lamIndex;
-	if (!CompileLambdaBody(body,&initExprs,lamIndex))
+	if (!CompileLambdaBody((SlangList*)argIt,&initExprs,nullptr,lamIndex))
 		return false;
 	lambdaStack.pop_back();
-	WriteOpCode(SLANG_OP_PUSH_LAMBDA);
-	WriteInt64(lamIndex);
-	
-	if (terminating){
-		WriteOpCode(SLANG_OP_RETCALL);
-	} else {
-		WriteOpCode(SLANG_OP_CALL);
-	}
+	WriteMakeLambda(lamIndex);
+	WriteCall(terminating);
 	return true;
 }
 
 bool CodeWriter::CompileLet(const SlangHeader* expr,bool terminating){
-	size_t argCount = GetArgCount((SlangList*)((SlangList*)expr)->right);
-	
 	SymbolName letName = LET_SELF_SYM;
 	SlangHeader* argIt = ((SlangList*)expr)->right;
-	if (argCount==3){
-		SlangHeader* nameH = ((SlangList*)argIt)->left;
-		if (GetType(nameH)!=SlangType::Symbol){
-			TypeError(nameH,GetType(nameH),SlangType::Symbol);
-			return false;
-		}
+	SlangHeader* nameH = ((SlangList*)argIt)->left;
+	if (GetType(nameH)==SlangType::Symbol){
 		letName = ((SlangObj*)nameH)->symbol;
 		argIt = ((SlangList*)argIt)->right;
 	}
@@ -3765,13 +4222,15 @@ bool CodeWriter::CompileLet(const SlangHeader* expr,bool terminating){
 	{
 		ParamData p{};
 		p.Reserve(4);
-		LambdaData dat{letName,p};
+		Vector<size_t> heights{};
+		heights.Reserve(4);
+		LambdaData dat{letName,p,{},heights};
 		dat.isStar = true;
 		lambdaStack.push_back(dat);
 	}
 	std::set<SymbolName> seen{};
 	
-	WriteOpCode(SLANG_OP_PUSH_FRAME);
+	WritePushFrame();
 	while (paramIt){
 		SlangHeader* pairH = paramIt->left;
 		if (!IsList(pairH)){
@@ -3799,6 +4258,7 @@ bool CodeWriter::CompileLet(const SlangHeader* expr,bool terminating){
 			return false;
 		
 		lambdaStack.back().params.PushBack(sym);
+		lambdaStack.back().paramHeights.PushBack(currHeights.Back());
 		seen.insert(sym);
 		
 		paramIt = (SlangList*)paramIt->right;
@@ -3809,22 +4269,15 @@ bool CodeWriter::CompileLet(const SlangHeader* expr,bool terminating){
 	}
 	
 	argIt = ((SlangList*)argIt)->right;
-	SlangHeader* body = ((SlangList*)argIt)->left;
 	size_t lamIndex;
 	lambdaStack.back().isStar = false;
 	knownLambdaStack.emplace_back();
-	if (!CompileLambdaBody(body,nullptr,lamIndex))
+	if (!CompileLambdaBody((SlangList*)argIt,nullptr,nullptr,lamIndex))
 		return false;
 	knownLambdaStack.pop_back();
 	lambdaStack.pop_back();
-	WriteOpCode(SLANG_OP_PUSH_LAMBDA);
-	WriteInt64(lamIndex);
-	
-	if (terminating){
-		WriteOpCode(SLANG_OP_RETCALL);
-	} else {
-		WriteOpCode(SLANG_OP_CALL);
-	}
+	WriteMakeLambda(lamIndex);
+	WriteCall(terminating);
 	return true;
 }
 
@@ -3836,7 +4289,7 @@ bool CodeWriter::CompileApply(const SlangHeader* expr,bool terminating){
 	
 	argIt = ((SlangList*)argIt)->right;
 	
-	WriteOpCode(SLANG_OP_PUSH_FRAME);
+	WritePushFrame();
 	
 	for (size_t i=0;i<argCount-2;++i){
 		SlangHeader* v = ((SlangList*)argIt)->left;
@@ -3851,26 +4304,23 @@ bool CodeWriter::CompileApply(const SlangHeader* expr,bool terminating){
 		if (!CompileExpr(args))
 			return false;
 		
-		WriteOpCode(SLANG_OP_UNPACK);
+		WriteUnpack();
 	}
 	
 	if (!CompileExpr(func))
 		return false;
 	
-	if (terminating){
-		WriteOpCode(SLANG_OP_RETCALL);
-	} else {
-		WriteOpCode(SLANG_OP_CALL);
-	}
+	WriteCall(terminating);
 	return true;
 }
 
 bool CodeWriter::CompileAnd(const SlangHeader* expr,bool terminating){
 	SlangList* argIt = (SlangList*)((SlangList*)expr)->right;
 	if (!argIt){
-		WriteOpCode(SLANG_OP_BOOL_TRUE);
+		WriteTrue();
+		
 		if (terminating)
-			WriteOpCode(SLANG_OP_RET);
+			WriteRet();
 		return true;
 	}
 	Vector<size_t> jumpStarts;
@@ -3881,7 +4331,7 @@ bool CodeWriter::CompileAnd(const SlangHeader* expr,bool terminating){
 			return false;
 		
 		jumpStarts.PushBack(WriteStartCJump(false));
-		WriteOpCode(SLANG_OP_POP_ARG);
+		WritePop();
 		
 		argIt = (SlangList*)argIt->right;
 	}
@@ -3894,7 +4344,7 @@ bool CodeWriter::CompileAnd(const SlangHeader* expr,bool terminating){
 	}
 	
 	if (terminating){
-		WriteOpCode(SLANG_OP_RET);
+		WriteRet();
 	}
 	
 	return true;
@@ -3903,9 +4353,9 @@ bool CodeWriter::CompileAnd(const SlangHeader* expr,bool terminating){
 bool CodeWriter::CompileOr(const SlangHeader* expr,bool terminating){
 	SlangList* argIt = (SlangList*)((SlangList*)expr)->right;
 	if (!argIt){
-		WriteOpCode(SLANG_OP_BOOL_FALSE);
+		WriteFalse();
 		if (terminating)
-			WriteOpCode(SLANG_OP_RET);
+			WriteRet();
 		return true;
 	}
 	Vector<size_t> jumpStarts;
@@ -3916,7 +4366,7 @@ bool CodeWriter::CompileOr(const SlangHeader* expr,bool terminating){
 			return false;
 		
 		jumpStarts.PushBack(WriteStartCJump(true));
-		WriteOpCode(SLANG_OP_POP_ARG);
+		WritePop();
 		
 		argIt = (SlangList*)argIt->right;
 	}
@@ -3928,7 +4378,7 @@ bool CodeWriter::CompileOr(const SlangHeader* expr,bool terminating){
 	}
 	
 	if (terminating){
-		WriteOpCode(SLANG_OP_RET);
+		WriteRet();
 	}
 	
 	return true;
@@ -3939,43 +4389,45 @@ bool CodeWriter::CompileConst(const SlangHeader* obj){
 	SymbolName sym;
 	switch (GetType(obj)){
 		case SlangType::NullType:
-			WriteOpCode(SLANG_OP_NULL);
+			WriteNull();
 			break;
 		case SlangType::Int:
 			if (asObj->integer==0){
-				WriteOpCode(SLANG_OP_ZERO);
+				WriteZero();
 			} else if (asObj->integer==1){
-				WriteOpCode(SLANG_OP_ONE);
+				WriteOne();
 			} else {
-				WriteOpCode(SLANG_OP_LOAD_PTR);
-				WritePointer(Copy(obj));
+				WriteLoadPtr(Copy(obj));
 			}
 			break;
 		case SlangType::Real:
-			WriteOpCode(SLANG_OP_LOAD_PTR);
-			WritePointer(Copy(obj));
+			WriteLoadPtr(Copy(obj));
 			break;
 		case SlangType::Bool:
 			if (obj->boolVal)
-				WriteOpCode(SLANG_OP_BOOL_TRUE);
+				WriteTrue();
 			else
-				WriteOpCode(SLANG_OP_BOOL_FALSE);
+				WriteFalse();
 			break;
 		case SlangType::String:
-			WriteOpCode(SLANG_OP_LOAD_PTR);
-			WritePointer(Copy(obj));
+			WriteLoadPtr(Copy(obj));
 			break;
 		case SlangType::Vector:
-			WriteOpCode(SLANG_OP_LOAD_PTR);
-			WritePointer(Copy(obj));
+			WriteLoadPtr(Copy(obj));
 			break;
 		case SlangType::Symbol:
 			sym = asObj->symbol;
 			uint16_t idx;
-			if (SymbolInStarParams(sym,idx)){
+			uint32_t height;
+			if (SymbolInStarParams(sym,height)){
 				// let local var
-				WriteOpCode(SLANG_OP_GET_REC);
-				WriteInt16(idx);
+				WriteOpCode(SLANG_OP_GET_STACK);
+				WriteInt32(height);
+				++currHeights.Back();
+			} else if (SymbolInInternalDefs(sym,height)){
+				WriteOpCode(SLANG_OP_GET_STACK);
+				WriteInt32(height);
+				++currHeights.Back();
 			} else if (SymbolInParams(sym,idx)){
 				// local var
 				if (!ParamIsInited(idx)){
@@ -3984,15 +4436,16 @@ bool CodeWriter::CompileConst(const SlangHeader* obj){
 				}
 				WriteOpCode(SLANG_OP_GET_LOCAL);
 				WriteInt16(idx);
+				++currHeights.Back();
 			} else if (SymbolNotInAnyParams(sym)){
 				// global var
 				if (sym>=GLOBAL_SYMBOL_COUNT){
 					WriteOpCode(SLANG_OP_GET_GLOBAL);
 					WriteSymbolName(sym);
+					++currHeights.Back();
 					AddCodeLocation(obj);
 				} else {
-					WriteOpCode(SLANG_OP_LOAD_PTR);
-					WritePointer(Copy(obj));
+					WriteLoadPtr(Copy(obj));
 				}
 			} else {
 				// closure var
@@ -4000,6 +4453,7 @@ bool CodeWriter::CompileConst(const SlangHeader* obj){
 				WriteSymbolName(sym);
 				AddClosureParam(sym);
 				AddCodeLocation(obj);
+				++currHeights.Back();
 			}
 			break;
 		default:
@@ -4024,9 +4478,7 @@ bool CodeWriter::CompileQuote(const SlangHeader* expr){
 			break;
 	}
 	
-	WriteOpCode(SLANG_OP_LOAD_PTR);
-	WritePointer(Copy(qObj));
-		
+	WriteLoadPtr(Copy(qObj));
 	return true;
 }
 
@@ -4089,12 +4541,11 @@ inline bool IsQuasiquoteProc(const SlangHeader* expr){
 
 bool CodeWriter::QuasiquoteVector(const SlangVec* vec,size_t depth){
 	if (!vec->storage){
-		WriteOpCode(SLANG_OP_LOAD_PTR);
-		WritePointer(Copy((SlangHeader*)vec));
+		WriteLoadPtr(Copy((SlangHeader*)vec));
 		WriteOpCode(SLANG_OP_COPY);
 		return true;
 	}
-	WriteOpCode(SLANG_OP_PUSH_FRAME);
+	WritePushFrame();
 	for (size_t i=0;i<vec->storage->size;++i){
 		SlangHeader* obj = vec->storage->objs[i];
 		SlangType oType = GetType(obj);
@@ -4112,7 +4563,7 @@ bool CodeWriter::QuasiquoteVector(const SlangVec* vec,size_t depth){
 					if (depth==0){
 						if (!CompileUnquoteSplicing(obj))
 							return false;
-						WriteOpCode(SLANG_OP_UNPACK);
+						WriteUnpack();
 					} else {
 						if (!QuasiquoteList((SlangList*)obj,depth-1))
 							return false;
@@ -4136,7 +4587,7 @@ bool CodeWriter::QuasiquoteVector(const SlangVec* vec,size_t depth){
 		}
 	}
 	
-	WriteOpCode(SLANG_OP_MAKE_VEC);
+	WriteMakeVec();
 	return true;
 }
 
@@ -4200,8 +4651,9 @@ bool CodeWriter::QuasiquoteList(const SlangList* list,size_t depth){
 	if (spliced){
 		WriteOpCode(SLANG_OP_LIST_CONCAT);
 		WriteInt16(2);
+		--currHeights.Back();
 	} else {
-		WriteOpCode(SLANG_OP_PAIR);
+		WriteMakePair();
 	}
 	return true;
 }
@@ -4262,8 +4714,7 @@ bool CodeWriter::CompileAdd(const SlangHeader* expr){
 	size_t argCount = GetArgCount((SlangList*)((SlangList*)expr)->right);
 	
 	if (argCount==0){
-		WriteOpCode(SLANG_OP_LOAD_PTR);
-		WritePointer(constOneObj);
+		WriteZero();
 		return true;
 	}
 	
@@ -4285,6 +4736,7 @@ bool CodeWriter::CompileAdd(const SlangHeader* expr){
 	
 	WriteOpCode(SLANG_OP_ADD);
 	WriteInt16(count);
+	currHeights.Back() -= count-1;
 	return true;
 }
 
@@ -4312,6 +4764,7 @@ bool CodeWriter::CompileSub(const SlangHeader* expr){
 	
 	WriteOpCode(SLANG_OP_SUB);
 	WriteInt16(count);
+	currHeights.Back() -= count-1;
 	return true;
 }
 
@@ -4319,8 +4772,7 @@ bool CodeWriter::CompileMul(const SlangHeader* expr){
 	size_t argCount = GetArgCount((SlangList*)((SlangList*)expr)->right);
 	
 	if (argCount==0){
-		WriteOpCode(SLANG_OP_LOAD_PTR);
-		WritePointer(constZeroObj);
+		WriteOne();
 		return true;
 	}
 	
@@ -4342,6 +4794,7 @@ bool CodeWriter::CompileMul(const SlangHeader* expr){
 	
 	WriteOpCode(SLANG_OP_MUL);
 	WriteInt16(count);
+	currHeights.Back() -= count-1;
 	return true;
 }
 
@@ -4369,6 +4822,7 @@ bool CodeWriter::CompileDiv(const SlangHeader* expr){
 	
 	WriteOpCode(SLANG_OP_DIV);
 	WriteInt16(count);
+	currHeights.Back() -= count-1;
 	return true;
 }
 
@@ -4382,6 +4836,7 @@ bool CodeWriter::CompileEq(const SlangHeader* expr){
 	if (!CompileExpr(rObj))
 		return false;
 	WriteOpCode(SLANG_OP_EQ);
+	--currHeights.Back();
 	return true;
 }
 
@@ -4395,8 +4850,8 @@ bool CodeWriter::CompilePair(const SlangHeader* expr){
 	SlangHeader* rObj = ((SlangList*)argIt)->left;
 	if (!CompileExpr(rObj))
 		return false;
-		
-	WriteOpCode(SLANG_OP_PAIR);
+	
+	WriteMakePair();
 	return true;
 }
 
@@ -4430,7 +4885,8 @@ bool CodeWriter::CompileSetLeft(const SlangHeader* expr){
 		return false;
 		
 	WriteOpCode(SLANG_OP_SET_LEFT);
-	WriteOpCode(SLANG_OP_NULL);
+	currHeights.Back() -= 2;
+	WriteNull();
 	return true;
 }
 
@@ -4446,12 +4902,13 @@ bool CodeWriter::CompileSetRight(const SlangHeader* expr){
 		return false;
 		
 	WriteOpCode(SLANG_OP_SET_RIGHT);
-	WriteOpCode(SLANG_OP_NULL);
+	currHeights.Back() -= 2;
+	WriteNull();
 	return true;
 }
 
 bool CodeWriter::CompileVec(const SlangHeader* expr){
-	WriteOpCode(SLANG_OP_PUSH_FRAME);
+	WritePushFrame();
 	SlangList* argIt = (SlangList*)((SlangList*)expr)->right;
 	while (argIt){
 		if (!CompileExpr(argIt->left))
@@ -4460,7 +4917,7 @@ bool CodeWriter::CompileVec(const SlangHeader* expr){
 		argIt = (SlangList*)argIt->right;
 	}
 	
-	WriteOpCode(SLANG_OP_MAKE_VEC);
+	WriteMakeVec();
 	return true;
 }
 
@@ -4468,9 +4925,9 @@ bool CodeWriter::CompileIsPure(const SlangHeader* expr){
 	SlangHeader* argIt = ((SlangList*)expr)->right;
 	SlangHeader* obj = ((SlangList*)argIt)->left;
 	if (IsPure(obj))
-		WriteOpCode(SLANG_OP_BOOL_TRUE);
+		WriteTrue();
 	else
-		WriteOpCode(SLANG_OP_BOOL_FALSE);
+		WriteFalse();
 		
 	return true;
 }
@@ -4485,7 +4942,7 @@ bool CodeWriter::CompileExport(const SlangHeader* expr){
 	
 	WriteOpCode(SLANG_OP_EXPORT);
 	WriteSymbolName(((SlangObj*)obj)->symbol);
-	WriteOpCode(SLANG_OP_NULL);
+	WriteNull();
 	return true;
 }
 
@@ -4524,8 +4981,31 @@ bool CodeWriter::CompileImport(const SlangHeader* expr){
 	
 	WriteOpCode(SLANG_OP_IMPORT);
 	WritePointer(Copy(obj));
-	WriteOpCode(SLANG_OP_NULL);
+	WriteNull();
 	
+	return true;
+}
+
+bool CodeWriter::KnownLambdaArityCheck(const SlangHeader* expr,SymbolName sym,size_t argCount){
+	for (size_t i=knownLambdaStack.size()-1;i!=-1ULL;--i){
+		const auto& layer = knownLambdaStack[i];
+		if (layer.contains(sym)){
+			const CodeBlock& block = lambdaCodes[layer.at(sym)];
+			size_t pCount = block.params.size;
+			if (block.isVariadic){
+				if (argCount<(size_t)(pCount-1)){
+					ArityError(expr,argCount,pCount-1,VARIADIC_ARG_COUNT);
+					return false;
+				}
+			} else {
+				if (argCount!=pCount){
+					ArityError(expr,argCount,pCount,pCount);
+					return false;
+				}
+			}
+			return true;
+		}
+	}
 	return true;
 }
 
@@ -4533,7 +5013,7 @@ bool CodeWriter::CompileImport(const SlangHeader* expr){
 	if (!func(expr)) \
 		return false; \
 	if (terminating) \
-		WriteOpCode(SLANG_OP_RET); \
+		WriteRet(); \
 	AddCodeLocation(expr); \
 	return true
 
@@ -4542,7 +5022,7 @@ bool CodeWriter::CompileExpr(const SlangHeader* expr,bool terminating){
 		if (!CompileConst(expr))
 			return false;
 		if (terminating){
-			WriteOpCode(SLANG_OP_RET);
+			WriteRet();
 		}
 		return true;
 	}
@@ -4553,7 +5033,7 @@ bool CodeWriter::CompileExpr(const SlangHeader* expr,bool terminating){
 	SlangHeader* head = list->left;
 	SlangType t = GetType(head);
 	if (t!=SlangType::Symbol&&t!=SlangType::List){
-		TypeError(head,t,SlangType::Lambda);
+		TypeError(expr,t,SlangType::Lambda);
 		return false;
 	}
 	
@@ -4598,6 +5078,12 @@ bool CodeWriter::CompileExpr(const SlangHeader* expr,bool terminating){
 					return CompileOr(expr,terminating);
 				case SLANG_MAP:
 					COMPILE_GLOBAL_SYM(CompileMap);
+				case SLANG_FOREACH:
+					COMPILE_GLOBAL_SYM(CompileForeach);
+				case SLANG_FILTER:
+					COMPILE_GLOBAL_SYM(CompileFilter);
+				case SLANG_FOLD:
+					COMPILE_GLOBAL_SYM(CompileFold);
 				case SLANG_TRY:
 					COMPILE_GLOBAL_SYM(CompileTry);
 				case SLANG_UNWRAP:
@@ -4636,9 +5122,9 @@ bool CodeWriter::CompileExpr(const SlangHeader* expr,bool terminating){
 					if (argCount==2){
 						COMPILE_GLOBAL_SYM(CompileEq);
 					} else if (argCount<=1){
-						WriteOpCode(SLANG_OP_BOOL_TRUE);
+						WriteTrue();
 						if (terminating)
-							WriteOpCode(SLANG_OP_RET);
+							WriteRet();
 						return true;
 					}
 					break;
@@ -4661,12 +5147,17 @@ bool CodeWriter::CompileExpr(const SlangHeader* expr,bool terminating){
 				case SLANG_IMPORT:
 					COMPILE_GLOBAL_SYM(CompileImport);
 			}
-		} else if (!lambdaStack.empty()&&sym==lambdaStack.back().funcName){
-			recurse = true;
+		} else {
+			if (!KnownLambdaArityCheck(head,sym,argCount)){
+				return false;
+			}
+			if (!lambdaStack.empty()&&sym==lambdaStack.back().funcName){
+				recurse = true;
+			}
 		}
 	}
 	
-	WriteOpCode(SLANG_OP_PUSH_FRAME);
+	WritePushFrame();
 	
 	SlangList* argIt = (SlangList*)list->right;
 	for (size_t i=0;i<argCount;++i){
@@ -4685,21 +5176,14 @@ bool CodeWriter::CompileExpr(const SlangHeader* expr,bool terminating){
 		}
 	}
 	
-	if (terminating&&recurse)
+	if (terminating&&recurse){
 		WriteOpCode(SLANG_OP_RECURSE);
-	else if (terminating){
-		if (!inlineSymHead){
-			WriteOpCode(SLANG_OP_RETCALL);
-		} else {
-			WriteOpCode(SLANG_OP_RETCALLSYM);
-			WriteInt16(((SlangObj*)head)->symbol);
-		}
+		currFrames.PopBack();
 	} else {
 		if (!inlineSymHead){
-			WriteOpCode(SLANG_OP_CALL);
+			WriteCall(terminating);
 		} else {
-			WriteOpCode(SLANG_OP_CALLSYM);
-			WriteInt16(((SlangObj*)head)->symbol);
+			WriteCallSym(((SlangObj*)head)->symbol,terminating);
 		}
 	}
 	
@@ -4725,6 +5209,8 @@ CodeWriter::CodeWriter(SlangParser& parser)
 	  memChain(32768){
 	Reset();
 	optimize = true;
+	currHeights.Reserve(16);
+	currFrames.Reserve(32);
 }
 
 CodeWriter::~CodeWriter(){
@@ -4759,8 +5245,8 @@ void CodeWriter::Reset(){
 	}
 	lambdaCodes.clear();
 	lambdaStack.clear();
-	knownLambdaStack.clear();
 	
+	knownLambdaStack.clear();
 	knownLambdaStack.emplace_back();
 	
 	currDefName = EMPTY_NAME;
@@ -4800,11 +5286,11 @@ inline void CodeInterpreter::LoadTry(){
 	
 	SlangObj* emptyMaybe = alloc.AllocateObj(SlangType::Maybe);
 	emptyMaybe->maybe = nullptr;
-	argStack.data[argStack.size++] = (SlangHeader*)emptyMaybe;
+	PushArg((SlangHeader*)emptyMaybe);
 }
 
 inline void CodeInterpreter::Call(size_t funcIndex,SlangEnv* env){
-	FuncData& f = funcStack.data[funcStack.size++];
+	FuncData& f = funcStack.PlaceBack();
 	f.funcIndex = funcIndex;
 	f.argsFrame = stack.size-1;
 	f.env = env;
@@ -4899,6 +5385,21 @@ inline void CodeInterpreter::DefEnvSymbol(SlangEnv* e,SymbolName name,SlangHeade
 	PopArg();
 }
 
+void CodeInterpreter::DefOrSetEnvSymbol(SlangEnv* e,SymbolName name,SlangHeader* val){
+	if (!e->SetSymbol(name,val)){
+		PushArg((SlangHeader*)e);
+		if (!e->DefSymbol(name,val)){
+			PushArg(val);
+			SlangEnv* newEnv = AllocateEnvs(1);
+			newEnv->DefSymbol(name,PopArg());
+			e = (SlangEnv*)PopArg();
+			e->AddBlock(newEnv);
+			return;
+		}
+		PopArg();
+	}
+}
+
 inline void CodeInterpreter::DefCurrEnvSymbol(SymbolName name,SlangHeader* val){
 	SlangEnv* e = GetCurrEnv();
 	if (!e->DefSymbol(name,val)){
@@ -4936,7 +5437,11 @@ inline SlangLambda* CodeInterpreter::CreateLambda(size_t index){
 	if (block.isClosure){
 		lam->header.flags |= FLAG_CLOSURE;
 		PushArg((SlangHeader*)lam);
-		SlangEnv* newEnv = AllocateEnvs(block.params.size);
+		size_t pCount = block.params.size;
+		size_t dCount = block.defs.size;
+		if (block.name!=EMPTY_NAME&&block.name!=LET_SELF_SYM)
+			++pCount;
+		SlangEnv* newEnv = AllocateEnvs(pCount+dCount);
 		lam = (SlangLambda*)PopArg();
 		lam->env = newEnv;
 		lam->env->parent = GetCurrEnv();
@@ -4951,6 +5456,12 @@ inline SlangLambda* CodeInterpreter::CreateLambda(size_t index){
 			if (i%SLANG_ENV_BLOCK_SIZE==SLANG_ENV_BLOCK_SIZE-1){
 				envIt = envIt->next;
 			}
+		}
+		
+		if (block.name!=EMPTY_NAME&&block.name!=LET_SELF_SYM){
+			PushArg((SlangHeader*)lam);
+			DefEnvSymbol(lam->env,block.name,(SlangHeader*)lam);
+			lam = (SlangLambda*)PopArg();
 		}
 	} else {
 		lam->env = GetCurrEnv();
@@ -4970,7 +5481,6 @@ inline SlangList* CodeInterpreter::MakeVariadicList(
 	for (size_t i=start;i<end;++i){
 		list = alloc.AllocateList();
 		list->left = argStack.data[i];
-		list->right = nullptr;
 		
 		if (i==start){
 			listHead = list;
@@ -4998,7 +5508,7 @@ inline SlangVec* CodeInterpreter::MakeVecFromArgs(size_t start,size_t end){
 	return v;
 }
 
-SlangHeader* CodeInterpreter::Copy(SlangHeader* expr){
+/*SlangHeader* CodeInterpreter::Copy(SlangHeader* expr){
 	if (!arena->InCurrSet((uint8_t*)expr)) return expr;
 	
 	PushArg(expr);
@@ -5008,6 +5518,163 @@ SlangHeader* CodeInterpreter::Copy(SlangHeader* expr){
 	memcpy(copied,expr,size);
 	
 	return copied;
+}*/
+
+SlangHeader* CodeInterpreter::Copy(SlangHeader* obj){
+	if (!obj)
+		return nullptr;
+	
+	switch (obj->type){
+		case SlangType::Int:
+		case SlangType::Real:
+		case SlangType::Symbol:
+		case SlangType::EndOfFile:
+		case SlangType::Bool: {
+			size_t oldSize = obj->GetSize();
+			PushArg(obj);
+			SlangHeader* newObj = (SlangHeader*)alloc.Allocate(oldSize);
+			obj = PopArg();
+			memcpy(newObj,obj,oldSize);
+			return newObj;
+		}
+		case SlangType::List: {
+			size_t oldIndex = argStack.size;
+			PushArg(obj);
+			
+			SlangList* newList = (SlangList*)alloc.Allocate(obj->GetSize());
+			newList->header = ((SlangList*)PeekArg())->header;
+			newList->left = nullptr;
+			newList->right = nullptr;
+			PushArg((SlangHeader*)newList);
+			((SlangList*)PeekArg())->left = Copy(((SlangList*)argStack.data[oldIndex])->left);
+			((SlangList*)PeekArg())->right = Copy(((SlangList*)argStack.data[oldIndex])->right);
+			
+			newList = (SlangList*)PopArg();
+			PopArg();
+			return (SlangHeader*)newList;
+		}
+		case SlangType::Maybe: {
+			PushArg(obj);
+			SlangObj* newMaybe = (SlangObj*)alloc.Allocate(obj->GetSize());
+			newMaybe->maybe = nullptr;
+			SlangObj* oldMaybe = (SlangObj*)PopArg();
+			newMaybe->header = oldMaybe->header;
+			PushArg((SlangHeader*)newMaybe);
+			((SlangObj*)PeekArg())->maybe = Copy(oldMaybe->maybe);
+			return PopArg();
+		}
+		case SlangType::Vector: {
+			PushArg(obj);
+			SlangVec* newVec = (SlangVec*)alloc.Allocate(obj->GetSize());
+			SlangVec* oldVec = (SlangVec*)PopArg();
+			memcpy(newVec,oldVec,oldVec->header.GetSize());
+			if (!oldVec->storage){
+				return (SlangHeader*)newVec;
+			}
+			newVec->storage = nullptr;
+			PushArg((SlangHeader*)newVec);
+			SlangStorage* newStorage = (SlangStorage*)Copy((SlangHeader*)oldVec->storage);
+			newVec = (SlangVec*)PopArg();
+			newVec->storage = newStorage;
+			return (SlangHeader*)newVec;
+		}
+		case SlangType::String: {
+			PushArg(obj);
+			SlangStr* newStr = (SlangStr*)alloc.Allocate(obj->GetSize());
+			SlangStr* oldStr = (SlangStr*)PopArg();
+			memcpy(newStr,oldStr,oldStr->header.GetSize());
+			if (!oldStr->storage)
+				return (SlangHeader*)newStr;
+			newStr->storage = nullptr;
+			PushArg((SlangHeader*)newStr);
+			SlangStorage* newStorage = (SlangStorage*)Copy((SlangHeader*)oldStr->storage);
+			newStr = (SlangStr*)PopArg();
+			newStr->storage = newStorage;
+			return (SlangHeader*)newStr;
+		}
+		case SlangType::Dict: {
+			PushArg(obj);
+			SlangDict* newDict = (SlangDict*)alloc.Allocate(obj->GetSize());
+			SlangDict* oldDict = (SlangDict*)PopArg();
+			memcpy(newDict,oldDict,oldDict->header.GetSize());
+			if (!oldDict->storage)
+				return (SlangHeader*)newDict;
+			
+			newDict->storage = nullptr;
+			newDict->table = nullptr;
+			PushArg((SlangHeader*)newDict);
+			PushArg((SlangHeader*)oldDict);
+			SlangDictTable* newTable = (SlangDictTable*)Copy((SlangHeader*)oldDict->table);
+			
+			oldDict = (SlangDict*)PopArg();
+			newDict = (SlangDict*)PeekArg();
+			newDict->table = newTable;
+			
+			SlangStorage* newStorage = (SlangStorage*)Copy((SlangHeader*)oldDict->storage);
+			newDict = (SlangDict*)PopArg();
+			newDict->storage = newStorage;
+			return (SlangHeader*)newDict;
+		}
+		case SlangType::Storage: {
+			size_t oldIndex = argStack.size;
+			PushArg(obj);
+			size_t elemSize = obj->elemSize;
+			SlangStorage* oldStorage = (SlangStorage*)obj;
+			SlangStorage* newStorage = alloc.AllocateStorage(oldStorage->size,obj->elemSize);
+			oldStorage = (SlangStorage*)PeekArg();
+			if (elemSize==sizeof(uint8_t)){
+				memcpy(newStorage->data,oldStorage->data,oldStorage->size);
+				PopArg();
+				return (SlangHeader*)newStorage;
+			}
+			
+			if (elemSize==sizeof(SlangHeader*)){
+				size_t s = oldStorage->size;
+				size_t newIndex = argStack.size;
+				PushArg((SlangHeader*)newStorage);
+				for (size_t i=0;i<s;++i){
+					((SlangStorage*)argStack.data[newIndex])->objs[i] = Copy(((SlangStorage*)argStack.data[oldIndex])->objs[i]);
+					
+				}
+				newStorage = (SlangStorage*)PopArg();
+				PopArg();
+				return (SlangHeader*)newStorage;
+			}
+			
+			if (elemSize==sizeof(SlangDictElement)){
+				memcpy(
+					newStorage->elements,
+					oldStorage->elements,
+					sizeof(SlangDictElement)*oldStorage->size
+				);
+				size_t s = oldStorage->size;
+				size_t newIndex = argStack.size;
+				PushArg((SlangHeader*)newStorage);
+				for (size_t i=0;i<s;++i){
+					if ((uint64_t)((SlangStorage*)argStack.data[newIndex])->elements[i].key!=DICT_UNOCCUPIED_VAL){
+						((SlangStorage*)argStack.data[newIndex])->elements[i].key = Copy(((SlangStorage*)argStack.data[oldIndex])->elements[i].key);
+						((SlangStorage*)argStack.data[newIndex])->elements[i].val = Copy(((SlangStorage*)argStack.data[oldIndex])->elements[i].val);
+					}
+				}
+				newStorage = (SlangStorage*)PopArg();
+				PopArg();
+				return (SlangHeader*)newStorage;
+			}
+			assert(false);
+			return (SlangHeader*)newStorage;
+		}
+		case SlangType::DictTable: {
+			PushArg(obj);
+			SlangDictTable* newTable = alloc.AllocateDictTable(((SlangDictTable*)obj)->capacity);
+			SlangDictTable* oldTable = (SlangDictTable*)PopArg();
+			memcpy(newTable,oldTable,oldTable->header.GetSize());
+			return (SlangHeader*)newTable;
+		}
+		
+		default:
+			assert(false);
+			return nullptr;
+	}
 }
 
 SlangList* CodeInterpreter::CopyList(SlangList* list){
@@ -5015,8 +5682,6 @@ SlangList* CodeInterpreter::CopyList(SlangList* list){
 	size_t aindex = argStack.size+1;
 	PushArg((SlangHeader*)list);
 	SlangList* allocd = alloc.AllocateList();
-	allocd->left = nullptr;
-	allocd->right = nullptr;
 	PushArg((SlangHeader*)allocd);
 	PushArg(argStack.Back());
 	while (true){
@@ -5030,10 +5695,9 @@ SlangList* CodeInterpreter::CopyList(SlangList* list){
 			break;
 		}
 		
-		((SlangList*)argStack.data[aindex])->right = (SlangHeader*)alloc.AllocateList();
-		argStack.data[aindex] = ((SlangList*)argStack.data[aindex])->right;
-		((SlangList*)argStack.data[aindex])->left = nullptr;
-		((SlangList*)argStack.data[aindex])->right = nullptr;
+		SlangList* newList = alloc.AllocateList();
+		((SlangList*)argStack.data[aindex])->right = (SlangHeader*)newList;
+		argStack.data[aindex] = (SlangHeader*)newList;
 	}
 	SlangList* retlist = (SlangList*)argStack.data[aindex+1];
 	argStack.size -= 3;
@@ -5089,6 +5753,7 @@ inline void CodeInterpreter::RawDictInsertStorage(
 		SlangDictElement* to = newStorage->elements;
 		size_t s = dict->storage->size;
 		size_t realCount = 0;
+		size_t* end = table->elementOffsets+table->capacity;
 		uint64_t hashVal;
 		for (size_t i=0;i<s;++i){
 			if ((uint64_t)from->key==DICT_UNOCCUPIED_VAL){
@@ -5096,7 +5761,13 @@ inline void CodeInterpreter::RawDictInsertStorage(
 			} else {
 				if (realCount!=i){
 					hashVal = from->hash;
-					table->elementOffsets[hashVal & (table->capacity-1)] = realCount;
+					size_t* offset = &table->elementOffsets[hashVal & (table->capacity-1)];
+					while (*offset!=i){
+						++offset;
+						if (offset==end)
+							offset = table->elementOffsets;
+					}
+					*offset = realCount;
 				}
 				*to++ = *from++;
 				++realCount;
@@ -5132,8 +5803,10 @@ inline void CodeInterpreter::RawDictInsert(SlangDict* dict,SlangHeader* key,Slan
 	while (true){
 		if (*offset == DICT_UNOCCUPIED_VAL){
 			size_t offsetOff = offset-table->elementOffsets;
+			PushArg((SlangHeader*)dict);
 			RawDictInsertStorage(dict,hash,key,val);
-			offset = table->elementOffsets+offsetOff;
+			dict = (SlangDict*)PopArg();
+			offset = dict->table->elementOffsets+offsetOff;
 			*offset = dict->storage->size-1;
 			return;
 		}
@@ -5253,7 +5926,7 @@ bool CodeInterpreter::ParseSlangString(const SlangStr& code,SlangHeader** res){
 	}
 	
 	std::string_view sv{(const char*)code.storage->data,code.storage->size};
-	
+	//evalMemChain.Reset();
 	SlangAllocator savedAlloc = parser.alloc;
 	parser.alloc = evalAlloc;
 	parser.SetCodeString(sv);
@@ -5265,7 +5938,7 @@ bool CodeInterpreter::ParseSlangString(const SlangStr& code,SlangHeader** res){
 	parser.alloc = savedAlloc;
 	if (!success||!parser.errors.empty())
 		return false;
-	*res = parsed;
+	*res = Copy(parsed);
 	return true;
 }
 
@@ -5943,7 +6616,11 @@ inline bool CodeInterpreter::SlangOutputToFile(FILE* file,SlangHeader* obj){
 		}
 		case SlangType::Real: {
 			SlangObj* realObj = (SlangObj*)obj;
-			fprintf(file,"%.16g",realObj->real);
+			double real = realObj->real;
+			if (real==floor(real)&&abs(real)<1e16)
+				fprintf(file,"%.16g.0",real);
+			else
+				fprintf(file,"%.16g",real);
 			break;
 		}
 		case SlangType::Symbol: {
@@ -5995,13 +6672,9 @@ inline bool CodeInterpreter::SlangOutputToString(SlangStream* stream,SlangHeader
 			str = (SlangStr*)PopArg();
 			// stream is now guaranteed big enough
 			
-			
 			uint8_t* it = sstr->storage->data+stream->pos;
 			uint8_t* otherIt = str->storage->data;
 			memcpy(it,otherIt,str->storage->size);
-			//for (size_t i=0;i<str->storage->size;++i){
-				//*it++ = *otherIt++;
-			//}
 			
 			stream->pos += str->storage->size;
 			break;
@@ -6015,25 +6688,26 @@ inline bool CodeInterpreter::SlangOutputToString(SlangStream* stream,SlangHeader
 			
 			uint8_t* it = sstr->storage->data+stream->pos;
 			uint8_t* otherIt = (uint8_t*)&tempStr[0];
-			for (ssize_t i=0;i<size;++i){
-				*it++ = *otherIt++;
-			}
+			memcpy(it,otherIt,size);
 			
 			stream->pos += size;
 			break;
 		}
 		case SlangType::Real: {
 			SlangObj* realObj = (SlangObj*)obj;
-			ssize_t size = snprintf(tempStr,sizeof(tempStr),"%.16g",realObj->real);
+			ssize_t size;
+			double real = realObj->real;
+			if (real==floor(real)&&abs(real)<1e16)
+				size = snprintf(tempStr,sizeof(tempStr),"%.16g.0",real);
+			else
+				size = snprintf(tempStr,sizeof(tempStr),"%.16g",real);
 			assert(size!=-1);
 			stream = ReallocateStream(stream,size);
 			sstr = stream->str;
 			
 			uint8_t* it = sstr->storage->data+stream->pos;
 			uint8_t* otherIt = (uint8_t*)&tempStr[0];
-			for (ssize_t i=0;i<size;++i){
-				*it++ = *otherIt++;
-			}
+			memcpy(it,otherIt,size);
 			
 			stream->pos += size;
 			break;
@@ -6048,9 +6722,6 @@ inline bool CodeInterpreter::SlangOutputToString(SlangStream* stream,SlangHeader
 			uint8_t* it = sstr->storage->data+stream->pos;
 			uint8_t* otherIt = (uint8_t*)symStr.data();
 			memcpy(it,otherIt,size);
-			/*for (ssize_t i=0;i<size;++i){
-				*it++ = *otherIt++;
-			}*/
 			
 			stream->pos += size;
 			break;
@@ -6217,16 +6888,16 @@ bool PrintCodeSub(const uint8_t* c,void* data){
 			std::cout << gDebugParser->GetSymbolString(sym);
 			std::cout << '\n';
 			break;
-		case SLANG_OP_GET_REC:
-			std::cout << "GETREC ";
-			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
-			std::cout << localIdx;
+		case SLANG_OP_GET_STACK:
+			std::cout << "GETSTACK ";
+			big = *(uint32_t*)(c+OPCODE_SIZE);
+			std::cout << big;
 			std::cout << '\n';
 			break;
-		case SLANG_OP_SET_REC:
-			std::cout << "SETREC ";
-			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
-			std::cout << localIdx;
+		case SLANG_OP_SET_STACK:
+			std::cout << "SETSTACK ";
+			big = *(uint32_t*)(c+OPCODE_SIZE);
+			std::cout << big;
 			std::cout << '\n';
 			break;
 		case SLANG_OP_PUSH_FRAME:
@@ -6239,6 +6910,9 @@ bool PrintCodeSub(const uint8_t* c,void* data){
 			break;
 		case SLANG_OP_POP_ARG:
 			std::cout << "POP\n";
+			break;
+		case SLANG_OP_INTERNAL_DEF:
+			std::cout << "INTERNAL DEF\n";
 			break;
 		case SLANG_OP_UNPACK:
 			std::cout << "UNPACK\n";
@@ -6321,9 +6995,20 @@ bool PrintCodeSub(const uint8_t* c,void* data){
 			std::cout << "UNWRAP\n";
 			break;
 		case SLANG_OP_MAP_STEP:
-			std::cout << "MAPSTEP ";
+			std::cout << "MAP STEP ";
 			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
 			std::cout << localIdx << '\n';
+			break;
+		case SLANG_OP_FOREACH_STEP:
+			std::cout << "FOREACH STEP ";
+			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
+			std::cout << localIdx << '\n';
+			break;
+		case SLANG_OP_FILTER_STEP:
+			std::cout << "FILTER STEP\n";
+			break;
+		case SLANG_OP_FOLD_STEP:
+			std::cout << "FOLD STEP\n";
 			break;
 		case SLANG_OP_NOT:
 			std::cout << "NOT\n";
@@ -6474,6 +7159,10 @@ void CodeInterpreter::TypeError2(SlangType found,SlangType expected1,SlangType e
 	PushError("TypeError",msg.str());
 }
 
+void CodeInterpreter::CharTypeError(){
+	PushError("TypeError","Expected type Char instead of type Str");
+}
+
 void CodeInterpreter::ArityError(size_t found,size_t expectMin,size_t expectMax){
 	std::stringstream msg = {};
 	const char* plural = (expectMin!=1) ? "s" : "";
@@ -6508,7 +7197,7 @@ void CodeInterpreter::ListIndexError(ssize_t desired){
 			desired << " of a list";
 	} else {
 		msg << "Attempted to access index " <<
-			desired << " of a list with length <=" << desired;
+			desired << " of a list with length <= " << desired;
 	}
 	
 	PushError("IndexError",msg.str());
@@ -6530,7 +7219,7 @@ void CodeInterpreter::ExportError(SymbolName sym){
 }
 
 void CodeInterpreter::DotError(){
-	PushError("TypeError","List instead of DottedList");
+	PushError("TypeError","Expected type List instead of DottedList");
 }
 
 void CodeInterpreter::ZeroDivisionError(){
@@ -6569,8 +7258,7 @@ bool CodeFuncEval(CodeInterpreter* c){
 }
 
 bool CodeFuncQuote(CodeInterpreter* c){
-	SlangHeader* obj = c->GetArg(0);
-	c->Return(c->Copy(obj));
+	c->Return(c->GetArg(0));
 	return true;
 }
 
@@ -7649,6 +8337,97 @@ bool CodeFuncOr(CodeInterpreter* c){
 }
 
 bool CodeFuncMap(CodeInterpreter* c);
+bool CodeFuncForeach(CodeInterpreter* c);
+bool CodeFuncFilter(CodeInterpreter* c);
+bool CodeFuncFold(CodeInterpreter* c);
+
+#define RANGE_PATTERN() \
+	if (c->argStack.data[itIndex]){ \
+		SlangList* newL = c->alloc.AllocateList(); \
+		((SlangList*)c->argStack.data[itIndex])->right = (SlangHeader*)newL; \
+		c->argStack.data[itIndex] = (SlangHeader*)newL; \
+	} else { \
+		c->argStack.data[headIndex] = (SlangHeader*)c->alloc.AllocateList(); \
+		c->argStack.data[itIndex] = c->argStack.data[headIndex]; \
+	} \
+	SlangObj* intObj = c->alloc.MakeInt(i); \
+	listIt = (SlangList*)c->argStack.data[itIndex]; \
+	listIt->left = (SlangHeader*)intObj;
+
+bool CodeFuncRange(CodeInterpreter* c){
+	size_t argCount = c->GetArgCount();
+	int64_t start = 0;
+	int64_t end = 0;
+	int64_t step = 1;
+	if (argCount==1){
+		SlangHeader* endObj = c->GetArg(0);
+		TYPE_CHECK_EXACT(endObj,SlangType::Int);
+		end = ((SlangObj*)endObj)->integer;
+	} else if (argCount==2){
+		SlangHeader* startObj = c->GetArg(0);
+		SlangHeader* endObj = c->GetArg(1);
+		TYPE_CHECK_EXACT(startObj,SlangType::Int);
+		TYPE_CHECK_EXACT(endObj,SlangType::Int);
+		start = ((SlangObj*)startObj)->integer;
+		end = ((SlangObj*)endObj)->integer;
+	} else {
+		SlangHeader* startObj = c->GetArg(0);
+		SlangHeader* endObj = c->GetArg(1);
+		SlangHeader* stepObj = c->GetArg(2);
+		TYPE_CHECK_EXACT(startObj,SlangType::Int);
+		TYPE_CHECK_EXACT(endObj,SlangType::Int);
+		TYPE_CHECK_EXACT(stepObj,SlangType::Int);
+		start = ((SlangObj*)startObj)->integer;
+		end = ((SlangObj*)endObj)->integer;
+		step = ((SlangObj*)stepObj)->integer;
+		if (step==0){
+			c->PushError("RangeError","Step size cannot be zero!");
+			return false;
+		}
+	}
+	
+	if (start==end){
+		c->Return(nullptr);
+		return true;
+	}
+	
+	SlangList* listIt;
+	size_t headIndex = c->argStack.size;
+	c->PushArg(nullptr);
+	size_t itIndex = c->argStack.size;
+	c->PushArg(nullptr);
+	if (end-start>0){
+		if (step>0){
+			for (int64_t i=start;i<end;i+=step){
+				RANGE_PATTERN();
+			}
+		} else {
+			int64_t realStart = ((end-start)/step)*step+start;
+			if (realStart==end) realStart += step;
+			// do it backwards
+			for (int64_t i=realStart;i>=start;i+=step){
+				RANGE_PATTERN();
+			}
+		}
+	} else {
+		if (step>0){
+			for (int64_t i=start;i>end;i-=step){
+				RANGE_PATTERN();
+			}
+		} else {
+			int64_t realStart = ((end-start)/step)*step+start;
+			if (realStart==end) realStart -= step;
+			for (int64_t i=realStart;i<=start;i-=step){
+				RANGE_PATTERN();
+			}
+		}
+	}
+	
+	c->Return(c->argStack.data[headIndex]);
+	return true;
+}
+
+#undef RANGE_PATTERN
 
 bool CodeFuncPair(CodeInterpreter* c){
 	SlangList* l = c->alloc.AllocateList();
@@ -7719,8 +8498,6 @@ bool CodeFuncList(CodeInterpreter* c){
 		return true;
 	}
 	SlangList* head = c->alloc.AllocateList();
-	head->left = nullptr;
-	head->right = nullptr;
 	size_t headIndex = c->argStack.size;
 	c->PushArg((SlangHeader*)head);
 	size_t currIndex = c->argStack.size;
@@ -7728,8 +8505,6 @@ bool CodeFuncList(CodeInterpreter* c){
 	c->PushArg((SlangHeader*)curr);
 	for (size_t i=0;i<argCount-1;++i){
 		SlangList* newL = c->alloc.AllocateList();
-		newL->left = nullptr;
-		newL->right = nullptr;
 		curr = (SlangList*)c->argStack.data[currIndex];
 		curr->left = c->GetArg(i);
 		curr->right = (SlangHeader*)newL;
@@ -7828,8 +8603,10 @@ bool CodeFuncListConcat(CodeInterpreter* c){
 	
 	for (size_t i=0;i<argCount-1;++i){
 		SlangHeader* arg = c->GetArg(i);
-		if (GetType(arg)!=SlangType::List){
-			c->TypeError(GetType(arg),SlangType::List);
+		if (!arg)
+			continue;
+		if (arg->type!=SlangType::List){
+			c->TypeError(arg->type,SlangType::List);
 			return false;
 		}
 		if (list){
@@ -7850,8 +8627,12 @@ bool CodeFuncListConcat(CodeInterpreter* c){
 	}
 	
 	SlangHeader* last = c->GetArg(argCount-1);
-	list->right = last;
-	c->Return(c->PopArg());
+	if (!list){
+		c->Return(last);
+	} else {
+		list->right = last;
+		c->Return(c->PopArg());
+	}
 	return true;
 }
 
@@ -8162,6 +8943,82 @@ bool CodeFuncDictPop(CodeInterpreter* c){
 	return true;
 }
 
+bool CodeFuncDictKeys(CodeInterpreter* c){
+	SlangHeader* dictObj = c->GetArg(0);
+	TYPE_CHECK_EXACT(dictObj,SlangType::Dict);
+	
+	SlangDict* dict = (SlangDict*)dictObj;
+	if (!dict->storage){
+		c->Return(nullptr);
+		return true;
+	}
+	
+	size_t headIndex = c->argStack.size;
+	size_t itIndex = c->argStack.size+1;
+	c->PushArg(nullptr);
+	c->PushArg(nullptr);
+	
+	size_t dictSize = dict->storage->size;
+	for (size_t i=0;i<dictSize;++i){
+		SlangDictElement* elem = &dict->storage->elements[i];
+		if ((uint64_t)elem->key==DICT_UNOCCUPIED_VAL){
+			continue;
+		}
+		SlangList* newList = c->alloc.AllocateList();
+		dict = (SlangDict*)c->GetArg(0);
+		elem = &dict->storage->elements[i];
+		newList->left = elem->key;
+		if (c->argStack.data[itIndex]){
+			((SlangList*)c->argStack.data[itIndex])->right = (SlangHeader*)newList;
+			c->argStack.data[itIndex] = (SlangHeader*)newList;
+		} else {
+			c->argStack.data[headIndex] = (SlangHeader*)newList;
+			c->argStack.data[itIndex] = c->argStack.data[headIndex];
+		}
+	}
+	
+	c->Return(c->argStack.data[headIndex]);
+	return true;
+}
+
+bool CodeFuncDictValues(CodeInterpreter* c){
+	SlangHeader* dictObj = c->GetArg(0);
+	TYPE_CHECK_EXACT(dictObj,SlangType::Dict);
+	
+	SlangDict* dict = (SlangDict*)dictObj;
+	if (!dict->storage){
+		c->Return(nullptr);
+		return true;
+	}
+	
+	size_t headIndex = c->argStack.size;
+	size_t itIndex = c->argStack.size+1;
+	c->PushArg(nullptr);
+	c->PushArg(nullptr);
+	
+	size_t dictSize = dict->storage->size;
+	for (size_t i=0;i<dictSize;++i){
+		SlangDictElement* elem = &dict->storage->elements[i];
+		if ((uint64_t)elem->key==DICT_UNOCCUPIED_VAL){
+			continue;
+		}
+		SlangList* newList = c->alloc.AllocateList();
+		dict = (SlangDict*)c->GetArg(0);
+		elem = &dict->storage->elements[i];
+		newList->left = elem->val;
+		if (c->argStack.data[itIndex]){
+			((SlangList*)c->argStack.data[itIndex])->right = (SlangHeader*)newList;
+			c->argStack.data[itIndex] = (SlangHeader*)newList;
+		} else {
+			c->argStack.data[headIndex] = (SlangHeader*)newList;
+			c->argStack.data[itIndex] = c->argStack.data[headIndex];
+		}
+	}
+	
+	c->Return(c->argStack.data[headIndex]);
+	return true;
+}
+
 bool CodeFuncStrGet(CodeInterpreter* c){
 	SlangHeader* strObj = c->GetArg(0);
 	SlangHeader* indexObj = c->GetArg(1);
@@ -8289,14 +9146,13 @@ bool CodeFuncStrPop(CodeInterpreter* c){
 
 bool CodeFuncStrSplit(CodeInterpreter* c){
 	static char splitterArray[256];
-	
-	SlangHeader* strObj = c->GetArg(0);
+	size_t splitterCount = c->GetArgCount()-1;
+	SlangHeader* strObj = c->GetArg(splitterCount);
 	TYPE_CHECK_EXACT(strObj,SlangType::String);
 	SlangStr* str = (SlangStr*)strObj;
-	size_t splitterCount = c->GetArgCount()-1;
 	
 	for (size_t i=0;i<splitterCount;++i){
-		SlangHeader* splitArg = c->GetArg(1+i);
+		SlangHeader* splitArg = c->GetArg(i);
 		TYPE_CHECK_EXACT(splitArg,SlangType::String);
 		SlangStr* splitChar = (SlangStr*)splitArg;
 		if (GetStorageSize(splitChar->storage)!=1){
@@ -8314,8 +9170,6 @@ bool CodeFuncStrSplit(CodeInterpreter* c){
 	}
 	
 	SlangList* listHead = c->alloc.AllocateList();
-	listHead->right = nullptr;
-	listHead->left = nullptr;
 	size_t headIndex = c->argStack.size;
 	c->PushArg((SlangHeader*)listHead);
 	SlangList* listIt = listHead;
@@ -8323,7 +9177,7 @@ bool CodeFuncStrSplit(CodeInterpreter* c){
 	c->PushArg((SlangHeader*)listIt);
 	size_t grabStart = 0;
 	size_t strPos = 0;
-	str = (SlangStr*)c->GetArg(0);
+	str = (SlangStr*)c->GetArg(splitterCount);
 	while (true){
 		if (strPos>=str->storage->size){
 			break;
@@ -8335,12 +9189,11 @@ bool CodeFuncStrSplit(CodeInterpreter* c){
 				c->PushArg((SlangHeader*)piece);
 				SlangList* newList = c->alloc.AllocateList();
 				piece = (SlangStr*)c->PopArg();
-				str = (SlangStr*)c->GetArg(0);
+				str = (SlangStr*)c->GetArg(splitterCount);
 				if (strPos!=grabStart){
 					memcpy(piece->storage->data,str->storage->data+grabStart,strPos-grabStart);
 				}
 				newList->left = (SlangHeader*)piece;
-				newList->right = nullptr;
 				if (grabStart==0){
 					c->argStack.data[headIndex] = (SlangHeader*)newList;
 					c->argStack.data[itIndex] = (SlangHeader*)newList;
@@ -8362,12 +9215,11 @@ bool CodeFuncStrSplit(CodeInterpreter* c){
 	c->PushArg((SlangHeader*)finalPiece);
 	SlangList* newList = c->alloc.AllocateList();
 	finalPiece = (SlangStr*)c->PopArg();
-	str = (SlangStr*)c->GetArg(0);
+	str = (SlangStr*)c->GetArg(splitterCount);
 	if (strPos!=grabStart){
 		memcpy(finalPiece->storage->data,str->storage->data+grabStart,strPos-grabStart);
 	}
 	newList->left = (SlangHeader*)finalPiece;
-	newList->right = nullptr;
 	if (grabStart==0){
 		c->argStack.data[headIndex] = (SlangHeader*)newList;
 	} else {
@@ -8900,6 +9752,145 @@ bool CodeFuncRealToInt(CodeInterpreter* c){
 	return true;
 }
 
+bool CodeFuncCharToByte(CodeInterpreter* c){
+	SlangHeader* charObj = c->GetArg(0);
+	TYPE_CHECK_EXACT(charObj,SlangType::String);
+	SlangStr* str = (SlangStr*)charObj;
+	if (GetStorageSize(str->storage)!=1){
+		c->CharTypeError();
+		return false;
+	}
+	uint8_t val = str->storage->data[0];
+	c->Return((SlangHeader*)c->alloc.MakeInt(val));
+	return true;
+}
+
+bool CodeFuncByteToChar(CodeInterpreter* c){
+	SlangHeader* intObj = c->GetArg(0);
+	TYPE_CHECK_EXACT(intObj,SlangType::Int);
+	SlangObj* intVal = (SlangObj*)intObj;
+	if (intVal->integer>=256||intVal->integer<0){
+		std::stringstream ss{};
+		ss << "Expected integer between 0 and 255, not ";
+		ss << intVal->integer;
+		c->PushError("TypeError",ss.str());
+		return false;
+	}
+	uint8_t val = intVal->integer;
+	SlangStr* s = c->alloc.AllocateStr(1);
+	s->storage->data[0] = val;
+	c->Return((SlangHeader*)s);
+	return true;
+}
+
+bool CodeFuncNumToStr(CodeInterpreter* c){
+	static char printArr[32];
+	SlangHeader* numObj = c->GetArg(0);
+	TYPE_CHECK_NUMERIC(numObj);
+	SlangObj* num = (SlangObj*)numObj;
+	size_t written;
+	if (numObj->type==SlangType::Int){
+		int64_t val = num->integer;
+		written = snprintf(printArr,sizeof(printArr),"%lld",val);
+	} else {
+		double val = num->real;
+		if (val==floor(val)&&abs(val)<1e16)
+			written = snprintf(printArr,sizeof(printArr),"%.16g.0",val);
+		else
+			written = snprintf(printArr,sizeof(printArr),"%.16g",val);
+	}
+	if (written>=sizeof(printArr)){
+		assert(false);
+	}
+
+	SlangStr* s = c->alloc.AllocateStr(written);
+	memcpy(s->storage->data,printArr,written);
+	c->Return((SlangHeader*)s);
+	return true;
+}
+
+bool CodeFuncStrToNum(CodeInterpreter* c){
+	SlangHeader* strObj = c->GetArg(0);
+	TYPE_CHECK_EXACT(strObj,SlangType::String);
+	SlangStr* str = (SlangStr*)strObj;
+	if (GetStorageSize(str->storage)==0){
+		c->PushError("ParseError","Cannot parse a number from an empty string!");
+		return false;
+	} else if (str->storage->size==1){
+		uint8_t ch = str->storage->data[0];
+		if (ch<'0'||ch>'9'){
+			std::stringstream ss{};
+			ss << "Could not parse number from ";
+			ss << '"' << ch << '"';
+			c->PushError("ParseError",ss.str());
+			return false;
+		}
+		int64_t n = ch-'0';
+		c->Return((SlangHeader*)c->alloc.MakeInt(n));
+		return true;
+	}
+	
+	SlangHeader* res;
+	if (!c->ParseSlangString(*str,&res)){
+		std::stringstream ss{};
+		ss << "Could not parse number from ";
+		ss << *(SlangHeader*)str;
+		c->PushError("ParseError",ss.str());
+		return false;
+	}
+	
+	if (!IsNumeric(res)){
+		std::stringstream ss{};
+		ss << "Could not parse number from ";
+		ss << *(SlangHeader*)str;
+		c->PushError("ParseError",ss.str());
+		return false;
+	}
+	
+	c->Return(res);
+	return true;
+}
+
+bool CodeFuncStrToList(CodeInterpreter* c){
+	SlangHeader* strObj = c->GetArg(0);
+	TYPE_CHECK_EXACT(strObj,SlangType::String);
+	SlangStr* str = (SlangStr*)strObj;
+	if (GetStorageSize(str->storage)==0){
+		c->Return(nullptr);
+		return true;
+	}
+	
+	size_t size = str->storage->size;
+	char firstC = str->storage->data[0];
+	
+	SlangList* list = c->alloc.AllocateList();
+	size_t headIndex = c->argStack.size;
+	c->PushArg((SlangHeader*)list);
+	size_t itIndex = c->argStack.size;
+	c->PushArg((SlangHeader*)list);
+	
+	SlangStr* firstChar = c->alloc.AllocateStr(1);
+	firstChar->storage->data[0] = firstC;
+	list = (SlangList*)c->PeekArg();
+	list->left = (SlangHeader*)firstChar;
+	
+	SlangList* newList;
+	for (size_t i=1;i<size;++i){
+		newList = c->alloc.AllocateList();
+		list = (SlangList*)c->PeekArg();
+		list->right = (SlangHeader*)newList;
+		c->argStack.data[itIndex] = (SlangHeader*)newList;
+		SlangStr* charStr = c->alloc.AllocateStr(1);
+		str = (SlangStr*)c->GetArg(0);
+		charStr->storage->data[0] = str->storage->data[i];
+		newList = (SlangList*)c->PeekArg();
+		newList->left = (SlangHeader*)charStr;
+	}
+	
+	c->Return(c->argStack.data[headIndex]);
+	return true;
+}
+
 void CFGetImportName(CodeInterpreter* c,SlangList* nameList,std::string& name){
 	assert(nameList);
 	if (!name.empty())
@@ -9022,6 +10013,10 @@ const CodeFunc CodeBuiltinFuncs[] = {
 	CodeFuncInvalid, // set!
 	CodeFuncLen,
 	CodeFuncMap,
+	CodeFuncForeach,
+	CodeFuncFilter,
+	CodeFuncFold,
+	CodeFuncRange,
 	CodeFuncAnd,
 	CodeFuncOr,
 	CodeFuncInvalid, // try
@@ -9049,6 +10044,8 @@ const CodeFunc CodeBuiltinFuncs[] = {
 	CodeFuncDictGet,
 	CodeFuncDictSet,
 	CodeFuncDictPop,
+	CodeFuncDictKeys,
+	CodeFuncDictValues,
 	CodeFuncStrGet,
 	CodeFuncStrSet,
 	CodeFuncStrApp,
@@ -9116,6 +10113,11 @@ const CodeFunc CodeBuiltinFuncs[] = {
 	CodeFuncIsMain,
 	CodeFuncIntToReal,
 	CodeFuncRealToInt,
+	CodeFuncCharToByte,
+	CodeFuncByteToChar,
+	CodeFuncNumToStr,
+	CodeFuncStrToNum,
+	CodeFuncStrToList,
 	CodeFuncExport,
 	CodeFuncInvalid,
 };
@@ -9205,8 +10207,6 @@ bool CodeFuncMap(CodeInterpreter* c){
 	size_t resIndex = c->argStack.size;
 	size_t currIndex = c->argStack.size+1;
 	SlangList* resL = c->alloc.AllocateList();
-	resL->left = nullptr;
-	resL->right = nullptr;
 	c->PushArg((SlangHeader*)resL);
 	c->PushArg((SlangHeader*)resL);
 	funcArg = c->GetArg(0);
@@ -9220,13 +10220,7 @@ bool CodeFuncMap(CodeInterpreter* c){
 	if (funcArg->type==SlangType::Symbol&&
 		((SlangObj*)funcArg)->symbol<GLOBAL_SYMBOL_COUNT){
 		SymbolName sym = ((SlangObj*)funcArg)->symbol;
-		if (!GoodArity(sym,argCount)){
-			c->ArityError(argCount,
-				gGlobalArityArray[sym].min,
-				gGlobalArityArray[sym].max
-			);
-			return false;
-		}
+		assert(GoodArity(sym,argCount));
 		
 		const CodeFunc f = CodeBuiltinFuncs[sym];
 		while (true){
@@ -9240,8 +10234,6 @@ bool CodeFuncMap(CodeInterpreter* c){
 			if (!MapInnerLoop(c,listsBase,argCount))
 				break;
 			SlangList* newList = c->alloc.AllocateList();
-			newList->left = nullptr;
-			newList->right = nullptr;
 			((SlangList*)c->argStack.data[currIndex])->right = (SlangHeader*)newList;
 			c->argStack.data[currIndex] = (SlangHeader*)newList;
 		}
@@ -9253,6 +10245,181 @@ bool CodeFuncMap(CodeInterpreter* c){
 	
 	c->Return(c->argStack.data[resIndex]);
 	return true;
+}
+
+bool CodeFuncForeach(CodeInterpreter* c){
+	SlangHeader* funcArg = c->GetArg(0);
+	size_t listsBase = c->stack.Back().base+1;
+	size_t argCount = c->GetArgCount()-1;
+	if (GetType(funcArg)!=SlangType::Symbol){
+		c->TypeError(GetType(funcArg),SlangType::Lambda);
+		return false;
+	}
+	
+	for (size_t i=0;i<argCount;++i){
+		SlangHeader* arg = c->GetArg(i+1);
+		if (!IsList(arg)){
+			c->TypeError(arg->type,SlangType::List);
+			return false;
+		}
+	}
+	
+	funcArg = c->GetArg(0);
+	
+	c->PushFrame();
+	size_t argFrameStart = c->argStack.size;
+	if (!MapInnerLoop(c,listsBase,argCount)){
+		c->Return(nullptr);
+		return true;
+	}
+	if (funcArg->type==SlangType::Symbol&&
+		((SlangObj*)funcArg)->symbol<GLOBAL_SYMBOL_COUNT){
+		SymbolName sym = ((SlangObj*)funcArg)->symbol;
+		assert(GoodArity(sym,argCount));
+		
+		const CodeFunc f = CodeBuiltinFuncs[sym];
+		while (true){
+			if (!f(c))
+				return false;
+			
+			c->argStack.size = argFrameStart;
+			c->PushFrame();
+			if (!MapInnerLoop(c,listsBase,argCount))
+				break;
+		}
+	} else {
+		c->TypeError(funcArg->type,SlangType::Lambda);
+		return false;
+	}
+	c->PopFrame();
+	
+	c->Return(nullptr);
+	return true;
+}
+
+bool CodeFuncFilter(CodeInterpreter* c){
+	SlangHeader* funcArg = c->GetArg(0);
+	SlangHeader* listArg = c->GetArg(1);
+	size_t listPos = c->stack.Back().base+1;
+	
+	if (GetType(funcArg)!=SlangType::Symbol){
+		c->TypeError(GetType(funcArg),SlangType::Lambda);
+		return false;
+	}
+	
+	if (!IsList(listArg)){
+		c->TypeError(listArg->type,SlangType::List);
+		return false;
+	}
+	
+	if (!listArg){
+		c->Return(nullptr);
+		return true;
+	}
+	
+	size_t resIndex = c->argStack.size;
+	size_t currIndex = c->argStack.size+1;
+	
+	c->PushArg(nullptr);
+	c->PushArg(nullptr);
+	
+	c->PushFrame();
+	c->PushArg(((SlangList*)listArg)->left);
+	
+	SlangHeader* predRes;
+	if (funcArg->type==SlangType::Symbol&&
+		((SlangObj*)funcArg)->symbol<GLOBAL_SYMBOL_COUNT){
+		SymbolName sym = ((SlangObj*)funcArg)->symbol;
+		assert(GoodArity(sym,1));
+		
+		const CodeFunc f = CodeBuiltinFuncs[sym];
+		while (true){
+			if (!f(c))
+				return false;
+			
+			predRes = c->PopArg();
+			if (ConvertToBool(predRes)){
+				SlangList* newList = c->alloc.AllocateList();
+				if (!c->argStack.data[resIndex]){
+					c->argStack.data[resIndex] = (SlangHeader*)newList;
+					c->argStack.data[currIndex] = (SlangHeader*)newList;
+				} else
+					((SlangList*)c->argStack.data[currIndex])->right = (SlangHeader*)newList;
+				
+				newList->left = ((SlangList*)c->argStack.data[listPos])->left;
+				c->argStack.data[currIndex] = (SlangHeader*)newList;
+			}
+			
+			c->PushFrame();
+			c->argStack.data[listPos] = ((SlangList*)c->argStack.data[listPos])->right;
+			
+			if (GetType(c->argStack.data[listPos])!=SlangType::List){
+				c->PopFrame();
+				c->Return(c->argStack.data[resIndex]);
+				return true;
+			}
+			
+			c->PushArg(((SlangList*)c->argStack.data[listPos])->left);
+		}
+	} else {
+		c->TypeError(funcArg->type,SlangType::Lambda);
+		return false;
+	}
+}
+
+bool CodeFuncFold(CodeInterpreter* c){
+	SlangHeader* funcArg = c->GetArg(0);
+	SlangHeader* initArg = c->GetArg(1);
+	SlangHeader* listArg = c->GetArg(2);
+	size_t listPos = c->stack.Back().base+2;
+	
+	if (GetType(funcArg)!=SlangType::Symbol){
+		c->TypeError(GetType(funcArg),SlangType::Lambda);
+		return false;
+	}
+	
+	if (!IsList(listArg)){
+		c->TypeError(listArg->type,SlangType::List);
+		return false;
+	}
+	
+	if (!listArg){
+		c->Return(initArg);
+		return true;
+	}
+	
+	c->PushFrame();
+	
+	c->PushArg(initArg);
+	c->PushArg(((SlangList*)listArg)->left);
+	SlangHeader* res;
+	if (funcArg->type==SlangType::Symbol&&
+		((SlangObj*)funcArg)->symbol<GLOBAL_SYMBOL_COUNT){
+		SymbolName sym = ((SlangObj*)funcArg)->symbol;
+		assert(GoodArity(sym,2));
+		
+		const CodeFunc f = CodeBuiltinFuncs[sym];
+		while (true){
+			if (!f(c))
+				return false;
+			
+			c->PushFrame();
+			--c->stack.Back().base;
+			c->argStack.data[listPos] = ((SlangList*)c->argStack.data[listPos])->right;
+			
+			if (GetType(c->argStack.data[listPos])!=SlangType::List){
+				res = c->PopArg();
+				c->PopFrame();
+				c->Return(res);
+				return true;
+			}
+			
+			c->PushArg(((SlangList*)c->argStack.data[listPos])->left);
+		}
+	} else {
+		c->TypeError(funcArg->type,SlangType::Lambda);
+		return false;
+	}
 }
 
 bool CodeFuncApply(CodeInterpreter* c){
@@ -9354,11 +10521,12 @@ bool CodeFuncApply(CodeInterpreter* c){
 		&&SLANG_OP_GET_GLOBAL_label, \
 		&&SLANG_OP_SET_GLOBAL_label, \
 		&&SLANG_OP_DEF_GLOBAL_label, \
-		&&SLANG_OP_GET_REC_label, \
-		&&SLANG_OP_SET_REC_label, \
+		&&SLANG_OP_GET_STACK_label, \
+		&&SLANG_OP_SET_STACK_label, \
 		\
 		&&SLANG_OP_PUSH_FRAME_label, \
 		&&SLANG_OP_POP_ARG_label, \
+		&&SLANG_OP_INTERNAL_DEF_label, \
 		&&SLANG_OP_UNPACK_label, \
 		&&SLANG_OP_COPY_label, \
 		&&SLANG_OP_CALL_label, \
@@ -9380,6 +10548,9 @@ bool CodeFuncApply(CodeInterpreter* c){
 		&&SLANG_OP_MAYBE_UNWRAP_label, \
 		\
 		&&SLANG_OP_MAP_STEP_label, \
+		&&SLANG_OP_FOREACH_STEP_label, \
+		&&SLANG_OP_FILTER_STEP_label, \
+		&&SLANG_OP_FOLD_STEP_label, \
 		\
 		&&SLANG_OP_NOT_label, \
 		&&SLANG_OP_INC_label, \
@@ -9440,13 +10611,14 @@ bool CodeFuncApply(CodeInterpreter* c){
 
 
 #define LOOP_NAME SingleStep
-#define NEXT_INST() break
+#define NEXT_INST() goto breakout;
 #define LOOP_INST(inst) case inst:
 #define LOOP_PREAMBLE() \
 	op = *c->pc; \
 	switch (op){
 #define LOOP_POST() \
 		} \
+		breakout:\
 		c->pc += SlangOpSizes[op];
 #include "loop.cpp.inc"
 
@@ -9478,6 +10650,8 @@ bool CodeInterpreter::CompileInto(SlangHeader* prog,size_t funcIndex){
 	codeWriter.curr->write = codeWriter.curr->start;
 	codeWriter.curr->locData.size = 0;
 	codeWriter.curr->moduleIndex = 0;
+	codeWriter.InitCompile();
+	
 	if (!codeWriter.CompileExpr(prog)){
 		return false;
 	}
@@ -9491,7 +10665,6 @@ void CodeInterpreter::ResetState(){
 	halted = false;
 	pc = nullptr;
 	stepCount = 0;
-	gMaxStackHeight = 0;
 	gSmallGCs = 0;
 	
 	stack.Clear();
@@ -9623,7 +10796,7 @@ CodeInterpreter::CodeInterpreter()
 	  alloc(this,CodeInterpreterAllocate),
 	  memChain(8192),
 	  constAlloc(&memChain,CodeInterpreterConstAllocate),
-	  evalMemChain(4096),
+	  evalMemChain(64),
 	  evalAlloc(&evalMemChain,CodeInterpreterConstAllocate){
 	gRandState.Seed(GetSeedTime());
 	arena = new MemArena();
@@ -9634,8 +10807,8 @@ CodeInterpreter::CodeInterpreter()
 	gArenaSize = memSize;
 	gMaxArenaSize = memSize;
 	
-	stack.Reserve(256);
-	funcStack.Reserve(256);
+	stack.Reserve(512);
+	funcStack.Reserve(512);
 	argStack.Reserve(2048);
 	tryStack.Reserve(16);
 	modules.Reserve(16);
@@ -9694,9 +10867,6 @@ std::ostream& operator<<(std::ostream& os,const SlangHeader& obj){
 	switch (obj.type){
 		case SlangType::Env:
 			os << "[ENV]";
-			break;
-		case SlangType::Params:
-			os << "[PARAMS]";
 			break;
 		case SlangType::Storage:
 			os << "[STORAGE]";

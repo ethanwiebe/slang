@@ -1,12 +1,16 @@
 ;(def (eq x y) (if (- x y) false true))
-(def fact-sub (& (z curr)
-	(if z 
-		(fact-sub (-- z) (* curr z))
-		curr 
-	)
-))
 
-(def fact (& (x) (fact-sub x 1)))
+
+(def (fact x)
+	(def (fact-sub z curr)
+		(if z
+			(fact-sub (-- z) (* curr z))
+			curr
+		)
+	)
+	(fact-sub x 1)
+)
+
 ; 100k
 ; pre-compile: 48ms
 ; 26ms 
@@ -40,5 +44,5 @@
 ; 862ms (after closures)
 ; 725ms
 ; 671ms
-(fact 10000000)
+(fact 1000000)
 ;(fact 100000)

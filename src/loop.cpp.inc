@@ -9,6 +9,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 	size_t i;
 	uint16_t localIdx;
 	int32_t jumpVal;
+	uint32_t v32;
 	uint64_t v64;
 	uint64_t v642;
 	int64_t i64;
@@ -66,7 +67,6 @@ inline void LOOP_NAME(CodeInterpreter* c){
 			NEXT_INST();
 		LOOP_INST(SLANG_OP_LOOKUP)
 			sym = *(SymbolName*)(c->pc+OPCODE_SIZE);
-			[[unlikely]]
 			if (!GetRecursiveSymbol(c->GetCurrEnv(),sym,&val)){
 				c->UndefinedError(sym);
 				return;
@@ -76,7 +76,6 @@ inline void LOOP_NAME(CodeInterpreter* c){
 		LOOP_INST(SLANG_OP_SET)
 			sym = *(SymbolName*)(c->pc+OPCODE_SIZE);
 			val = c->PopArg();
-			
 			if (!c->SetRecursiveSymbol(sym,val)){
 				c->DefCurrEnvSymbol(sym,val);
 			}
@@ -92,7 +91,6 @@ inline void LOOP_NAME(CodeInterpreter* c){
 			NEXT_INST();
 		LOOP_INST(SLANG_OP_GET_GLOBAL)
 			sym = *(SymbolName*)(c->pc+OPCODE_SIZE);
-			//env = c->funcStack.data[c->currGlobalEnv].env;
 			env = c->funcStack.Back().globalEnv;
 			if (!env->GetSymbol(sym,&val)){
 				c->UndefinedError(sym);
@@ -103,7 +101,6 @@ inline void LOOP_NAME(CodeInterpreter* c){
 		LOOP_INST(SLANG_OP_SET_GLOBAL)
 			sym = *(SymbolName*)(c->pc+OPCODE_SIZE);
 			val = c->PopArg();
-			//env = c->funcStack.data[c->currGlobalEnv].env;
 			env = c->funcStack.Back().globalEnv;
 			if (!env->SetSymbol(sym,val)){
 				c->UndefinedError(sym);
@@ -123,21 +120,32 @@ inline void LOOP_NAME(CodeInterpreter* c){
 				}
 			}
 			NEXT_INST();
-		LOOP_INST(SLANG_OP_GET_REC)
-			localIdx = *(uint16_t*)(c->pc+OPCODE_SIZE);
-			c->PushRecLocal(localIdx);
+		LOOP_INST(SLANG_OP_GET_STACK)
+			v32 = *(uint32_t*)(c->pc+OPCODE_SIZE);
+			c->PushRecLocal(v32);
 			NEXT_INST();
-		LOOP_INST(SLANG_OP_SET_REC)
-			localIdx = *(uint16_t*)(c->pc+OPCODE_SIZE);
+		LOOP_INST(SLANG_OP_SET_STACK)
+			v32 = *(uint32_t*)(c->pc+OPCODE_SIZE);
 			val = c->PopArg();
-			c->SetRecLocalArg(localIdx,val);
+			c->SetRecLocalArg(v32,val);
 			NEXT_INST();
 		LOOP_INST(SLANG_OP_PUSH_FRAME)
 			c->PushFrame();
+#ifndef NDEBUG
 			gMaxStackHeight = (c->stack.size>gMaxStackHeight) ? c->stack.size : gMaxStackHeight;
+#endif
 			NEXT_INST();
 		LOOP_INST(SLANG_OP_POP_ARG)
 			c->PopArg();
+			NEXT_INST();
+		LOOP_INST(SLANG_OP_INTERNAL_DEF)
+			if (!c->codeWriter.lambdaCodes[c->funcStack.Back().funcIndex].isClosure){
+				NEXT_INST();
+			}
+			
+			v32 = *(uint32_t*)(c->pc+OPCODE_SIZE);
+			c->InternalDef(v32,c->PeekArg());
+			
 			NEXT_INST();
 		LOOP_INST(SLANG_OP_UNPACK)
 			val = c->PopArg();
@@ -323,9 +331,9 @@ inline void LOOP_NAME(CodeInterpreter* c){
 			}
 			NEXT_INST();
 		LOOP_INST(SLANG_OP_CASE_JUMP)
-			jumpVal = *(int32_t*)(c->pc+OPCODE_SIZE);
+			v32 = *(uint32_t*)(c->pc+OPCODE_SIZE);
 			val = c->PopArg();
-			v64 = c->codeWriter.CaseDictGet(c->codeWriter.caseDicts.data[(uint32_t)jumpVal],val);
+			v64 = c->codeWriter.CaseDictGet(c->codeWriter.caseDicts.data[v32],val);
 			c->pc += v64-SlangOpSizes[SLANG_OP_CASE_JUMP];
 			
 			NEXT_INST();
@@ -363,14 +371,11 @@ inline void LOOP_NAME(CodeInterpreter* c){
 			val = c->argStack.data[v64+localIdx+2];
 			if (!val&&c->argStack.size>v64+3+localIdx){
 				val = (SlangHeader*)c->alloc.AllocateList();
-				((SlangList*)val)->right = nullptr;
 				((SlangList*)val)->left = c->PopArg();
 				c->argStack.data[v64+localIdx+1] = val;
 				c->argStack.data[v64+localIdx+2] = val;
 			} else if (val){
 				val2 = (SlangHeader*)c->alloc.AllocateList();
-				((SlangList*)val2)->left = nullptr;
-				((SlangList*)val2)->right = nullptr;
 				((SlangList*)c->argStack.data[v64+localIdx+2])->right = val2;
 				val = c->argStack.data[v64+localIdx+2];
 				c->argStack.data[v64+localIdx+2] = ((SlangList*)val)->right;
@@ -404,9 +409,208 @@ inline void LOOP_NAME(CodeInterpreter* c){
 						);
 						return;
 					}
-					c->funcStack.Back().retAddr = c->pc;
 					if (!CodeBuiltinFuncs[sym](c))
 						return;
+					c->pc -= SlangOpSizes[SLANG_OP_MAP_STEP];
+					NEXT_INST();
+				}
+				c->TypeError(GetType(val),SlangType::Lambda);
+				return;
+			}
+			
+			lam = (SlangLambda*)val;
+			v64 = lam->funcIndex;
+			v642 = (uint64_t)c->pc;
+			block = &c->codeWriter.lambdaCodes[v64];
+			c->lamEnv = lam->env;
+			if (!CFHandleArgs(
+					c,
+					lam->env,
+					*block))
+				return;
+				
+			c->Call(v64,c->lamEnv);
+			c->lamEnv = nullptr;
+			c->funcStack.Back().retAddr = (const uint8_t*)v642;
+			NEXT_INST();
+		LOOP_INST(SLANG_OP_FOREACH_STEP)
+			localIdx = *(uint16_t*)(c->pc+OPCODE_SIZE);
+			v64 = c->stack.Back().base;
+
+			c->PushFrame();
+			// func = localIdx
+			for (size_t i=0;i<localIdx;++i){
+				val = c->argStack.data[v64+i];
+				if (GetType(val)!=SlangType::List){
+					c->PopFrame();
+					c->PopFrame();
+					c->PushArg(nullptr);
+					NEXT_INST();
+				}
+				c->PushArg(((SlangList*)val)->left);
+				c->argStack.data[v64+i] = ((SlangList*)val)->right;
+			}
+			
+			val = c->argStack.data[v64+localIdx];
+			if (GetType(val)!=SlangType::Lambda){
+				if (GetType(val)==SlangType::Symbol&&((SlangObj*)val)->symbol<GLOBAL_SYMBOL_COUNT){
+					sym = ((SlangObj*)val)->symbol;
+					if (!GoodArity(sym,c->GetArgCount())){
+						c->ArityError(
+							c->GetArgCount(),
+							gGlobalArityArray[sym].min,
+							gGlobalArityArray[sym].max
+						);
+						return;
+					}
+					if (!CodeBuiltinFuncs[sym](c))
+						return;
+					c->pc -= SlangOpSizes[SLANG_OP_FOREACH_STEP];
+					c->PopArg();
+					NEXT_INST();
+				}
+				c->TypeError(GetType(val),SlangType::Lambda);
+				return;
+			}
+			
+			lam = (SlangLambda*)val;
+			v64 = lam->funcIndex;
+			v642 = (uint64_t)c->pc;
+			block = &c->codeWriter.lambdaCodes[v64];
+			c->lamEnv = lam->env;
+			if (!CFHandleArgs(
+					c,
+					lam->env,
+					*block))
+				return;
+				
+			c->Call(v64,c->lamEnv);
+			c->lamEnv = nullptr;
+			c->funcStack.Back().retAddr = (const uint8_t*)v642;
+			NEXT_INST();
+		LOOP_INST(SLANG_OP_FILTER_STEP)
+			v64 = c->stack.Back().base;
+			
+			// first run
+			if (c->argStack.size-v64==4){
+				val = c->argStack.data[v64];
+				// called with empty list
+				if (!val){
+					c->PopFrame();
+					c->PushArg(nullptr);
+					NEXT_INST();
+				}
+				c->PushFrame();
+				c->PushArg(((SlangList*)val)->left);
+			} else {
+				// get bool
+				val = c->PopArg();
+				if (ConvertToBool(val)){
+					val2 = (SlangHeader*)c->alloc.AllocateList();
+					if (c->argStack.data[v64+3]){
+						((SlangList*)c->argStack.data[v64+3])->right = val2;
+						val = c->argStack.data[v64+3];
+						c->argStack.data[v64+3] = ((SlangList*)val)->right;
+					} else {
+						c->argStack.data[v64+2] = val2;
+						c->argStack.data[v64+3] = val2;
+					}
+					((SlangList*)c->argStack.data[v64+3])->left = ((SlangList*)c->argStack.data[v64])->left;
+				}
+				
+				c->argStack.data[v64] = ((SlangList*)c->argStack.data[v64])->right;
+				val = c->argStack.data[v64];
+				if (GetType(val)!=SlangType::List){
+					val = c->argStack.data[v64+2];
+					c->PopFrame();
+					c->PushArg(val);
+					NEXT_INST();
+				}
+				c->PushFrame();
+				c->PushArg(((SlangList*)val)->left);
+			}
+			
+			val = c->argStack.data[v64+1];
+			if (GetType(val)!=SlangType::Lambda){
+				if (GetType(val)==SlangType::Symbol&&((SlangObj*)val)->symbol<GLOBAL_SYMBOL_COUNT){
+					sym = ((SlangObj*)val)->symbol;
+					if (!GoodArity(sym,c->GetArgCount())){
+						c->ArityError(
+							c->GetArgCount(),
+							gGlobalArityArray[sym].min,
+							gGlobalArityArray[sym].max
+						);
+						return;
+					}
+					if (!CodeBuiltinFuncs[sym](c))
+						return;
+					c->pc -= SlangOpSizes[SLANG_OP_FILTER_STEP];
+					NEXT_INST();
+				}
+				c->TypeError(GetType(val),SlangType::Lambda);
+				return;
+			}
+			
+			lam = (SlangLambda*)val;
+			v64 = lam->funcIndex;
+			v642 = (uint64_t)c->pc;
+			block = &c->codeWriter.lambdaCodes[v64];
+			c->lamEnv = lam->env;
+			if (!CFHandleArgs(
+					c,
+					lam->env,
+					*block))
+				return;
+				
+			c->Call(v64,c->lamEnv);
+			c->lamEnv = nullptr;
+			c->funcStack.Back().retAddr = (const uint8_t*)v642;
+			NEXT_INST();
+		LOOP_INST(SLANG_OP_FOLD_STEP)
+			v64 = c->stack.Back().base;
+			
+			// first run
+			if (c->argStack.size-v64==3){
+				val = c->argStack.data[v64+1];
+				// called with empty list
+				if (!val){
+					val = c->argStack.data[v64];
+					c->PopFrame();
+					c->PushArg(val);
+					NEXT_INST();
+				}
+				c->PushFrame();
+				c->PushArg(c->argStack.data[v64]);
+				c->PushArg(((SlangList*)val)->left);
+			} else {
+				c->argStack.data[v64+1] = ((SlangList*)c->argStack.data[v64+1])->right;
+				val = c->argStack.data[v64+1];
+				if (GetType(val)!=SlangType::List){
+					val = c->PopArg();
+					c->PopFrame();
+					c->PushArg(val);
+					NEXT_INST();
+				}
+				c->PushFrame();
+				--c->stack.Back().base;
+				c->PushArg(((SlangList*)val)->left);
+			}
+			
+			val = c->argStack.data[v64+2];
+			if (GetType(val)!=SlangType::Lambda){
+				if (GetType(val)==SlangType::Symbol&&((SlangObj*)val)->symbol<GLOBAL_SYMBOL_COUNT){
+					sym = ((SlangObj*)val)->symbol;
+					if (!GoodArity(sym,c->GetArgCount())){
+						c->ArityError(
+							c->GetArgCount(),
+							gGlobalArityArray[sym].min,
+							gGlobalArityArray[sym].max
+						);
+						return;
+					}
+					if (!CodeBuiltinFuncs[sym](c))
+						return;
+					c->pc -= SlangOpSizes[SLANG_OP_FOLD_STEP];
 					NEXT_INST();
 				}
 				c->TypeError(GetType(val),SlangType::Lambda);
@@ -785,14 +989,6 @@ inline void LOOP_NAME(CodeInterpreter* c){
 			}
 			
 			newEnv = c->GetCurrEnv();
-			//SlangHeader* val;
-			//std::cout << c->currGlobalEnv << '\n';
-			//std::cout << c->funcStack.size << '\n';
-			/*newEnv = c->funcStack.data[c->currGlobalEnv].env;
-			if (!newEnv->GetSymbol(sym,&val)){
-				c->UndefinedError(sym);
-				return;
-			}*/
 			if (!GetRecursiveSymbol(newEnv,sym,&val)){
 				c->UndefinedError(sym);
 				return;

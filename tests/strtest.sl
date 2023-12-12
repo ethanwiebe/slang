@@ -13,33 +13,33 @@
 
 (assert-eq 
 	'("this" "is" "a" "test!")
-	(str-split test " ")
+	(str-split " " test)
 )
 
 (assert-eq
 	test
-	(str-join " " (str-split test " "))
+	(str-join " " (str-split " " test))
 )
 
 (assert-eq
 	"this  is  a  test!"
-	(str-join "  " (str-split test " "))
+	(str-join "  " (str-split " " test))
 )
 
 (assert-eq 
 	'("" "his is a " "es" "!")
-	(str-split test "t")
+	(str-split "t" test)
 )
 
 (assert-eq 
 	'("this is a test" "")
-	(str-split test "!")
+	(str-split "!" test)
 )
 
 (assert-eq 
 	'("this is a test!")
-	(str-split test "$")
-	(str-split test "$" "@")
+	(str-split "$" test)
+	(str-split "$" "@" test)
 )
 
 (def test2 "tokens with spaces\n and newlines\n\tand tabs!")

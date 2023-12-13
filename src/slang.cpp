@@ -44,7 +44,6 @@ size_t gArenaSize = 0;
 size_t gCurrDepth = 0;
 size_t gMaxDepth = 0;
 size_t gCaseMisses = 0;
-double gParseTime = 0.0;
 double gCompileTime = 0.0;
 double gRunTime = 0.0;
 
@@ -1104,6 +1103,33 @@ inline bool GetRecursiveSymbol(SlangEnv* e,SymbolName name,SlangHeader** val){
 	return false;
 }
 
+inline bool CodeInterpreter::GetStackSymbol(size_t funcFrame,SymbolName sym,SlangHeader** res){
+	//for (size_t i=funcFrame;i!=-1ULL;--i){
+	FuncData& f = funcStack.data[funcFrame];
+	size_t funcIndex = f.funcIndex;
+	if (sym==codeWriter.lambdaCodes[funcIndex].name){
+		return GetRecursiveSymbol(f.env,sym,res);
+	}
+	const ParamData& params = codeWriter.lambdaCodes[funcIndex].params;
+	for (size_t j=0;j<params.size;++j){
+		if (params.data[j]==sym){
+			size_t funcBase = stack.data[f.argsFrame].base;
+			*res = argStack.data[funcBase+j];
+			return true;
+		}
+	}
+	const ParamData& defs = codeWriter.lambdaCodes[funcIndex].defs;
+	for (size_t j=0;j<defs.size;++j){
+		if (defs.data[j]==sym){
+			size_t funcBase = stack.data[f.argsFrame].base;
+			*res = argStack.data[funcBase+params.size+j];
+			return true;
+		}
+	}
+	//}
+	return GetRecursiveSymbol(GetCurrEnv(),sym,res);
+}
+
 inline bool ConvertToBool(const SlangHeader* obj){
 	if (!obj){
 		return false;
@@ -1413,7 +1439,6 @@ void PrintInfo(){
 	size_t caseMem = gDebugInterpreter->codeWriter.caseDictElements.cap*sizeof(CaseDictElement);
 	std::cout << "Case mem: " << caseMem/1024 << " KB\n";
 	std::cout << std::fixed << std::setprecision(3);
-	std::cout << "Parse time: " << gParseTime*1000 << "ms\n";
 	std::cout << "Compile time: " << gCompileTime*1000 << "ms\n";
 	if (gRunTime>=2.0)
 		std::cout << "Run time: " << gRunTime << "s\n";
@@ -2507,7 +2532,7 @@ static const size_t SlangOpSizes[] = {
 	OPCODE_SIZE,    // SLANG_OP_ZERO
 	OPCODE_SIZE,    // SLANG_OP_ONE
 	OPCODE_SIZE+8,  // SLANG_OP_PUSH_LAMBDA
-	OPCODE_SIZE+8,  // SLANG_OP_LOOKUP
+	OPCODE_SIZE+8+4,// SLANG_OP_LOOKUP
 	OPCODE_SIZE+8,  // SLANG_OP_SET
 	OPCODE_SIZE+2,  // SLANG_OP_GET_LOCAL
 	OPCODE_SIZE+2,  // SLANG_OP_SET_LOCAL
@@ -3021,23 +3046,27 @@ bool CodeWriter::SymbolInParams(SymbolName sym,uint16_t& into) const {
 	return false;
 }
 
-bool CodeWriter::SymbolNotInAnyParams(SymbolName sym) const {
+bool CodeWriter::SymbolNotInAnyParams(SymbolName sym,uint32_t& frameHeight) const {
 	if (lambdaStack.empty()) return true;
 	size_t stackIdx = lambdaStack.size()-1;
 	while (true){
 		const LambdaData& lam = lambdaStack[stackIdx];
-		if (lam.funcName==sym)
+		if (lam.funcName==sym){
+			frameHeight = stackIdx;
 			return false;
+		}
 		
 		for (size_t i=0;i<lam.params.size;++i){
 			SymbolName s = lam.params.data[i];
 			if (sym==s){
+				frameHeight = stackIdx;
 				return false;
 			}
 		}
 		for (size_t i=0;i<lam.defs.size;++i){
 			SymbolName s = lam.defs.data[i];
 			if (sym==s){
+				frameHeight = stackIdx;
 				return false;
 			}
 		}
@@ -3215,6 +3244,7 @@ bool CodeWriter::CompileDefine(const SlangHeader* head){
 	if (defType==SLANG_SET){
 		uint16_t p;
 		uint32_t height;
+		uint32_t frameHeight;
 		if (SymbolInStarParams(sym,height)){
 			WriteOpCode(SLANG_OP_SET_STACK);
 			WriteInt32(height);
@@ -3226,7 +3256,7 @@ bool CodeWriter::CompileDefine(const SlangHeader* head){
 			WriteOpCode(SLANG_OP_SET_LOCAL);
 			WriteInt16(p);
 			--currHeights.Back();
-		} else if (SymbolNotInAnyParams(sym)){
+		} else if (SymbolNotInAnyParams(sym,frameHeight)){
 			WriteOpCode(SLANG_OP_SET_GLOBAL);
 			WriteSymbolName(sym);
 			--currHeights.Back();
@@ -4423,6 +4453,7 @@ bool CodeWriter::CompileConst(const SlangHeader* obj){
 			sym = asObj->symbol;
 			uint16_t idx;
 			uint32_t height;
+			uint32_t frameHeight;
 			if (SymbolInStarParams(sym,height)){
 				// let local var
 				WriteOpCode(SLANG_OP_GET_STACK);
@@ -4441,7 +4472,7 @@ bool CodeWriter::CompileConst(const SlangHeader* obj){
 				WriteOpCode(SLANG_OP_GET_LOCAL);
 				WriteInt16(idx);
 				++currHeights.Back();
-			} else if (SymbolNotInAnyParams(sym)){
+			} else if (SymbolNotInAnyParams(sym,frameHeight)){
 				// global var
 				if (sym>=GLOBAL_SYMBOL_COUNT){
 					WriteOpCode(SLANG_OP_GET_GLOBAL);
@@ -4455,6 +4486,7 @@ bool CodeWriter::CompileConst(const SlangHeader* obj){
 				// closure var
 				WriteOpCode(SLANG_OP_LOOKUP);
 				WriteSymbolName(sym);
+				WriteInt32(frameHeight+1);
 				AddClosureParam(sym);
 				AddCodeLocation(obj);
 				++currHeights.Back();
@@ -5293,7 +5325,7 @@ inline void CodeInterpreter::LoadTry(){
 	PushArg((SlangHeader*)emptyMaybe);
 }
 
-inline void CodeInterpreter::Call(size_t funcIndex,SlangEnv* env){
+inline void CodeInterpreter::Call(size_t funcIndex,SlangEnv* env,bool isClosure){
 	FuncData& f = funcStack.PlaceBack();
 	f.funcIndex = funcIndex;
 	f.argsFrame = stack.size-1;
@@ -5302,24 +5334,29 @@ inline void CodeInterpreter::Call(size_t funcIndex,SlangEnv* env){
 	f.globalEnv = modules.data[cb.moduleIndex].globalEnv;
 	
 	f.retAddr = pc+SlangOpSizes[*pc];
+	f.isClosure = isClosure;
 	uint8_t* code = cb.start;
 	pc = code-SlangOpSizes[*pc];
 }
 
-inline void CodeInterpreter::RetCall(size_t funcIndex,SlangEnv* env){
+inline void CodeInterpreter::RetCall(size_t funcIndex,SlangEnv* env,bool isClosure){
 	StackData& d = stack.Back();
 	FuncData& f = funcStack.Back();
 	f.funcIndex = funcIndex;
 	f.env = env;
 	const CodeBlock& cb = codeWriter.lambdaCodes[funcIndex];
 	f.globalEnv = modules.data[cb.moduleIndex].globalEnv;
+	f.isClosure = isClosure;
 	uint8_t* code = cb.start;
 	size_t argCount = GetArgCount();
 	size_t lowerBase = stack.data[f.argsFrame].base;
 	size_t upperBase = d.base;
 	// copy args down
 	for (size_t i=0;i<argCount;++i){
-		argStack.data[lowerBase+i] = argStack.data[upperBase+i];
+		SlangHeader* arg = argStack.data[upperBase+i];
+		if (arg&&arg->type==SlangType::Lambda)
+			arg->flags |= FLAG_CLOSURE;
+		argStack.data[lowerBase+i] = arg;
 	}
 	pc = code-SlangOpSizes[*pc];
 	// manual pop frame
@@ -5439,7 +5476,7 @@ inline SlangLambda* CodeInterpreter::CreateLambda(size_t index){
 		lam->header.flags |= FLAG_VARIADIC;
 	lam->funcIndex = index;
 	if (block.isClosure){
-		lam->header.flags |= FLAG_CLOSURE;
+		//lam->header.flags |= FLAG_CLOSURE;
 		PushArg((SlangHeader*)lam);
 		size_t pCount = block.params.size;
 		size_t dCount = block.defs.size;
@@ -5511,18 +5548,6 @@ inline SlangVec* CodeInterpreter::MakeVecFromArgs(size_t start,size_t end){
 	memcpy(v->storage->objs,&argStack.data[start],(end-start)*sizeof(SlangHeader*));
 	return v;
 }
-
-/*SlangHeader* CodeInterpreter::Copy(SlangHeader* expr){
-	if (!arena->InCurrSet((uint8_t*)expr)) return expr;
-	
-	PushArg(expr);
-	size_t size = expr->GetSize();
-	SlangHeader* copied = (SlangHeader*)CodeInterpreterAllocate(this,size);
-	expr = PopArg();
-	memcpy(copied,expr,size);
-	
-	return copied;
-}*/
 
 SlangHeader* CodeInterpreter::Copy(SlangHeader* obj){
 	if (!obj)
@@ -6783,7 +6808,7 @@ bool CodeInterpreter::EvalCall(SlangHeader* codeObj){
 	
 	if (r){
 		size_t index = codeWriter.evalFuncIndex;
-		Call(index,funcStack.Back().env);
+		Call(index,funcStack.Back().env,false);
 	}
 	return r;
 }
@@ -10017,7 +10042,7 @@ bool CFHandleImport(CodeInterpreter* c,SlangList* nameList){
 	SlangEnv* newEnv = c->AllocateEnvs(4);
 	md.globalEnv = newEnv;
 	c->stack.PushBack({c->argStack.size});
-	c->Call(newFunc,newEnv);
+	c->Call(newFunc,newEnv,false);
 	return true;
 }
 
@@ -10528,6 +10553,7 @@ bool CodeFuncApply(CodeInterpreter* c){
 	} else {
 		SlangLambda* lam = (SlangLambda*)func;
 		size_t funcIndex = lam->funcIndex;
+		bool isClosure = (func->flags & FLAG_CLOSURE);
 		c->lamEnv = lam->env;
 		[[unlikely]]
 		if (!CFHandleArgs(c,
@@ -10535,7 +10561,7 @@ bool CodeFuncApply(CodeInterpreter* c){
 							c->codeWriter.lambdaCodes[funcIndex]))
 			return false;
 			
-		c->Call(funcIndex,c->lamEnv);
+		c->Call(funcIndex,c->lamEnv,isClosure);
 		c->lamEnv = nullptr;
 	}
 	

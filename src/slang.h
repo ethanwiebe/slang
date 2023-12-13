@@ -1069,7 +1069,7 @@ namespace slang {
 		bool SymbolInStarParams(SymbolName,uint32_t&) const;
 		bool SymbolInInternalDefs(SymbolName,uint32_t&) const;
 		bool SymbolInParams(SymbolName,uint16_t&) const;
-		bool SymbolNotInAnyParams(SymbolName) const;
+		bool SymbolNotInAnyParams(SymbolName,uint32_t&) const;
 		bool ParamIsInited(uint16_t) const;
 		void AddClosureParam(SymbolName);
 		
@@ -1178,6 +1178,7 @@ namespace slang {
 		SlangEnv* env;
 		SlangEnv* globalEnv;
 		const uint8_t* retAddr;
+		bool isClosure;
 	};
 	
 	struct TryData {
@@ -1348,8 +1349,9 @@ namespace slang {
 		inline void PushTry();
 		inline void LoadTry();
 		
-		inline void Call(size_t funcIndex,SlangEnv* env);
-		inline void RetCall(size_t funcIndex,SlangEnv* env);
+		inline bool GetStackSymbol(size_t funcFrame,SymbolName sym,SlangHeader** res);
+		inline void Call(size_t funcIndex,SlangEnv* env,bool isClosure);
+		inline void RetCall(size_t funcIndex,SlangEnv* env,bool isClosure);
 		inline void Recurse();
 		inline void Return(SlangHeader* val);
 		

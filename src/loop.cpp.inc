@@ -7,6 +7,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 	SlangHeader* const oneObj = c->codeWriter.constOneObj;
 	uint8_t op;
 	size_t i;
+	bool boolVal;
 	uint16_t localIdx;
 	int32_t jumpVal;
 	uint32_t v32;
@@ -67,9 +68,17 @@ inline void LOOP_NAME(CodeInterpreter* c){
 			NEXT_INST();
 		LOOP_INST(SLANG_OP_LOOKUP)
 			sym = *(SymbolName*)(c->pc+OPCODE_SIZE);
-			if (!GetRecursiveSymbol(c->GetCurrEnv(),sym,&val)){
-				c->UndefinedError(sym);
-				return;
+			if (c->funcStack.Back().isClosure){
+				if (!GetRecursiveSymbol(c->GetCurrEnv(),sym,&val)){
+					c->UndefinedError(sym);
+					return;
+				}
+			} else {
+				v32 = *(uint32_t*)(c->pc+OPCODE_SIZE+sizeof(SymbolName));
+				if (!c->GetStackSymbol(c->funcStack.size-v32,sym,&val)){
+					c->UndefinedError(sym);
+					return;
+				}
 			}
 			c->PushArg(val);
 			NEXT_INST();
@@ -201,6 +210,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 			}
 			
 			lam = (SlangLambda*)val;
+			boolVal = (val->flags & FLAG_CLOSURE);
 			v64 = lam->funcIndex;
 			block = &c->codeWriter.lambdaCodes[v64];
 			c->lamEnv = lam->env;
@@ -210,7 +220,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 					*block))
 				return;
 				
-			c->Call(v64,c->lamEnv);
+			c->Call(v64,c->lamEnv,boolVal);
 			c->lamEnv = nullptr;
 			NEXT_INST();
 		LOOP_INST(SLANG_OP_CALLSYM)
@@ -223,7 +233,11 @@ inline void LOOP_NAME(CodeInterpreter* c){
 		LOOP_INST(SLANG_OP_RET)
 			v64 = c->stack.Back().base;
 			c->pc = c->funcStack.Back().retAddr-SlangOpSizes[SLANG_OP_RET];
-			c->argStack.data[v64] = c->argStack.data[c->argStack.size-1];
+			val = c->argStack.data[c->argStack.size-1];
+			if (val&&val->type==SlangType::Lambda){
+				val->flags |= FLAG_CLOSURE;
+			}
+			c->argStack.data[v64] = val;
 			c->argStack.size = v64+1;
 			c->stack.PopBack();
 			c->funcStack.PopBack();
@@ -269,6 +283,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 			}
 			
 			lam = (SlangLambda*)val;
+			//boolVal = (val->flags&FLAG_CLOSURE);
 			v64 = lam->funcIndex;
 			block = &c->codeWriter.lambdaCodes[v64];
 			c->lamEnv = lam->env;
@@ -277,7 +292,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 								*block))
 				return;
 			
-			c->RetCall(v64,c->lamEnv);
+			c->RetCall(v64,c->lamEnv,true);
 			c->lamEnv = nullptr;
 			NEXT_INST();
 		LOOP_INST(SLANG_OP_RETCALLSYM)
@@ -419,6 +434,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 			}
 			
 			lam = (SlangLambda*)val;
+			boolVal = (val->flags & FLAG_CLOSURE);
 			v64 = lam->funcIndex;
 			v642 = (uint64_t)c->pc;
 			block = &c->codeWriter.lambdaCodes[v64];
@@ -429,7 +445,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 					*block))
 				return;
 				
-			c->Call(v64,c->lamEnv);
+			c->Call(v64,c->lamEnv,boolVal);
 			c->lamEnv = nullptr;
 			c->funcStack.Back().retAddr = (const uint8_t*)v642;
 			NEXT_INST();
@@ -474,6 +490,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 			}
 			
 			lam = (SlangLambda*)val;
+			boolVal = (val->flags & FLAG_CLOSURE);
 			v64 = lam->funcIndex;
 			v642 = (uint64_t)c->pc;
 			block = &c->codeWriter.lambdaCodes[v64];
@@ -484,7 +501,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 					*block))
 				return;
 				
-			c->Call(v64,c->lamEnv);
+			c->Call(v64,c->lamEnv,boolVal);
 			c->lamEnv = nullptr;
 			c->funcStack.Back().retAddr = (const uint8_t*)v642;
 			NEXT_INST();
@@ -552,6 +569,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 			}
 			
 			lam = (SlangLambda*)val;
+			boolVal = (val->flags & FLAG_CLOSURE);
 			v64 = lam->funcIndex;
 			v642 = (uint64_t)c->pc;
 			block = &c->codeWriter.lambdaCodes[v64];
@@ -562,7 +580,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 					*block))
 				return;
 				
-			c->Call(v64,c->lamEnv);
+			c->Call(v64,c->lamEnv,boolVal);
 			c->lamEnv = nullptr;
 			c->funcStack.Back().retAddr = (const uint8_t*)v642;
 			NEXT_INST();
@@ -618,6 +636,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 			}
 			
 			lam = (SlangLambda*)val;
+			boolVal = (val->flags & FLAG_CLOSURE);
 			v64 = lam->funcIndex;
 			v642 = (uint64_t)c->pc;
 			block = &c->codeWriter.lambdaCodes[v64];
@@ -628,7 +647,7 @@ inline void LOOP_NAME(CodeInterpreter* c){
 					*block))
 				return;
 				
-			c->Call(v64,c->lamEnv);
+			c->Call(v64,c->lamEnv,boolVal);
 			c->lamEnv = nullptr;
 			c->funcStack.Back().retAddr = (const uint8_t*)v642;
 			NEXT_INST();

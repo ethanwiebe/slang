@@ -2125,8 +2125,9 @@ bool SlangParser::ParseLine(SlangHeader** res){
 	return ParseObj(res);
 }
 
-void SlangParser::SetCodeString(std::string_view code){
+void SlangParser::SetCodeString(std::string_view code,ModuleName mname){
 	tokenizer = std::make_unique<SlangTokenizer>(code,this);
+	currModule = mname;
 	gDebugParser = this;
 	errors.clear();
 	
@@ -3125,7 +3126,7 @@ bool CodeWriter::CompileCode(const std::string& code){
 	curr->moduleIndex = 0;
 	InitCompile();
 	
-	parser.SetCodeString(code);
+	parser.SetCodeString(code,currModuleIndex);
 	SlangHeader* expr;
 	while (parser.ParseLine(&expr)){
 		if (!CompileExpr(expr))
@@ -3147,7 +3148,6 @@ bool CodeWriter::CompileCode(const std::string& code){
 
 bool CodeWriter::CompileModule(ModuleName name,const std::string& code,size_t& funcIndex){
 	currModuleIndex = name;
-	parser.currModule = name;
 	funcIndex = AllocNewBlock(256);
 	curr = &lambdaCodes[funcIndex];
 	knownLambdaStack.clear();
@@ -3156,7 +3156,7 @@ bool CodeWriter::CompileModule(ModuleName name,const std::string& code,size_t& f
 	curr->isPure = true;
 	InitCompile();
 	
-	parser.SetCodeString(code);
+	parser.SetCodeString(code,currModuleIndex);
 	SlangHeader* expr;
 	while (parser.ParseLine(&expr)){
 		if (!CompileExpr(expr))
@@ -5933,8 +5933,7 @@ bool CodeInterpreter::ParseSlangString(const SlangStr& code,SlangHeader** res){
 	//evalMemChain.Reset();
 	SlangAllocator savedAlloc = parser.alloc;
 	parser.alloc = evalAlloc;
-	parser.SetCodeString(sv);
-	parser.currModule = -1U;
+	parser.SetCodeString(sv,-1U);
 	SlangHeader* parsed;
 	bool success = parser.ParseLine(&parsed);
 	if (parser.token.type!=SlangTokenType::EndOfFile)
@@ -9738,6 +9737,15 @@ bool CodeFuncIsVec(CodeInterpreter* c){
 	return true;
 }
 
+bool CodeFuncIsDict(CodeInterpreter* c){
+	SlangHeader* arg = c->GetArg(0);
+	if (GetType(arg)==SlangType::Dict)
+		c->Return(c->codeWriter.constTrueObj);
+	else
+		c->Return(c->codeWriter.constFalseObj);
+	return true;
+}
+
 bool CodeFuncIsMaybe(CodeInterpreter* c){
 	SlangHeader* arg = c->GetArg(0);
 	if (GetType(arg)==SlangType::Maybe)
@@ -10141,10 +10149,10 @@ const CodeFunc CodeBuiltinFuncs[] = {
 	CodeFuncBitNot,
 	CodeFuncBitLeftShift,
 	CodeFuncBitRightShift,
-	CodeFuncGT, //SlangFuncGT,
-	CodeFuncLT, //SlangFuncLT,
-	CodeFuncGTE, //SlangFuncGTE,
-	CodeFuncLTE, //SlangFuncLTE,
+	CodeFuncGT,
+	CodeFuncLT,
+	CodeFuncGTE,
+	CodeFuncLTE,
 	CodeFuncAssert,
 	CodeFuncEq,
 	CodeFuncNEq,
@@ -10157,6 +10165,7 @@ const CodeFunc CodeBuiltinFuncs[] = {
 	CodeFuncIsPair,
 	CodeFuncIsProc,
 	CodeFuncIsVec,
+	CodeFuncIsDict,
 	CodeFuncIsMaybe,
 	CodeFuncIsEndOfFile,
 	CodeFuncIsBound,
@@ -10742,7 +10751,7 @@ bool CodeInterpreter::LoadExpr(const std::string& code){
 		SetupDefaultModule("<repl>");
 	}
 	
-	parser.SetCodeString(code);
+	parser.SetCodeString(code,currModuleName);
 	SlangHeader* prog;
 	if (!parser.ParseLine(&prog))
 		return false;

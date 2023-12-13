@@ -946,7 +946,7 @@ namespace slang {
 		bool ParseVec(SlangHeader**);
 		void TestSeqMacro(SlangList* list,size_t argCount);
 		
-		void SetCodeString(std::string_view code);
+		void SetCodeString(std::string_view code,ModuleName name);
 	};
 	
 	struct CodeLocationPair {

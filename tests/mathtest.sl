@@ -12,5 +12,7 @@
 (assert (= (floor 0.0) 0.0))
 (assert (= (ceil 0.0) 0.0))
 (assert (= (% (+ 100 2) 10) 2))
+(assert (= (bitrsh 100 2) 25))
+(assert (= (bitlsh 100 2) 400))
 
 (output "math passed\n")

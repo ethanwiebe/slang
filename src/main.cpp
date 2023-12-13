@@ -1,4 +1,5 @@
 #include "slang.h"
+#include "debugger.h"
 
 #include <fstream>
 #include <iostream>
@@ -35,78 +36,6 @@ inline size_t BracketsAreComplete(const std::string& str){
 	return score;
 }
 
-void PrintStack(const Vector<SlangHeader*>& stack,size_t argsFrame,const Vector<StackData>& frames){
-	size_t currFrameIndex = 0;
-	for (size_t i=0;i<stack.size;++i){
-		SlangHeader* v = stack.data[i];
-		while (currFrameIndex<frames.size && i==frames.data[currFrameIndex].base){
-			if (argsFrame==currFrameIndex)
-				std::cout << "|";
-			else
-				std::cout << "/";
-			++currFrameIndex;
-		}
-		if (!v){
-			std::cout << "()";
-		} else {
-			std::cout << *v;
-		}
-		std::cout << "  ";
-	}
-	while (currFrameIndex<frames.size && stack.size==frames.data[currFrameIndex].base){
-		if (argsFrame==currFrameIndex)
-			std::cout << "|";
-		else
-			std::cout << "/";
-		++currFrameIndex;
-	}
-	std::cout << '\n';
-}
-
-void StepperLoop(CodeInterpreter* interp){
-	std::string inputStr{};
-	while (true){
-		CodeBlock currCodeBlock = interp->codeWriter.lambdaCodes[interp->funcStack.Back().funcIndex];
-		PrintCode(currCodeBlock.start,currCodeBlock.write,interp->pc);
-		size_t argsFrame = interp->funcStack.Back().argsFrame;
-		PrintStack(interp->argStack,argsFrame,interp->stack);
-		FuncData& fd = interp->funcStack.Back();
-		if (interp->funcStack.size>1){
-			size_t retFunc = interp->funcStack.data[interp->funcStack.size-2].funcIndex;
-			std::cout << "ret: " << 
-				(int64_t)(fd.retAddr-interp->codeWriter.lambdaCodes[retFunc].start) << 
-				'\n';
-		}
-		std::cout << "pc: " << 
-			(int64_t)(interp->pc-interp->codeWriter.lambdaCodes[fd.funcIndex].start) << '\n';
-		std::cout << "dbg> ";
-		
-		inputStr.clear();
-		std::getline(std::cin,inputStr);
-		if (inputStr.empty())
-			continue;
-		
-		if (inputStr=="q"){
-			break;
-		}
-		
-		if (inputStr=="s"){
-			bool r = interp->Step();
-			if (!r){
-				if (interp->errors.empty()){
-					std::cout << "HALTED\n";
-					SlangHeader* ret = interp->PopArg();
-					if (ret)
-						std::cout << *ret << '\n';
-				} else {
-					interp->DisplayErrors();
-				}
-				break;
-			}
-		}
-	}
-}
-
 void ReplLoop(CodeInterpreter* interp,bool debug){
 	std::cout << "====slang v" SLANG_VERSION "====\n";
 	std::string inputStr{};
@@ -136,7 +65,7 @@ void ReplLoop(CodeInterpreter* interp,bool debug){
 			if (debug){
 				uint8_t* start = interp->codeWriter.lambdaCodes[0].start;
 				uint8_t* end = interp->codeWriter.lambdaCodes[0].write;
-				PrintCode(start,end);
+				PrintCode(start,end,std::cout);
 			}
 			
 			if (!interp->Run()){
@@ -167,7 +96,7 @@ bool RunProgram(
 		return false;
 	}
 	if (shouldDebug){
-		for (size_t i=0;i<interp->codeWriter.lambdaCodes.size();++i){
+		/*for (size_t i=0;i<interp->codeWriter.lambdaCodes.size();++i){
 			CodeBlock& block = interp->codeWriter.lambdaCodes[i];
 			uint8_t* start = block.start;
 			uint8_t* end = block.write;
@@ -186,10 +115,10 @@ bool RunProgram(
 				std::cout << interp->parser.GetSymbolString(params.data[pIndex]) << ' ';
 			}
 			std::cout << '\n';
-			PrintCode(start,end);
+			PrintCode(start,end,std::cout);
 			std::cout << "END\n\n";
-		}
-		StepperLoop(interp);
+		}*/
+		DebuggerLoop(interp);
 		return true;
 	}
 	if (!interp->Run()){

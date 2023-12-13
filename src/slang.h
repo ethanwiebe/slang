@@ -139,6 +139,13 @@ namespace slang {
 			--size;
 		}
 		
+		inline void PopFrom(size_t index){
+			for (size_t i=index;i<size;++i){
+				data[i] = data[i+1];
+			}
+			--size;
+		}
+		
 		inline T& Front() const {
 			return data[0];
 		}
@@ -927,7 +934,7 @@ namespace slang {
 		inline SlangList* WrapExprSplice(SymbolName func,SlangList* expr);
 		inline LocationData GetExprLocation(const SlangHeader*);
 		
-		std::string_view GetSymbolString(SymbolName name);
+		std::string_view GetSymbolString(SymbolName name) const;
 		SymbolName RegisterSymbol(std::string_view name);
 		
 		void PushError(const std::string& msg);
@@ -1445,7 +1452,7 @@ namespace slang {
 		void ZeroDivisionError();
 	};
 	
-	void PrintCode(const uint8_t* code,const uint8_t* end,const uint8_t* pc=nullptr);
+	size_t PrintCode(const uint8_t* code,const uint8_t* end,std::ostream&,const uint8_t* pc=nullptr);
 	void PrintErrors(const std::vector<ErrorData>& errors);
 	
 	std::ostream& operator<<(std::ostream&,const SlangHeader&);

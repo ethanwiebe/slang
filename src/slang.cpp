@@ -11,6 +11,10 @@
 #ifdef _WIN32
 #include <profileapi.h>
 #include <sys/timeb.h>
+#include <conio.h>
+#else
+#include <sys/ioctl.h>
+#include <termios.h>
 #endif
 
 #define GEN_FLAG (1ULL<<63)
@@ -1663,7 +1667,7 @@ SymbolName SlangParser::RegisterSymbol(std::string_view str){
 	return name;
 }
 
-std::string_view SlangParser::GetSymbolString(SymbolName symbol){
+std::string_view SlangParser::GetSymbolString(SymbolName symbol) const {
 	if (symbol==LET_SELF_SYM)
 		return "$letself";
 	if (symbol==EMPTY_NAME)
@@ -6795,8 +6799,11 @@ void CodeWalker(const uint8_t* code,const uint8_t* end,CodeWalkFunc func,void* d
 }
 
 struct PrintCodeData {
+	std::ostream& os;
 	size_t pos;
 	const uint8_t* pc;
+	size_t currLine = 0;
+	size_t pcLine = 0;
 };
 
 bool PrintCodeSub(const uint8_t* c,void* data){
@@ -6807,304 +6814,308 @@ bool PrintCodeSub(const uint8_t* c,void* data){
 	int32_t big;
 	uint64_t lamIndex;
 	char spacer = ' ';
-	if (c==dat->pc) spacer = '*';
-	std::cout << dat->pos << ' ';
-	if (dat->pos<1000) std::cout << spacer;
-	if (dat->pos<100) std::cout << spacer;
-	if (dat->pos<10) std::cout << spacer;
+	if (c==dat->pc){
+		spacer = '*';
+		dat->pcLine = dat->currLine;
+	}
+	dat->os << dat->pos << ' ';
+	if (dat->pos<10000) dat->os << spacer;
+	if (dat->pos<1000) dat->os << spacer;
+	if (dat->pos<100) dat->os << spacer;
+	if (dat->pos<10) dat->os << spacer;
 	
 	switch (*c){
 		case SLANG_OP_NOOP:
-			std::cout << "NOOP\n";
+			dat->os << "NOOP\n";
 			break;
 		case SLANG_OP_HALT:
-			std::cout << "HALT\n";
+			dat->os << "HALT\n";
 			break;
 		case SLANG_OP_NULL:
-			std::cout << "PUSH ()\n";
+			dat->os << "PUSH ()\n";
 			break;
 		case SLANG_OP_LOAD_PTR:
-			std::cout << "LD ";
+			dat->os << "LD ";
 			ptr = *(SlangHeader**)(c+OPCODE_SIZE);
 			if (!ptr){
-				std::cout << "()";
+				dat->os << "()";
 			} else {
-				std::cout << *ptr;
+				dat->os << *ptr;
 			}
 			
-			std::cout << '\n';
+			dat->os << '\n';
 			break;
 		case SLANG_OP_BOOL_TRUE:
-			std::cout << "PUSH TRUE\n";
+			dat->os << "PUSH TRUE\n";
 			break;
 		case SLANG_OP_BOOL_FALSE:
-			std::cout << "PUSH FALSE\n";
+			dat->os << "PUSH FALSE\n";
 			break;
 		case SLANG_OP_ZERO:
-			std::cout << "PUSH ZERO\n";
+			dat->os << "PUSH ZERO\n";
 			break;
 		case SLANG_OP_ONE:
-			std::cout << "PUSH ONE\n";
+			dat->os << "PUSH ONE\n";
 			break;
 		case SLANG_OP_LOOKUP:
-			std::cout << "LOOKUP ";
+			dat->os << "LOOKUP ";
 			sym = *(SymbolName*)(c+OPCODE_SIZE);
-			std::cout << gDebugParser->GetSymbolString(sym);
-			std::cout << '\n';
+			dat->os << gDebugParser->GetSymbolString(sym);
+			dat->os << '\n';
 			break;
 		case SLANG_OP_SET:
-			std::cout << "SET ";
+			dat->os << "SET ";
 			sym = *(SymbolName*)(c+OPCODE_SIZE);
-			std::cout << gDebugParser->GetSymbolString(sym);
-			std::cout << '\n';
+			dat->os << gDebugParser->GetSymbolString(sym);
+			dat->os << '\n';
 			break;
 		case SLANG_OP_GET_LOCAL:
-			std::cout << "GETLOCAL ";
+			dat->os << "GETLOCAL ";
 			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
-			std::cout << localIdx;
-			std::cout << '\n';
+			dat->os << localIdx;
+			dat->os << '\n';
 			break;
 		case SLANG_OP_SET_LOCAL:
-			std::cout << "SETLOCAL ";
+			dat->os << "SETLOCAL ";
 			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
-			std::cout << localIdx;
-			std::cout << '\n';
+			dat->os << localIdx;
+			dat->os << '\n';
 			break;
 		case SLANG_OP_GET_GLOBAL:
-			std::cout << "GETGLOBAL ";
+			dat->os << "GETGLOBAL ";
 			sym = *(SymbolName*)(c+OPCODE_SIZE);
-			std::cout << gDebugParser->GetSymbolString(sym);
-			std::cout << '\n';
+			dat->os << gDebugParser->GetSymbolString(sym);
+			dat->os << '\n';
 			break;
 		case SLANG_OP_SET_GLOBAL:
-			std::cout << "SETGLOBAL ";
+			dat->os << "SETGLOBAL ";
 			sym = *(SymbolName*)(c+OPCODE_SIZE);
-			std::cout << gDebugParser->GetSymbolString(sym);
-			std::cout << '\n';
+			dat->os << gDebugParser->GetSymbolString(sym);
+			dat->os << '\n';
 			break;
 		case SLANG_OP_DEF_GLOBAL:
-			std::cout << "DEFGLOBAL ";
+			dat->os << "DEFGLOBAL ";
 			sym = *(SymbolName*)(c+OPCODE_SIZE);
-			std::cout << gDebugParser->GetSymbolString(sym);
-			std::cout << '\n';
+			dat->os << gDebugParser->GetSymbolString(sym);
+			dat->os << '\n';
 			break;
 		case SLANG_OP_GET_STACK:
-			std::cout << "GETSTACK ";
+			dat->os << "GETSTACK ";
 			big = *(uint32_t*)(c+OPCODE_SIZE);
-			std::cout << big;
-			std::cout << '\n';
+			dat->os << big;
+			dat->os << '\n';
 			break;
 		case SLANG_OP_SET_STACK:
-			std::cout << "SETSTACK ";
+			dat->os << "SETSTACK ";
 			big = *(uint32_t*)(c+OPCODE_SIZE);
-			std::cout << big;
-			std::cout << '\n';
+			dat->os << big;
+			dat->os << '\n';
 			break;
 		case SLANG_OP_PUSH_FRAME:
-			std::cout << "PUSH FRAME\n";
+			dat->os << "PUSH FRAME\n";
 			break;
 		case SLANG_OP_PUSH_LAMBDA:
-			std::cout << "PUSH LAMBDA ";
+			dat->os << "PUSH LAMBDA ";
 			lamIndex = *(uint64_t*)(c+OPCODE_SIZE);
-			std::cout << lamIndex << '\n';
+			dat->os << lamIndex << '\n';
 			break;
 		case SLANG_OP_POP_ARG:
-			std::cout << "POP\n";
+			dat->os << "POP\n";
 			break;
 		case SLANG_OP_INTERNAL_DEF:
-			std::cout << "INTERNAL DEF\n";
+			dat->os << "INTERNAL DEF\n";
 			break;
 		case SLANG_OP_UNPACK:
-			std::cout << "UNPACK\n";
+			dat->os << "UNPACK\n";
 			break;
 		case SLANG_OP_COPY:
-			std::cout << "COPY\n";
+			dat->os << "COPY\n";
 			break;
 		case SLANG_OP_CALL:
-			std::cout << "CALL\n";
+			dat->os << "CALL\n";
 			break;
 		case SLANG_OP_CALLSYM:
-			std::cout << "CALLSYM ";
+			dat->os << "CALLSYM ";
 			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
-			std::cout << gDebugParser->GetSymbolString((SymbolName)localIdx);
-			std::cout << '\n';
+			dat->os << gDebugParser->GetSymbolString((SymbolName)localIdx);
+			dat->os << '\n';
 			break;
 		case SLANG_OP_RET:
-			std::cout << "RET\n";
+			dat->os << "RET\n";
 			break;
 		case SLANG_OP_RETCALL:
-			std::cout << "RETCALL\n";
+			dat->os << "RETCALL\n";
 			break;
 		case SLANG_OP_RETCALLSYM:
-			std::cout << "RETCALLSYM ";
+			dat->os << "RETCALLSYM ";
 			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
-			std::cout << gDebugParser->GetSymbolString((SymbolName)localIdx);
-			std::cout << '\n';
+			dat->os << gDebugParser->GetSymbolString((SymbolName)localIdx);
+			dat->os << '\n';
 			break;
 		case SLANG_OP_RECURSE:
-			std::cout << "RECURSE\n";
+			dat->os << "RECURSE\n";
 			break;
 		case SLANG_OP_JUMP:
-			std::cout << "JMP ";
+			dat->os << "JMP ";
 			big = *(int32_t*)(c+OPCODE_SIZE);
 			big += dat->pos;
-			std::cout << big << '\n';
+			dat->os << big << '\n';
 			break;
 		case SLANG_OP_CJUMP_POP:
-			std::cout << "POP CJMP ";
+			dat->os << "POP CJMP ";
 			big = *(int32_t*)(c+OPCODE_SIZE);
 			big += dat->pos;
-			std::cout << big << '\n';
+			dat->os << big << '\n';
 			break;
 		case SLANG_OP_CNJUMP_POP:
-			std::cout << "POP CNJP ";
+			dat->os << "POP CNJP ";
 			big = *(int32_t*)(c+OPCODE_SIZE);
 			big += dat->pos;
-			std::cout << big << '\n';
+			dat->os << big << '\n';
 			break;
 		case SLANG_OP_CJUMP:
-			std::cout << "CJMP ";
+			dat->os << "CJMP ";
 			big = *(int32_t*)(c+OPCODE_SIZE);
 			big += dat->pos;
-			std::cout << big << '\n';
+			dat->os << big << '\n';
 			break;
 		case SLANG_OP_CNJUMP:
-			std::cout << "CNJP ";
+			dat->os << "CNJP ";
 			big = *(int32_t*)(c+OPCODE_SIZE);
 			big += dat->pos;
-			std::cout << big << '\n';
+			dat->os << big << '\n';
 			break;
 		case SLANG_OP_CASE_JUMP:
-			std::cout << "CASEJUMP ";
+			dat->os << "CASEJUMP ";
 			big = *(int32_t*)(c+OPCODE_SIZE);
-			std::cout << big << '\n';
+			dat->os << big << '\n';
 			break;
 		case SLANG_OP_TRY:
-			std::cout << "TRY ";
+			dat->os << "TRY ";
 			big = *(int32_t*)(c+OPCODE_SIZE);
 			big += dat->pos;
-			std::cout << big << '\n';
+			dat->os << big << '\n';
 			break;
 		case SLANG_OP_MAYBE_NULL:
-			std::cout << "PUSH ?<>\n";
+			dat->os << "PUSH ?<>\n";
 			break;
 		case SLANG_OP_MAYBE_WRAP:
-			std::cout << "MAYBE WRAP\n";
+			dat->os << "MAYBE WRAP\n";
 			break;
 		case SLANG_OP_MAYBE_UNWRAP:
-			std::cout << "UNWRAP\n";
+			dat->os << "UNWRAP\n";
 			break;
 		case SLANG_OP_MAP_STEP:
-			std::cout << "MAP STEP ";
+			dat->os << "MAP STEP ";
 			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
-			std::cout << localIdx << '\n';
+			dat->os << localIdx << '\n';
 			break;
 		case SLANG_OP_FOREACH_STEP:
-			std::cout << "FOREACH STEP ";
+			dat->os << "FOREACH STEP ";
 			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
-			std::cout << localIdx << '\n';
+			dat->os << localIdx << '\n';
 			break;
 		case SLANG_OP_FILTER_STEP:
-			std::cout << "FILTER STEP\n";
+			dat->os << "FILTER STEP\n";
 			break;
 		case SLANG_OP_FOLD_STEP:
-			std::cout << "FOLD STEP\n";
+			dat->os << "FOLD STEP\n";
 			break;
 		case SLANG_OP_NOT:
-			std::cout << "NOT\n";
+			dat->os << "NOT\n";
 			break;
 		case SLANG_OP_INC:
-			std::cout << "INC\n";
+			dat->os << "INC\n";
 			break;
 		case SLANG_OP_DEC:
-			std::cout << "DEC\n";
+			dat->os << "DEC\n";
 			break;
 		case SLANG_OP_NEG:
-			std::cout << "NEG\n";
+			dat->os << "NEG\n";
 			break;
 		case SLANG_OP_INVERT:
-			std::cout << "INVERT\n";
+			dat->os << "INVERT\n";
 			break;
 		case SLANG_OP_ADD:
-			std::cout << "ADD ";
+			dat->os << "ADD ";
 			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
-			std::cout << localIdx << '\n';
+			dat->os << localIdx << '\n';
 			break;
 		case SLANG_OP_SUB:
-			std::cout << "SUB ";
+			dat->os << "SUB ";
 			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
-			std::cout << localIdx << '\n';
+			dat->os << localIdx << '\n';
 			break;
 		case SLANG_OP_MUL:
-			std::cout << "MUL ";
+			dat->os << "MUL ";
 			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
-			std::cout << localIdx << '\n';
+			dat->os << localIdx << '\n';
 			break;
 		case SLANG_OP_DIV:
-			std::cout << "DIV ";
+			dat->os << "DIV ";
 			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
-			std::cout << localIdx << '\n';
+			dat->os << localIdx << '\n';
 			break;
 		case SLANG_OP_EQ:
-			std::cout << "EQ\n";
+			dat->os << "EQ\n";
 			break;
 		case SLANG_OP_PAIR:
-			std::cout << "PAIR\n";
+			dat->os << "PAIR\n";
 			break;
 		case SLANG_OP_LIST_CONCAT:
-			std::cout << "LCONCAT ";
+			dat->os << "LCONCAT ";
 			localIdx = *(uint16_t*)(c+OPCODE_SIZE);
-			std::cout << localIdx << '\n';
+			dat->os << localIdx << '\n';
 			break;
 		case SLANG_OP_LEFT:
-			std::cout << "L\n";
+			dat->os << "L\n";
 			break;
 		case SLANG_OP_RIGHT:
-			std::cout << "R\n";
+			dat->os << "R\n";
 			break;
 		case SLANG_OP_SET_LEFT:
-			std::cout << "SETL\n";
+			dat->os << "SETL\n";
 			break;
 		case SLANG_OP_SET_RIGHT:
-			std::cout << "SETR\n";
+			dat->os << "SETR\n";
 			break;
 		case SLANG_OP_MAKE_VEC:
-			std::cout << "MAKE VEC\n";
+			dat->os << "MAKE VEC\n";
 			break;
 		case SLANG_OP_VEC_GET:
-			std::cout << "VECGET\n";
+			dat->os << "VECGET\n";
 			break;
 		case SLANG_OP_VEC_SET:
-			std::cout << "VECSET\n";
+			dat->os << "VECSET\n";
 			break;
 		case SLANG_OP_EXPORT:
-			std::cout << "EXPORT ";
+			dat->os << "EXPORT ";
 			sym = *(SymbolName*)(c+OPCODE_SIZE);
-			std::cout << gDebugParser->GetSymbolString(sym);
-			std::cout << '\n';
+			dat->os << gDebugParser->GetSymbolString(sym);
+			dat->os << '\n';
 			break;
 		case SLANG_OP_IMPORT:
-			std::cout << "IMPORT ";
+			dat->os << "IMPORT ";
 			ptr = *(SlangHeader**)(c+OPCODE_SIZE);
 			if (ptr)
-				std::cout << *ptr;
+				dat->os << *ptr;
 			else
-				std::cout << "()";
-			std::cout << '\n';
+				dat->os << "()";
+			dat->os << '\n';
 			break;
 		default:
-			std::cout << "??\n";
+			dat->os << "??\n";
 			break;
 	}
 	dat->pos += SlangOpSizes[*c];
+	++dat->currLine;
 	return true;
 }
 
-void PrintCode(const uint8_t* code,const uint8_t* end,const uint8_t* pc){
-	PrintCodeData dat{};
-	dat.pos = 0;
-	dat.pc = pc;
+size_t PrintCode(const uint8_t* code,const uint8_t* end,std::ostream& os,const uint8_t* pc){
+	PrintCodeData dat{os,0,pc};
 	CodeWalker(code,end,PrintCodeSub,&dat);
+	return dat.pcLine;
 }
 
 void CodeInterpreter::DisplayErrors() const {
@@ -8132,6 +8143,45 @@ bool CodeFuncOutput(CodeInterpreter* c){
 	}
 	
 	c->Return(nullptr);
+	return true;
+}
+
+#ifdef _WIN32
+uint8_t GetKey(){
+	uint8_t c = _getch();
+	if (c==224){
+		c = _getch();
+	}
+	return c;
+}
+#else
+uint8_t getch(){
+	struct termios oldTerm, currentTerm;
+	tcgetattr(0,&oldTerm);
+	currentTerm = oldTerm;
+	currentTerm.c_lflag &= ~ICANON;
+	currentTerm.c_lflag &= ~ECHO;
+	tcsetattr(0,TCSANOW,&currentTerm);
+	uint8_t c = getchar();
+	tcsetattr(0,TCSANOW,&oldTerm);
+	return c;
+}
+
+uint8_t GetKey(){
+	uint8_t c = getch();
+	if (c==27){
+		getch();
+		getch();
+	}
+	return c;
+}
+#endif
+
+bool CodeFuncGetch(CodeInterpreter* c){
+	uint8_t ch = GetKey();
+	SlangStr* str = c->alloc.AllocateStr(1);
+	str->storage->data[0] = ch;
+	c->Return((SlangHeader*)str);
 	return true;
 }
 
@@ -10066,6 +10116,7 @@ const CodeFunc CodeBuiltinFuncs[] = {
 	CodeFuncPrint,
 	CodeFuncOutput,
 	CodeFuncInput,
+	CodeFuncGetch,
 	CodeFuncPair,
 	CodeFuncLeft,
 	CodeFuncRight,

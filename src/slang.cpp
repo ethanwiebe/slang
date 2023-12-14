@@ -3542,7 +3542,9 @@ bool CodeWriter::CompileLambdaBody(
 	uint8_t* savedLastInst = lastInst;
 	SymbolName funcName = lambdaStack.back().funcName;
 	lambdaIndex = lambdaCodes.size();
+#ifndef NDEBUG
 	size_t framesHeight = currFrames.size;
+#endif
 	currHeights.PushBack(0);
 	
 	if (funcName!=LET_SELF_SYM&&funcName!=EMPTY_NAME){
@@ -3579,7 +3581,6 @@ bool CodeWriter::CompileLambdaBody(
 			currDefName = param;
 			if (!CompileExpr(expr))
 				return false;
-			//currDefName = EMPTY_NAME;
 			WriteOpCode(SLANG_OP_SET_LOCAL);
 			WriteInt16(argIndex++);
 			--currHeights.Back();
@@ -3602,7 +3603,6 @@ bool CodeWriter::CompileLambdaBody(
 				return false;
 			WriteOpCode(SLANG_OP_INTERNAL_DEF);
 			WriteInt32(argIndex++);
-			//currDefName = EMPTY_NAME;
 		}
 		currDefName = oldDefName;
 		lambdaStack.back().currInternalDef = argIndex;
@@ -3641,10 +3641,6 @@ bool CodeWriter::CompileLambdaBody(
 	curr = &lambdaCodes[savedCurrOffset];
 	lastInst = savedLastInst;
 	knownLambdaStack.pop_back();
-	if (framesHeight!=currFrames.size){
-		std::cout << parser.GetSymbolString(funcName) << '\n';
-		std::cout << framesHeight << "," << currFrames.size << '\n';
-	}
 	assert(framesHeight==currFrames.size);
 	currHeights.PopBack();
 	
@@ -3719,40 +3715,10 @@ bool CodeWriter::CompileLambda(const SlangHeader* head){
 	}
 	currDefName = EMPTY_NAME;
 	
-	Vector<SymbolName> defNames{};
 	std::vector<SlangHeader*> internalDefs{};
 	internalDefs.reserve(4);
-	while (IsInternalDef(argIt->left)){
-		SlangList* defExpr = (SlangList*)argIt->left;
-		size_t defArgCount = GetArgCount(defExpr);
-		if (defArgCount!=3){
-			ArityError(argIt->left,defArgCount,3,3);
-			return false;
-		}
-		SlangHeader* symbolObj = ((SlangList*)defExpr->right)->left;
-		if (GetType(symbolObj)!=SlangType::Symbol){
-			TypeError(argIt->left,GetType(symbolObj),SlangType::Symbol);
-			return false;
-		}
-		SymbolName sym = ((SlangObj*)symbolObj)->symbol;
-		SlangList* defBodyIt = (SlangList*)((SlangList*)defExpr->right)->right;
-		
-		if (seen.contains(sym)){
-			RedefinedError(argIt->left,sym);
-			return false;
-		}
-		
-		defNames.PushBack(sym);
-		seen.insert(sym);
-		internalDefs.push_back(defBodyIt->left);
-		
-		argIt = (SlangList*)argIt->right;
-		if (!argIt)
-			break;
-	}
-	if (!internalDefs.empty()){
-		lambdaStack.back().defs = defNames;
-	}
+	if (!GetInternalDefs(argIt,seen,internalDefs))
+		return false;
 	
 	if (!CompileLambdaBody(argIt,nullptr,&internalDefs,lambdaIndex))
 		return false;
@@ -3801,6 +3767,7 @@ bool CodeWriter::CompileIf(const SlangHeader* head,bool terminating){
 	if (!CompileExpr(truePath,terminating))
 		return false;
 	
+	currHeights.Back() = falseHeight;
 	argIt = ((SlangList*)argIt)->right;
 	if (!argIt){
 		if (terminating){
@@ -3817,7 +3784,6 @@ bool CodeWriter::CompileIf(const SlangHeader* head,bool terminating){
 		}
 	}
 	
-	currHeights.Back() = falseHeight;
 	if (terminating){
 		FinishCJump(start);
 		SlangHeader* falsePath = ((SlangList*)argIt)->left;
@@ -4028,7 +3994,7 @@ bool CodeWriter::CompileCase(const SlangHeader* expr,bool terminating){
 			return false;
 		}
 	}
-	
+	currHeights.Back() = caseDefaultHeight;
 	WriteNull();
 	if (terminating){
 		WriteRet();
@@ -4155,6 +4121,7 @@ bool CodeWriter::CompileCond(const SlangHeader* expr,bool terminating){
 			WritePop();
 		argIt = (SlangList*)argIt->right;
 	}
+	currHeights.Back() = condDefaultHeight;
 	WriteNull();
 	if (terminating){
 		WriteRet();
@@ -4166,10 +4133,50 @@ bool CodeWriter::CompileCond(const SlangHeader* expr,bool terminating){
 	return true;
 }
 
+bool CodeWriter::GetInternalDefs(
+		SlangList*& argIt,
+		std::set<SymbolName>& seen,
+		std::vector<SlangHeader*>& internalDefs){
+	// internal defs in let
+	Vector<SymbolName> defNames{};
+	while (IsInternalDef(argIt->left)){
+		SlangList* defExpr = (SlangList*)argIt->left;
+		size_t defArgCount = GetArgCount(defExpr);
+		if (defArgCount!=3){
+			ArityError(argIt->left,defArgCount,3,3);
+			return false;
+		}
+		SlangHeader* symbolObj = ((SlangList*)defExpr->right)->left;
+		if (GetType(symbolObj)!=SlangType::Symbol){
+			TypeError(argIt->left,GetType(symbolObj),SlangType::Symbol);
+			return false;
+		}
+		SymbolName sym = ((SlangObj*)symbolObj)->symbol;
+		SlangList* defBodyIt = (SlangList*)((SlangList*)defExpr->right)->right;
+		
+		if (seen.contains(sym)){
+			RedefinedError(argIt->left,sym);
+			return false;
+		}
+		
+		defNames.PushBack(sym);
+		seen.insert(sym);
+		internalDefs.push_back(defBodyIt->left);
+		
+		argIt = (SlangList*)argIt->right;
+		if (!argIt)
+			break;
+	}
+	if (!internalDefs.empty()){
+		lambdaStack.back().defs = defNames;
+	}
+	return true;
+}
+
 bool CodeWriter::CompileLetRec(const SlangHeader* expr,bool terminating){
 	SymbolName letName = LET_SELF_SYM;
-	SlangHeader* argIt = ((SlangList*)expr)->right;
-	SlangHeader* params = ((SlangList*)argIt)->left;
+	SlangList* argIt = (SlangList*)((SlangList*)expr)->right;
+	SlangHeader* params = argIt->left;
 	if (!IsList(params)){
 		TypeError(params,GetType(params),SlangType::List);
 		return false;
@@ -4226,9 +4233,14 @@ bool CodeWriter::CompileLetRec(const SlangHeader* expr,bool terminating){
 		}
 	}
 	
-	argIt = ((SlangList*)argIt)->right;
+	argIt = (SlangList*)argIt->right;
+	std::vector<SlangHeader*> internalDefs{};
+	internalDefs.reserve(4);
+	if (!GetInternalDefs(argIt,seen,internalDefs))
+		return false;
+	
 	size_t lamIndex;
-	if (!CompileLambdaBody((SlangList*)argIt,&initExprs,nullptr,lamIndex))
+	if (!CompileLambdaBody(argIt,&initExprs,&internalDefs,lamIndex))
 		return false;
 	lambdaStack.pop_back();
 	WriteMakeLambda(lamIndex);
@@ -4238,14 +4250,14 @@ bool CodeWriter::CompileLetRec(const SlangHeader* expr,bool terminating){
 
 bool CodeWriter::CompileLet(const SlangHeader* expr,bool terminating){
 	SymbolName letName = LET_SELF_SYM;
-	SlangHeader* argIt = ((SlangList*)expr)->right;
-	SlangHeader* nameH = ((SlangList*)argIt)->left;
+	SlangList* argIt = (SlangList*)((SlangList*)expr)->right;
+	SlangHeader* nameH = argIt->left;
 	if (GetType(nameH)==SlangType::Symbol){
 		letName = ((SlangObj*)nameH)->symbol;
-		argIt = ((SlangList*)argIt)->right;
+		argIt = (SlangList*)argIt->right;
 	}
 	
-	SlangHeader* params = ((SlangList*)argIt)->left;
+	SlangHeader* params = argIt->left;
 	if (!IsList(params)){
 		TypeError(params,GetType(params),SlangType::List);
 		return false;
@@ -4260,6 +4272,7 @@ bool CodeWriter::CompileLet(const SlangHeader* expr,bool terminating){
 		heights.Reserve(4);
 		LambdaData dat{letName,p,{},heights};
 		dat.isStar = true;
+		dat.isClosure = true;
 		lambdaStack.push_back(dat);
 	}
 	std::set<SymbolName> seen{};
@@ -4302,11 +4315,17 @@ bool CodeWriter::CompileLet(const SlangHeader* expr,bool terminating){
 		}
 	}
 	
-	argIt = ((SlangList*)argIt)->right;
+	argIt = (SlangList*)argIt->right;
 	size_t lamIndex;
 	lambdaStack.back().isStar = false;
+	
+	std::vector<SlangHeader*> internalDefs{};
+	internalDefs.reserve(4);
+	if (!GetInternalDefs(argIt,seen,internalDefs))
+		return false;
+	
 	knownLambdaStack.emplace_back();
-	if (!CompileLambdaBody((SlangList*)argIt,nullptr,nullptr,lamIndex))
+	if (!CompileLambdaBody(argIt,nullptr,&internalDefs,lamIndex))
 		return false;
 	knownLambdaStack.pop_back();
 	lambdaStack.pop_back();
@@ -8174,7 +8193,7 @@ bool CodeFuncOutput(CodeInterpreter* c){
 uint8_t GetKey(){
 	uint8_t c = _getch();
 	if (c==224){
-		c = _getch();
+		_getch();
 	}
 	return c;
 }
@@ -8780,7 +8799,13 @@ bool CodeFuncVecAlloc(CodeInterpreter* c){
 		c->TypeError(GetType(sizeObj),SlangType::Int);
 		return false;
 	}
-	size_t vecSize = ((SlangObj*)sizeObj)->integer;
+	ssize_t vecSize = ((SlangObj*)sizeObj)->integer;
+	if (vecSize<0){
+		std::stringstream ss{};
+		ss << "Cannot allocate vector with size " << vecSize;
+		c->PushError("ValueError",ss.str());
+		return false;
+	}
 	SlangVec* vec = c->alloc.AllocateVec(vecSize);
 	SlangHeader* fill = nullptr;
 	if (argCount==2){
@@ -8789,7 +8814,7 @@ bool CodeFuncVecAlloc(CodeInterpreter* c){
 	if (!fill){
 		memset(vec->storage->objs,0,vecSize*sizeof(SlangHeader*));
 	} else {
-		for (size_t i=0;i<vecSize;++i){
+		for (size_t i=0;i<(size_t)vecSize;++i){
 			vec->storage->objs[i] = fill;
 		}
 	}

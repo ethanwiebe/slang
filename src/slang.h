@@ -5,7 +5,7 @@
 #include <unordered_map>
 #include <map>
 #include <vector>
-#include <list>
+#include <set>
 #include <ostream>
 #include <memory>
 #include <assert.h>
@@ -1093,6 +1093,12 @@ namespace slang {
 		SlangHeader* MakeSymbolConst(SymbolName sym);
 		
 		void InitCompile();
+		
+		bool GetInternalDefs(
+			SlangList*& argIt,
+			std::set<SymbolName>& seen,
+			std::vector<SlangHeader*>& internalDefs
+		);
 		
 		bool CompileData(const SlangHeader* obj);
 		bool CompileCode(const std::string& code);

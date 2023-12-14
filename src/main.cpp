@@ -5,6 +5,10 @@
 #include <iostream>
 #include <iomanip>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 using namespace slang;
 
 inline size_t BracketsAreComplete(const std::string& str){
@@ -143,6 +147,13 @@ int main(int argc,char** argv){
 	bool cmdlineProg = false;
 	bool interactive = false;
 	bool shouldDebug = false;
+
+#ifdef _WIN32
+	DWORD mode;
+	HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+	GetConsoleMode(h,&mode);
+	SetConsoleMode(h,mode|ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#endif
 	
 	std::vector<std::string> argVec{};
 	for (ssize_t i=1;i<argc;++i){

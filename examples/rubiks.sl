@@ -9,31 +9,13 @@
 		((red) (output "\e[41m"))
 		((blue) (output "\e[44m"))
 		((green) (output "\e[42m"))
-		((yellow) (output "\e[43m"))
+		((yellow) (output "\e[48;5;220m"))
 		((white) (output "\e[47m"))
 		((orange) (output "\e[48;5;208m"))
 		
 		(else assert false)
 	)
 )
-
-;-(def (list-get l index)
-	(let loop ((i 0) (curr l))
-		(if (= i index)
-			(L curr)
-			(loop (++ i) (R curr))
-		)
-	)
-)
-
-(def (list-set! l index item)
-	(let loop ((i 0) (curr l))
-		(if (= i index)
-			(set-L! curr item)
-			(loop (++ i) (R curr))
-		)
-	)
-)-;
 
 (def (list-swap! l i1 i2)
 	(let ((tmp (list-get l i1)))
@@ -42,31 +24,6 @@
 		l
 	)
 )
-
-;-(def (list-swap-sub l lIt elem i2)
-	(let loop ((it lIt) (j2 i2))
-		(if (= 0 j2)
-			(do
-				(set-L! l (L it))
-				(set-L! it elem)
-				()
-			)
-			(loop (R it) (-- j2))
-		)
-	)
-)
-
-(def (list-swap! l i1 i2)
-	(let ((ind1 (min i1 i2)) (ind2 (max i1 i2)))
-		(let loop ((j1 ind1) (j2 ind2) (lIt l))
-			(if (= 0 j1)
-				(list-swap-sub lIt lIt (L lIt) j2)
-				(loop (-- j1) (-- j2) (R lIt))
-			)
-		)
-	
-	)
-)-;
 
 (def (list-rev l)
 	(let loop ((newL ()) (oldL l))
@@ -435,7 +392,7 @@
 )
 ;(output-alg test-alg)
 ;(output "\n")
-;(display-cube c)
+(display-cube c)
 (import (slang time))
 
 (def start-t (perf-time))
